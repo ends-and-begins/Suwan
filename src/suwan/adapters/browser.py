@@ -6,8 +6,9 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 try:
     import requests
@@ -30,6 +31,17 @@ DEFAULT_WHITELIST = [
     "www.baidu.com",
 ]
 
+ERROR_PREFIXES = ("[访问失败", "[访问超时", "[连接失败", "[HTTP错误", "[浏览器不可用", "[不在白名单", "[未找到", "[重定向失败")
+
+
+def is_browser_error(text: str) -> bool:
+    """统一识别适配器失败状态，防止错误文案被当成搜索内容。"""
+    return not text or text.lstrip().startswith(ERROR_PREFIXES)
+
+
+class BrowserAccessError(ValueError):
+    pass
+
 
 class SafeBrowser:
     def __init__(self, whitelist: list[str] | None = None) -> None:
@@ -49,8 +61,52 @@ class SafeBrowser:
         return cls(whitelist=whitelist)
 
     def is_allowed(self, url: str) -> bool:
-        domain = urlparse(url).netloc
-        return any(domain == a or domain.endswith("." + a) for a in self.whitelist)
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme.lower() not in {"http", "https"} or parsed.username is not None or parsed.password is not None:
+                return False
+            domain = (parsed.hostname or "").lower().rstrip(".")
+        except ValueError:
+            return False
+        return any(domain == a.lower().rstrip(".") or domain.endswith("." + a.lower().rstrip(".")) for a in self.whitelist)
+
+    def _fetch(self, url: str, *, timeout: float = 8.0) -> str:
+        """手动跟随重定向；每个目标都先校验，并共用一次访问期限。"""
+        deadline = time.monotonic() + timeout
+        for hop in range(6):
+            if not self.is_allowed(url):
+                raise BrowserAccessError("[不在白名单]")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise requests.exceptions.Timeout()  # type: ignore[union-attr]
+            response = self.session.get(url, timeout=remaining, allow_redirects=False)  # type: ignore[union-attr]
+            try:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("Location")
+                    if not location or hop == 5:
+                        raise BrowserAccessError("[重定向失败]")
+                    url = urljoin(url, location)
+                    continue
+                response.raise_for_status()
+                if not 200 <= response.status_code < 300:
+                    raise BrowserAccessError(f"[HTTP错误 {response.status_code}]")
+                return response.text
+            finally:
+                response.close()
+        raise BrowserAccessError("[重定向失败]")  # pragma: no cover
+
+    @staticmethod
+    def _failure(exc: Exception) -> str:
+        if isinstance(exc, BrowserAccessError):
+            return str(exc)
+        if isinstance(exc, requests.exceptions.Timeout):  # type: ignore[union-attr]
+            return "[访问超时]"
+        if isinstance(exc, requests.exceptions.ConnectionError):  # type: ignore[union-attr]
+            return "[连接失败]"
+        if isinstance(exc, requests.exceptions.HTTPError):  # type: ignore[union-attr]
+            response = getattr(exc, "response", None)
+            return f"[HTTP错误 {getattr(response, 'status_code', '?')}]"
+        return f"[访问失败: {exc}]"
 
     def browse(self, url: str) -> str:
         if not self.available:
@@ -58,39 +114,31 @@ class SafeBrowser:
         if not self.is_allowed(url):
             return "[不在白名单]"
         try:
-            r = self.session.get(url, timeout=8)  # type: ignore[union-attr]
-            soup = BeautifulSoup(r.text, "html.parser")
+            soup = BeautifulSoup(self._fetch(url), "html.parser")
             for tag in soup(["script", "style"]):
                 tag.decompose()
             text = " ".join((line.strip() for line in soup.get_text().splitlines() if line.strip()))
             return text[:400]
-        except requests.exceptions.Timeout:  # type: ignore[union-attr]
-            return "[访问超时]"
-        except requests.exceptions.ConnectionError:  # type: ignore[union-attr]
-            return "[连接失败]"
-        except requests.exceptions.HTTPError as exc:  # type: ignore[union-attr]
-            return f"[HTTP错误 {exc.response.status_code}]"
         except Exception as exc:  # noqa: BLE001
-            return f"[访问失败: {exc}]"
+            return self._failure(exc)
 
     def search(self, query: str) -> str:
         if not self.available:
             return "[浏览器不可用]"
         safe_q = quote(query, safe="")
         result = self.browse(f"https://baike.baidu.com/item/{safe_q}")
-        if result and "[访问失败]" not in result and "[不在白名单]" not in result and "[浏览器不可用]" not in result:
+        if not is_browser_error(result):
             return result
         search_url = f"https://www.baidu.com/s?wd={safe_q}"
         if self.is_allowed(search_url):
             try:
-                r = self.session.get(search_url, timeout=8)  # type: ignore[union-attr]
-                soup = BeautifulSoup(r.text, "html.parser")
+                soup = BeautifulSoup(self._fetch(search_url), "html.parser")
                 abstracts = [d.get_text().strip() for d in soup.find_all("div", class_="c-abstract")]
                 if abstracts:
                     return "；".join(abstracts[:3])
                 spans = [s.get_text().strip() for s in soup.find_all("span", class_="content-right_8Zs40")]
                 if spans:
                     return "；".join(spans[:3])
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                return self._failure(exc)
         return f"[未找到关于'{query}'的有效信息]"

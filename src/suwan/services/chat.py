@@ -8,11 +8,13 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 from suwan.assets.local_replies import LocalReplyBank, extract_intro_name
+from suwan.adapters.llm import LLM_TIMEOUT_SECONDS
 from suwan.bus import EventBus
 from suwan.clock import Clock
-from suwan.events import CHAT_REPLY, DRIVE_ADJUST, SEARCH_REQUESTED, SEARCH_RESULT, SENSOR_USER_MESSAGE, USER_ACTIVE
+from suwan.events import CHAT_REPLY, DRIVE_ADJUST, SEARCH_REQUESTED, SEARCH_RESULT, SENSOR_RECORDED, SENSOR_USER_MESSAGE, USER_ACTIVE
 from suwan.organs.base import Organ
 from suwan.rpc import RpcTimeoutError, register_user_name, remember, request
 
@@ -40,6 +42,7 @@ class ChatService(Organ):
         self.network_enabled = network_enabled
         self.search_available = search_available
         self.last_via = "local"
+        self._chat_lock = asyncio.Lock()
 
     # ---------- 依赖便捷访问 ----------
     def _o(self, name: str):
@@ -50,17 +53,35 @@ class ChatService(Organ):
         self._subscribe(SENSOR_USER_MESSAGE, self._on_user_message)
 
     async def _on_user_message(self, event) -> None:  # noqa: ANN001
-        await self.chat(str(event.data.get("text", "")).strip())
+        if not event.data.get("observe_only"):
+            await self.chat(str(event.data.get("text", "")).strip(), _record_input=False, turn_id=event.data.get("rid"))
 
-    async def chat(self, user_text: str) -> str:
+    async def chat(self, user_text: str, *, _record_input: bool = True, turn_id: str | None = None) -> str:
         """公开对话入口：处理并发布 chat.reply，返回回复文本。"""
         text = (user_text or "").strip()
         if not text:
             return ""
-        reply = await self._respond(text)
-        if reply:
-            await self.bus.publish(CHAT_REPLY, {"text": reply, "via": self.last_via, "user_text": text})
-        return reply
+        async with self._chat_lock:
+            turn_id = turn_id or str(uuid.uuid4())
+            if _record_input:
+                await self._record_event(SENSOR_USER_MESSAGE, {
+                    "text": text, "source": "chat", "observe_only": True, "turn_id": turn_id,
+                })
+            self.last_via = "local"
+            reply = await self._respond(text)
+            if reply:
+                await self._record_event(CHAT_REPLY, {
+                    "text": reply, "via": self.last_via, "user_text": text, "turn_id": turn_id,
+                })
+            return reply
+
+    async def _record_event(self, topic: str, payload: dict) -> None:
+        sensory = self.organs.get("sensory")
+        if sensory is not None and getattr(sensory, "started", False):
+            # 等感官确认再读取历史/返回前端；每条回执各有 rid，并发不串话。
+            await request(self.bus, topic, SENSOR_RECORDED, payload, timeout=5.0)
+        else:
+            await self.bus.publish(topic, payload)
 
     # ---------- 响应 ----------
     async def _respond(self, user_text: str) -> str:
@@ -111,17 +132,25 @@ class ChatService(Organ):
         if not data.get("ok"):
             return f"我试着查了“{query}”，但没拿到有效结果，换个关键词或稍后再试？"
         if self.llm is not None and self.llm.available and self.api_enabled:
-            summarized = await asyncio.to_thread(
-                self.llm.chat, "你是苏晚，一个正在探索世界的信息助手。",
-                f"搜索“{query}”的结果如下：\n{raw[:800]}\n请用自己的话告诉用户搜到了什么。", 400,
-            )
+            try:
+                summarized = await asyncio.wait_for(asyncio.to_thread(
+                    self.llm.chat, "你是苏晚，一个正在探索世界的信息助手。",
+                    f"搜索“{query}”的结果如下：\n{raw[:800]}\n请用自己的话告诉用户搜到了什么。", 400,
+                ), timeout=LLM_TIMEOUT_SECONDS)
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning("搜索摘要降级: %s", exc)
+                summarized = None
             if summarized:
                 return summarized
         return f"我搜索了“{query}”，结果如下：\n{raw[:300]}..."
 
     async def _normal_reply(self, user_text: str) -> str:
         if self.llm is not None and self.llm.available and self.api_enabled:
-            reply = await asyncio.to_thread(self._llm_reply, user_text)
+            try:
+                reply = await asyncio.wait_for(asyncio.to_thread(self._llm_reply, user_text), timeout=LLM_TIMEOUT_SECONDS)
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning("模型回复降级: %s", exc)
+                reply = None
             if reply:
                 self.last_via = "llm"
                 return reply

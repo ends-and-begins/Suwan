@@ -12,10 +12,11 @@
 from __future__ import annotations
 
 import argparse
+import queue
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import scrolledtext, ttk
+from tkinter import messagebox, scrolledtext, ttk
 
 from suwan.adapters.tts import VOICE_PRESETS
 from suwan.config import ENDPOINT_ENV, MODEL_CANDIDATES, PROVIDER_LABELS, Settings
@@ -42,6 +43,9 @@ LOG_LEVELS = ("ALL", "INFO", "OK", "WARN", "ERROR")
 
 class TkApp:
     def __init__(self, runtime) -> None:
+        self._ui_callbacks = queue.SimpleQueue()
+        self._closing = False
+        self._after_ids: set[str] = set()
         self.server = RuntimeThread(runtime, TkBridge())
         self.server.start()
         self.root = tk.Tk()
@@ -366,7 +370,7 @@ class TkApp:
         self._refresh_api_indicator()
         if self.api_var.get():
             self._log_msg("已开启 API，正在自动探测连接…", "info")
-            self.root.after(500, self._test_api)
+            self._after(500, self._test_api)
         else:
             self._log_msg("已关闭 API，将使用本地模式", "warn")
 
@@ -391,9 +395,10 @@ class TkApp:
         try:
             reply = future.result(timeout=0.1)
         except Exception as exc:  # noqa: BLE001
-            self.root.after(0, lambda: self._log_msg(f"回复失败：{type(exc).__name__} {str(exc)[:80]}", "error"))
+            message = f"回复失败：{type(exc).__name__} {str(exc)[:80]}"
+            self._queue_ui(self._log_msg, message, "error")
             return
-        self.root.after(0, lambda: self._render_reply(reply))
+        self._queue_ui(self._render_reply, reply)
 
     def _render_reply(self, reply: str) -> None:
         self._last_reply = reply
@@ -417,9 +422,9 @@ class TkApp:
             except Exception as exc:  # noqa: BLE001
                 path, error = None, f"{type(exc).__name__}: {str(exc)[:80]}"
             if error:
-                self.root.after(0, lambda: self._log_msg(f"语音失败：{error}", "error"))
+                self._queue_ui(self._log_msg, f"语音失败：{error}", "error")
             elif path:
-                self.root.after(0, lambda: self._log_msg(f"语音已生成：{Path(path).name}", "ok"))
+                self._queue_ui(self._log_msg, f"语音已生成：{Path(path).name}", "ok")
 
         future.add_done_callback(done)
 
@@ -461,7 +466,7 @@ class TkApp:
             ok, msg = future.result(timeout=0.1)
         except Exception as exc:  # noqa: BLE001
             ok, msg = False, f"{type(exc).__name__}: {str(exc)[:80]}"
-        self.root.after(0, lambda: self._render_api_result(ok, msg))
+        self._queue_ui(self._render_api_result, ok, msg)
 
     def _render_api_result(self, ok: bool, msg: str) -> None:
         self._log_msg(msg, "ok" if ok else "error")
@@ -473,7 +478,32 @@ class TkApp:
             self._set_api_dot_color(ERR)
 
     # ---------- 总线事件拉取 ----------
+    def _after(self, delay: int, callback) -> None:
+        if self._closing:
+            return
+
+        def invoke() -> None:
+            self._after_ids.discard(after_id)
+            if not self._closing:
+                callback()
+
+        after_id = self.root.after(delay, invoke)
+        self._after_ids.add(after_id)
+
+    def _queue_ui(self, callback, *args) -> None:
+        # Future 回调可能位于后台线程；不能在此调用任何 Tk API，含 root.after。
+        if not self._closing:
+            self._ui_callbacks.put((callback, args))
+
     def _pump(self) -> None:
+        if self._closing:
+            return
+        while True:
+            try:
+                callback, args = self._ui_callbacks.get_nowait()
+            except queue.Empty:
+                break
+            callback(*args)
         for item in self.server.bridge.drain():
             kind, data = item["kind"], item["data"]
             text = data.get("text", data.get("name", ""))
@@ -485,13 +515,13 @@ class TkApp:
                 self._show_chat("独白", f"（{text}）")
             elif kind == "narrative":
                 self._show_chat("苏晚·主动", text)
-        self.root.after(100, self._pump)
+        self._after(100, self._pump)
 
     # ---------- 轮询视图 ----------
     def _schedule_views(self) -> None:
         self._refresh_status()
         self._refresh_files()
-        self.root.after(2000, self._schedule_views)
+        self._after(2000, self._schedule_views)
 
     def _refresh_status(self) -> None:
         try:
@@ -559,8 +589,16 @@ class TkApp:
 
     # ---------- 关闭 ----------
     def on_close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        for after_id in self._after_ids:
+            self.root.after_cancel(after_id)
+        self._after_ids.clear()
         try:
             self.server.stop()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("退出保存未完成", f"{exc}\n\n请保留现有数据与备份，检查问题后再启动。", parent=self.root)
         finally:
             self.root.destroy()
 

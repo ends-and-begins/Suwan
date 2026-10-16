@@ -67,33 +67,62 @@ class RuntimeThread:
         self._ready = threading.Event()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._serve, name="suwan-runtime", daemon=True)
+        self._startup_error: BaseException | None = None
+        self._shutdown_error: BaseException | None = None
 
     def start(self) -> None:
         self._thread.start()
-        self._ready.wait(timeout=15)
-        if self._loop is None:
+        if not self._ready.wait(timeout=15):
+            self._stop.set()
+            raise TimeoutError("运行时启动超过15秒，已请求停止")
+        if self._startup_error is not None:
+            self._thread.join(timeout=15)
+            raise self._startup_error
+        if self._loop is None or not self._thread.is_alive():
             raise RuntimeError("运行时线程启动失败")
 
     def _serve(self) -> None:
-        asyncio.run(self._serve_async())
+        try:
+            asyncio.run(self._serve_async())
+        except BaseException as exc:
+            if not self._ready.is_set():
+                self._startup_error = exc
+            else:
+                self._shutdown_error = exc
+        finally:
+            self._ready.set()
 
     async def _serve_async(self) -> None:
         self._loop = asyncio.get_running_loop()
         try:
-            await self.runtime.start()
-            await self.bridge.start(self.runtime.bus)
-            self._ready.set()
+            try:
+                await self.runtime.start()
+                await self.bridge.start(self.runtime.bus)
+            except BaseException as exc:
+                self._startup_error = exc
+                return
+            finally:
+                self._ready.set()
             while not self._stop.is_set():
                 await asyncio.sleep(0.1)
         finally:
             self.bridge.stop()
-            await self.runtime.stop()
+            try:
+                await self.runtime.stop()
+            except BaseException as exc:
+                self._shutdown_error = exc
 
     # ---------- 从 GUI 线程调用 ----------
     def _submit(self, coro) -> Future:
         """把任意协程提交给运行时事件循环，返回 Future。"""
-        assert self._loop is not None
-        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+        if self._loop is None or self._stop.is_set() or not self._thread.is_alive():
+            coro.close()
+            raise RuntimeError("运行时未运行，无法提交操作")
+        try:
+            return asyncio.run_coroutine_threadsafe(coro, self._loop)
+        except RuntimeError:
+            coro.close()
+            raise
 
     def ask(self, text: str) -> Future:
         """把一句话提交给运行时；返回 Future[str]，用回调取回。"""
@@ -114,6 +143,10 @@ class RuntimeThread:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=15)
+        if self._thread.is_alive():
+            raise TimeoutError("运行时尚未完成退出，不能确认保存已完成")
+        if self._shutdown_error is not None:
+            raise self._shutdown_error
 
     def status(self) -> dict:
         return self.runtime.status()

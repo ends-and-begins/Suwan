@@ -84,6 +84,10 @@ class ReflectionTest(unittest.TestCase):
 
 
 class ShareTest(unittest.TestCase):
+    def setUp(self) -> None:
+        ensure_dir(TMP)
+        self.addCleanup(lambda: shutil.rmtree(TMP, ignore_errors=True))
+
     def test_scan_consumes_file(self) -> None:
         async def scenario() -> tuple[bool, int]:
             bus = EventBus()
@@ -108,6 +112,8 @@ class ShareTest(unittest.TestCase):
             await bus.flush()
             consumed = not gift_file.exists()
             mem_count = organs["memory"].state()["count"]
+            self.assertTrue(list((share_dir / ".processed").glob("*.txt")))
+            self.assertIn("这是给你的一首诗", (TMP / "mem2.json").read_text(encoding="utf-8"))
             await watcher.stop()
             for o in organs.values():
                 await o.stop()

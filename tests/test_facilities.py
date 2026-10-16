@@ -41,6 +41,9 @@ class FacilitiesTest(unittest.TestCase):
         async def scenario() -> tuple[str | None, str]:
             await runtime.start()
             try:
+                _, disabled_error = await runtime.speak("你好")
+                self.assertIn("API 未开启", disabled_error)
+                runtime.set_api_enabled(True)
                 path, error = await runtime.speak("你好")
             finally:
                 await runtime.stop()

@@ -1,11 +1,10 @@
-"""长期记忆器官（等价旧 MemorySystem，修正 B20 的 sort(...) 截断与排序语义）。
+"""长期记忆器官：关键数据严格读取，持久化确认与分享收据去重。
 
 状态：self.items（MemoryItem 列表），由本器官独占写入。
 - add()：追加并每 N 条自动保存（原子写）；
 - 回忆：关键词/随机/高重要性/最近片段，均含随时间的衰减概率；
 - cleanup_old()：清理低重要性高龄记忆；
-- compress_old()：把超过保留数的"次新旧记忆"合并为一条摘要（先做确定性实现，
-  LLM 化摘要由外部 llm 适配器注入，见 M4）；
+- compress_old()：第一轮暂缓破坏性压缩，保留完整原始记录及其顺序；
 - 文件格式与旧版 memories.json 兼容：list[{content, importance, emotion, created(iso)}]，
   因此 M4 的 Migrator 只需复制文件/或原位读取。
 
@@ -21,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from suwan.adapters.filestore import atomic_write_text, read_json
+from suwan.adapters.filestore import DataFileError, atomic_write_text, read_json_checked
 from suwan.bus import EventBus
 from suwan.clock import Clock
 from suwan.events import MEMORY_ADD_REQUEST, MEMORY_ADDED, MEMORY_CLEANED, MEMORY_COMPACTED, MEMORY_MAINTENANCE
@@ -34,6 +33,7 @@ class MemoryItem:
     importance: float = 5.0
     emotion: float = 50.0
     created: datetime | None = None
+    receipt: str | None = None
 
 
 class MemoryOrgan(Organ):
@@ -52,25 +52,38 @@ class MemoryOrgan(Organ):
         self._save_every = save_every
         self.items: list[MemoryItem] = []
         self._dirty = False
+        self._read_error: DataFileError | None = None
+        self._durable_receipts: set[str] = set()
+        self._loaded = False
 
     # ---------- 生命周期 ----------
     async def _on_start(self) -> None:
+        await asyncio.to_thread(self._load)
         self._subscribe(MEMORY_ADD_REQUEST, self._on_add_request)
         self._subscribe(MEMORY_MAINTENANCE, self._on_maintenance)
-        await asyncio.to_thread(self._load)
 
     async def _on_add_request(self, event) -> None:  # noqa: ANN001
         data = event.data
-        content = str(data.get("content", "")).strip()
-        if not content:
-            return
-        importance = float(data.get("importance", 5.0))
-        emotion = float(data.get("emotion", 50.0))
-        self.add(content, importance=importance, emotion=emotion)
-        await self.bus.publish(
-            MEMORY_ADDED,
-            {"rid": data.get("rid"), "content": content, "importance": importance, "emotion": emotion},
-        )
+        try:
+            content = data.get("content", "")
+            receipt = data.get("receipt")
+            if receipt is not None and (not isinstance(receipt, str) or not receipt):
+                raise ValueError("无效记忆收据")
+            self._ensure_writable()
+            if receipt is None or not self.has_receipt(receipt):
+                item = self.add(content, importance=data.get("importance", 5.0),
+                                emotion=data.get("emotion", 50.0), receipt=receipt)
+                if not item.content:
+                    raise ValueError("记忆内容为空")
+            if data.get("persist"):
+                # 不在工作线程写同一可变列表；确认完成后才返回持久化成功。
+                self.force_save()
+            result = {"rid": data.get("rid"), "ok": True, "content": content,
+                      "receipt": receipt, "persisted": bool(data.get("persist"))}
+        except (OSError, ValueError, TypeError) as exc:
+            self._log.error("记忆接收失败: %s", exc)
+            result = {"rid": data.get("rid"), "ok": False, "error": str(exc)}
+        await self.bus.publish(MEMORY_ADDED, result)
 
     async def _on_maintenance(self, event) -> None:  # noqa: ANN001
         removed = self.cleanup_old()
@@ -83,11 +96,39 @@ class MemoryOrgan(Organ):
             await self.bus.publish(MEMORY_COMPACTED, {"n": compressed})
 
     async def _on_stop(self) -> None:
-        await asyncio.to_thread(self.force_save)
+        if self._read_error is not None:
+            self._log.error("原记忆文件未成功读取，已阻止退出覆盖: %s", self._file)
+            return
+        self.force_save()
 
     # ---------- 写入 ----------
-    def add(self, content: str, importance: float = 5.0, emotion: float = 50.0) -> MemoryItem:
-        item = MemoryItem(content=str(content).strip(), importance=float(importance), emotion=float(emotion), created=self.clock.now())
+    def _ensure_writable(self) -> None:
+        if self._read_error is not None:
+            raise self._read_error
+        if not self._loaded:
+            self._load()
+
+    @staticmethod
+    def _number(value, label: str) -> float:
+        try:
+            finite = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        except OverflowError:
+            finite = False
+        if not finite:
+            raise ValueError(f"{label}必须为有限数字")
+        return float(value)
+
+    def has_receipt(self, receipt: str, *, durable: bool = False) -> bool:
+        if durable:
+            return receipt in self._durable_receipts
+        return any(m.receipt == receipt for m in self.items)
+
+    def add(self, content: str, importance: float = 5.0, emotion: float = 50.0, *, receipt: str | None = None) -> MemoryItem:
+        self._ensure_writable()
+        if not isinstance(content, str):
+            raise ValueError("记忆内容必须为文本")
+        item = MemoryItem(content=content.strip(), importance=self._number(importance, "importance"),
+                          emotion=self._number(emotion, "emotion"), created=self.clock.now(), receipt=receipt)
         if not item.content:
             return item
         self.items.append(item)
@@ -98,7 +139,14 @@ class MemoryOrgan(Organ):
 
     def import_memory_items(self, items: list[MemoryItem]) -> int:
         """批量导入（Migrator 用）：保留原 created 时间，追加后落盘。"""
+        self._ensure_writable()
         now = self.clock.now()
+        # 全部验证后再改变当前集合，防止半次导入。
+        for item in items:
+            if not isinstance(item.content, str):
+                raise ValueError("记忆内容必须为文本")
+            self._number(item.importance, "importance")
+            self._number(item.emotion, "emotion")
         count = 0
         for item in items:
             if not item.content:
@@ -113,35 +161,63 @@ class MemoryOrgan(Organ):
         return count
 
     def force_save(self) -> None:
+        self._ensure_writable()
+        if self._file.exists():
+            self._load(validate_only=True)
         if not self._dirty and self._file.exists():
             return
         data = [
-            {"content": m.content, "importance": m.importance, "emotion": m.emotion, "created": m.created.isoformat()}
+            {"content": m.content, "importance": m.importance, "emotion": m.emotion,
+             "created": (m.created or self.clock.now()).isoformat(),
+             **({"receipt": m.receipt} if m.receipt is not None else {})}
             for m in self.items
         ]
-        atomic_write_text(self._file, json.dumps(data, ensure_ascii=False, indent=2))
+        atomic_write_text(self._file, json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False))
         self._dirty = False
+        self._durable_receipts = {m.receipt for m in self.items if m.receipt is not None}
 
-    def _load(self) -> None:
-        data = read_json(self._file, default=None)
-        if data is None:
-            return
-        for record in data:
-            created = None
-            raw = record.get("created")
-            if raw:
-                try:
-                    created = datetime.fromisoformat(raw)
-                except ValueError:
-                    created = None
-            self.items.append(
-                MemoryItem(
-                    content=record.get("content", ""),
-                    importance=float(record.get("importance", 5.0)),
-                    emotion=float(record.get("emotion", 50.0)),
-                    created=created,
-                )
-            )
+    def _load(self, *, validate_only: bool = False) -> None:
+        self._loaded = True
+        try:
+            missing = object()
+            data = read_json_checked(self._file, default=missing)
+            if data is missing:
+                data = []
+            if not isinstance(data, list):
+                raise ValueError("记忆文件必须为记录列表")
+            loaded = []
+            receipts = set()
+            for index, record in enumerate(data):
+                if not isinstance(record, dict) or not isinstance(record.get("content"), str):
+                    raise ValueError(f"第{index + 1}条记忆缺少文本内容")
+                if set(record) - {"content", "importance", "emotion", "created", "receipt"}:
+                    raise ValueError(f"第{index + 1}条记忆含未知字段，需确认格式版本")
+                raw = record.get("created")
+                created = self.clock.now() if raw is None else datetime.fromisoformat(raw)
+                now = self.clock.now()
+                if created.tzinfo is not None and now.tzinfo is None:
+                    created = created.astimezone().replace(tzinfo=None)
+                elif created.tzinfo is None and now.tzinfo is not None:
+                    created = created.replace(tzinfo=now.tzinfo)
+                receipt = record.get("receipt")
+                if receipt is not None:
+                    if not isinstance(receipt, str) or not receipt or receipt in receipts:
+                        raise ValueError(f"第{index + 1}条记忆收据无效或重复")
+                    receipts.add(receipt)
+                loaded.append(MemoryItem(record["content"], self._number(record.get("importance", 5.0), "importance"),
+                                         self._number(record.get("emotion", 50.0), "emotion"), created, receipt))
+        except (OSError, ValueError, TypeError) as exc:
+            error = exc if isinstance(exc, DataFileError) else DataFileError(self._file, str(exc))
+            self._read_error = error
+            self._log.error("无法恢复记忆，原文件已保护: %s", error)
+            if error is exc:
+                raise
+            raise error from exc
+        if not validate_only:
+            self.items = loaded
+            self._durable_receipts = receipts
+            self._dirty = False
+            self._read_error = None
 
     # ---------- 衰减 ----------
     def _decay_factor(self, item: MemoryItem) -> float:
@@ -204,23 +280,8 @@ class MemoryOrgan(Organ):
         return removed
 
     def compress_old(self, keep_count: int = 200, max_age_days: int = 30) -> int:
-        """把高龄记忆（importance<9）超过保留数的部分合并为一条摘要。
-
-        排序语义：importance 高者保留；同 importance 保留新的（修复旧版 sort(...) 截断）。
-        """
-        now = self.clock.now()
-        old = [m for m in self.items if (now - (m.created if m.created else now)).days > max_age_days and m.importance < 9]
-        if len(old) <= keep_count:
-            return 0
-        old.sort(key=lambda m: (m.importance, m.created.timestamp() if m.created else 0.0), reverse=True)
-        to_keep = old[:keep_count]
-        to_merge = old[keep_count:]
-        merged_text = "；".join([m.content[:40] for m in to_merge[:20]])
-        summary = f"旧日摘要：{merged_text}"
-        old_set = set(map(id, old))
-        self.items = [m for m in self.items if id(m) not in old_set] + to_keep
-        self.add(summary, importance=2.0, emotion=50.0)
-        return len(to_merge)
+        """暂缓压缩删除；来源与摘要覆盖规则在下一阶段定义后再启用。"""
+        return 0
 
     # ---------- 状态 ----------
     def state(self) -> dict:
@@ -228,4 +289,5 @@ class MemoryOrgan(Organ):
             "count": len(self.items),
             "dirty": self._dirty,
             "file": str(self._file),
+            "write_blocked": self._read_error is not None,
         }

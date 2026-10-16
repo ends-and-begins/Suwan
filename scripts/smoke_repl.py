@@ -6,22 +6,23 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from _offline import install_offline_guard
+
+GUARD = install_offline_guard()
+
 from suwan.app import SuwanRuntime  # noqa: PLC0415
 from suwan.config import Settings  # noqa: PLC0415
 
 
-async def main() -> int:
-    tmp = Path(__file__).resolve().parent / ".smoke_home"
-    if tmp.exists():
-        shutil.rmtree(tmp, ignore_errors=True)
-    settings = Settings.from_env(home_dir=tmp)
+async def _scenario(tmp: Path) -> int:
+    settings = Settings.from_env(env={}, home_dir=tmp, load_env=False)
     runtime = SuwanRuntime(settings, migrate_legacy_data=False)
     await runtime.start()
     try:
@@ -40,9 +41,14 @@ async def main() -> int:
         await runtime.stop()
     assert (settings.data_dir / "memories.json").exists(), "记忆未持久化"
     assert (settings.data_dir / "state.json").exists(), "快照未持久化"
-    shutil.rmtree(tmp, ignore_errors=True)
+    assert GUARD["network_blocks"] == 0, "离线冒烟期间尝试了真实网络访问（已阻断）"
     print("[smoke] OK")
     return 0
+
+
+async def main() -> int:
+    with tempfile.TemporaryDirectory(prefix="suwan-smoke-") as temporary:
+        return await _scenario(Path(temporary))
 
 
 if __name__ == "__main__":

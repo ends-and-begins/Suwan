@@ -1,6 +1,6 @@
 # 苏晚 v2 目标架构（事件总线 + 器官）
 
-> 文档状态：M0 草案。随实现推进修订。
+> 文档状态：目标架构与实现说明。2026-10-16 第一轮本地验收与实际限制见 [round1-report.md](round1-report.md)。原则中的完全事件化、跨线程一致快照仍是逐步收敛目标。
 > 设计来源：suwan23.py 单体功能 + suwan_mvp 的事件/器官原型 + 现行工作区的后续功能。
 > 旧版所有已知 bug 的修复点见 `docs/bug-registry.md`，实现时逐条对照。
 
@@ -50,18 +50,20 @@
 autonomy.trigger / monologue.trigger / reflection.diary / reflection.story / memory.maintenance
 
 # 输入（前端/传感器 → 服务）
-sensor.user_message {text}           用户说话（唯一对话输入）
+sensor.user_message {text,observe_only,turn_id,rid} 用户输入；chat直调时发布观察事件，observe_only阻止重复处理
+sensor.recorded {rid,kind}          感官已记录输入/回复，服务等待对应回执
 user.active                          "用户在场"（affect/drive/节律据此切换平衡点）
 sensor.share_file {name,path,content} 收到投喂（=礼物，Relation 加亲近/信任）
 
 # 请求→应答（变更；rpc）
 identity.name.register.request → identity.name_updated {rid,name}
-memory.add.request → memory.added {rid,content,importance,emotion}
+memory.add.request {rid,content,importance,emotion,persist,receipt}
+  → memory.added {rid,ok,content,receipt,persisted,error}（persist时确认落盘后才成功）
 search.requested {query,rid} → search.result {rid,query,ok,text}
 tts.request {text,voice,rid} → tts.done {rid,file,ok,error}
 
 # 通报（发布方 → 观察者/联动）
-chat.reply {text,via,user_text}      对话回复（Sensory/Relation 联动；GUI 展示）
+chat.reply {rid,turn_id,text,via,user_text} 对话回复（Sensory/Relation 联动；GUI 展示）
 act.chosen {action} / act.done {action,note}
 monologue.generated {text,kind}      独白/梦境/回忆叙事
 story.generated {date,text}  / doc.generated {name,path}

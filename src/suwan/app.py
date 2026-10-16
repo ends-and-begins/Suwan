@@ -15,13 +15,14 @@ from pathlib import Path
 
 from suwan.adapters.browser import SafeBrowser
 from suwan.adapters.filestore import ensure_dir
-from suwan.adapters.llm import LLMClient
+from suwan.adapters.llm import LLM_TIMEOUT_SECONDS, LLMClient
 from suwan.adapters.migrator import migrate as migrate_legacy
 from suwan.adapters.tts import TTSClient
 from suwan.bus import EventBus
 from suwan.clock import Clock, RealClock
 from suwan.config import ENDPOINT_ENV, Settings
 from suwan.events import CLOCK_TICK, TTS_DONE, TTS_REQUEST
+from suwan.instance_lock import InstanceLock
 from suwan.organs.affect import AffectOrgan
 from suwan.organs.circadian import CircadianOrgan
 from suwan.organs.drive import DriveOrgan
@@ -63,13 +64,15 @@ class SuwanRuntime:
         self.clock = clock or RealClock()
         self._log = logging.getLogger(logger_name)
         self._running = False
+        self._lifecycle_lock = asyncio.Lock()
+        self._instance_lock = InstanceLock(self.settings.data_dir)
         self._ticker_task: asyncio.Task | None = None
+        self._foreground_tasks: set[asyncio.Task] = set()
         self.migrate_legacy_data = migrate_legacy_data
         self._api_enabled = api_enabled
         self._network_enabled = network_enabled
         self.tts_voice = "mimo_default"
         self.tts_enabled = False
-        self._ensure_dirs()
 
         # 适配器
         if llm_provider is None:
@@ -78,6 +81,7 @@ class SuwanRuntime:
 
         # 适配器
         self.llm = LLMClient(self.settings, provider=llm_provider, clock=self.clock)
+        self._llm_clients = [self.llm]
         self.tts = TTSClient(self.settings, clock=self.clock)
         # 白名单：默认内置清单；可用环境变量 SUWAN_BROWSER_CONFIG 指向 JSON 覆盖（如实化配置源）
         cfg_path = os.getenv("SUWAN_BROWSER_CONFIG")
@@ -156,42 +160,105 @@ class SuwanRuntime:
 
     # ---------- 生命周期 ----------
     async def start(self) -> None:
-        if self._running:
-            return
-        self._running = True
-        await self.bus.start()
-        for organ in self._all_organs:
-            await organ.start()
-        # 旧数据迁移（只读旧目录；标记幂等）
-        if self.migrate_legacy_data:
+        async with self._lifecycle_lock:
+            if self._running:
+                return
+            # 在迁移/恢复或器官写入前持有进程锁；锁失败不能清理其它实例。
+            self._instance_lock.acquire()
+            attempted = []
             try:
-                result = await asyncio.to_thread(migrate_legacy, self.settings, self.organs["memory"], self.organs["identity"], self.clock)
-                if result["memories"] or result["snapshot_name"]:
-                    self._log.info("旧数据迁移完成: %s", result)
-                elif not result["skipped"]:
-                    self._log.info("旧数据迁移：无可用数据")
-            except Exception:  # noqa: BLE001
-                self._log.exception("旧数据迁移失败（不影响启动）")
-        for service in self.services:
-            await service.start()
-        self._sync_flags()
-        self._ticker_task = asyncio.create_task(self._tick_loop(), name="suwan.ticker")
+                self.llm.set_active(True)
+                self.tts.set_active(True)
+                self._ensure_dirs()
+                await self.bus.start()
+                for organ in self._all_organs:
+                    attempted.append(organ)
+                    await organ.start()
+                # 旧数据迁移（只读旧目录；标记幂等）
+                if self.migrate_legacy_data:
+                    try:
+                        result = await asyncio.to_thread(migrate_legacy, self.settings, self.organs["memory"], self.organs["identity"], self.clock)
+                        if result["memories"] or result["snapshot_name"]:
+                            self._log.info("旧数据迁移完成: %s", result)
+                        elif not result["skipped"]:
+                            self._log.info("旧数据迁移：无可用数据")
+                    except Exception:  # noqa: BLE001
+                        self._log.exception("旧数据迁移失败（不影响启动）")
+                for service in self.services:
+                    attempted.append(service)
+                    await service.start()
+                self._sync_flags()
+                self._running = True
+                self._ticker_task = asyncio.create_task(self._tick_loop(), name="suwan.ticker")
+            except BaseException:
+                # 恢复失败时只撤销订阅和任务，不执行持久化退出钩子，保留原件。
+                try:
+                    for component in reversed(attempted):
+                        component._started = False
+                        for sub in list(component._subs):
+                            await sub.close()
+                        component._subs.clear()
+                        for task in component._tasks:
+                            task.cancel()
+                        await asyncio.gather(*component._tasks, return_exceptions=True)
+                        component._tasks.clear()
+                finally:
+                    try:
+                        await self.bus.stop()
+                    finally:
+                        for client in self._llm_clients:
+                            client.set_active(False)
+                        self.tts.set_active(False)
+                        self._instance_lock.release()
+                raise
 
     async def stop(self) -> None:
-        if not self._running:
-            return
-        self._running = False
-        if self._ticker_task is not None:
-            self._ticker_task.cancel()
+        async with self._lifecycle_lock:
+            if not self._running:
+                return
+            self._running = False
+            errors = []
             try:
-                await self._ticker_task
-            except asyncio.CancelledError:
-                pass
-        for service in reversed(self.services):
-            await service.stop()
-        for organ in reversed(self._all_organs):
-            await organ.stop()
-        await self.bus.stop()
+                pending_requests = [task for task in self._foreground_tasks if task is not asyncio.current_task()]
+                for task in pending_requests:
+                    task.cancel()
+                if pending_requests:
+                    await asyncio.gather(*pending_requests, return_exceptions=True)
+                if self._ticker_task is not None:
+                    self._ticker_task.cancel()
+                    try:
+                        await self._ticker_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(exc)
+                    self._ticker_task = None
+                for service in reversed(self.services):
+                    try:
+                        await service.stop()
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(exc)
+                try:
+                    await self.bus.flush()
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+                for organ in reversed(self._all_organs):
+                    try:
+                        await organ.stop()
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(exc)
+            finally:
+                try:
+                    await self.bus.stop()
+                finally:
+                    for client in self._llm_clients:
+                        client.set_active(False)
+                    self.tts.set_active(False)
+                    self._instance_lock.release()
+            if errors:
+                for error in errors:
+                    self._log.error("停止时发生错误: %s", error)
+                raise errors[0]
 
     async def _tick_loop(self) -> None:
         last = self.clock.monotonic()
@@ -225,6 +292,7 @@ class SuwanRuntime:
 
     def set_llm_provider(self, provider: str) -> None:
         self.llm = LLMClient(self.settings, provider=provider, clock=self.clock)
+        self._llm_clients.append(self.llm)
         self._sync_flags()
 
     def set_llm_model(self, model: str) -> None:
@@ -243,11 +311,17 @@ class SuwanRuntime:
         """经总线请求 TTS 服务合成语音；返回 (filepath, None) 或 (None, error)。"""
         if not self._running:
             return None, "运行时未启动"
+        if not self._api_enabled:
+            return None, "API 未开启"
         voice = voice or getattr(self, "tts_voice", "mimo_default")
+        task = asyncio.current_task()
+        self._foreground_tasks.add(task)
         try:
             data = await request(self.bus, TTS_REQUEST, TTS_DONE, {"text": text, "voice": voice}, timeout=60.0)
         except RpcTimeoutError:
             return None, "语音合成超时"
+        finally:
+            self._foreground_tasks.discard(task)
         ok = bool(data.get("ok"))
         return (data.get("file"), None) if ok else (None, str(data.get("error") or "语音合成失败"))
 
@@ -262,7 +336,14 @@ class SuwanRuntime:
     # ---------- 门面 ----------
     async def ask(self, text: str) -> str:
         """发一句话给苏晚并返回回复（本地/LLM）。"""
-        return await self.chat_service.chat(text)
+        if not self._running:
+            raise RuntimeError("运行时未启动")
+        task = asyncio.current_task()
+        self._foreground_tasks.add(task)
+        try:
+            return await self.chat_service.chat(text)
+        finally:
+            self._foreground_tasks.discard(task)
 
     async def check_api_connection(self) -> tuple[bool, str]:
         """探测当前供应商的 API 连通性（真实发一次极短请求）。
@@ -276,10 +357,17 @@ class SuwanRuntime:
         llm = self.llm
         if llm is None or not llm.available:
             return False, f"未配置密钥（{llm.provider if llm else '?'}）"
+        task = asyncio.current_task()
+        self._foreground_tasks.add(task)
         try:
-            reply = await asyncio.to_thread(llm.chat, "你是一个连通性测试助手。", "请只回复：OK", 8)
+            reply = await asyncio.wait_for(
+                asyncio.to_thread(llm.chat, "你是一个连通性测试助手。", "请只回复：OK", 8),
+                timeout=LLM_TIMEOUT_SECONDS,
+            )
         except Exception as exc:  # noqa: BLE001
             return False, f"连接失败：{type(exc).__name__}: {str(exc)[:80]}"
+        finally:
+            self._foreground_tasks.discard(task)
         if reply:
             return True, f"连接成功（{llm.provider}/{llm.model}）"
         return False, f"连接失败或超时（{llm.provider}/{llm.model}）"

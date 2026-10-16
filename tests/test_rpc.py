@@ -11,7 +11,7 @@ from pathlib import Path
 from suwan.adapters.filestore import ensure_dir
 from suwan.bus import EventBus, Subscription
 from suwan.clock import ManualClock
-from suwan.events import SEARCH_REQUESTED, SEARCH_RESULT
+from suwan.events import MEMORY_ADD_REQUEST, MEMORY_ADDED, SEARCH_REQUESTED, SEARCH_RESULT
 from suwan.organs.identity import IdentityOrgan
 from suwan.organs.memory import MemoryOrgan
 from suwan.rpc import RpcTimeoutError, register_user_name, remember, request
@@ -116,6 +116,66 @@ class RpcTest(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(name, "阿遥")
 
+    def test_queue_backpressure_is_inside_timeout_and_cancel_cleans_up(self) -> None:
+        async def scenario() -> None:
+            bus = EventBus(default_queue_size=1)
+            entered, blocked = asyncio.Event(), asyncio.Event()
+
+            async def slow(event) -> None:
+                entered.set()
+                await blocked.wait()
+
+            bus.subscribe("slow.request", slow)
+            await bus.start()
+            await bus.publish("slow.request", {"n": 1})
+            await entered.wait()
+            await bus.publish("slow.request", {"n": 2})
+            initial = bus.stats()["subscribers"]
+            with self.assertRaises(RpcTimeoutError):
+                await asyncio.wait_for(request(bus, "slow.request", "slow.reply", {}, timeout=0.03), 0.5)
+            self.assertEqual(bus.stats()["subscribers"], initial)
+            pending = asyncio.create_task(request(bus, "slow.request", "slow.reply", {}, timeout=10))
+            await asyncio.sleep(0)
+            pending.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await pending
+            self.assertEqual(bus.stats()["subscribers"], initial)
+            await bus.stop()
+
+        run(scenario())
+
+    def test_concurrent_requests_keep_their_correlations(self) -> None:
+        async def scenario() -> None:
+            bus = EventBus()
+            EchoTopic.subscribe_echo(bus)
+            await bus.start()
+            results = await asyncio.gather(*(
+                request(bus, EchoTopic.REQUEST, EchoTopic.RESULT, {"payload": i}) for i in range(20)
+            ))
+            self.assertEqual([r["echo"] for r in results], list(range(20)))
+            self.assertEqual(bus.stats()["subscribers"], 1)
+            await bus.stop()
+
+        run(scenario())
+
+    def test_remember_propagates_durable_request_and_rejects_negative_ack(self) -> None:
+        async def scenario() -> None:
+            bus = EventBus()
+            seen = []
+
+            async def fail(event) -> None:
+                seen.append(event.data)
+                await bus.publish(MEMORY_ADDED, {"rid": event.data["rid"], "ok": False, "error": "disk full"})
+
+            bus.subscribe(MEMORY_ADD_REQUEST, fail)
+            await bus.start()
+            self.assertFalse(await remember(bus, "gift", persist=True, receipt="abc"))
+            self.assertTrue(seen[0]["persist"])
+            self.assertEqual(seen[0]["receipt"], "abc")
+            await bus.stop()
+
+        run(scenario())
+
 
 class SearchServiceTest(unittest.TestCase):
     def _run(self, browser) -> tuple[bool, str]:
@@ -148,6 +208,12 @@ class SearchServiceTest(unittest.TestCase):
     def test_exception_branch(self) -> None:
         ok, _text = self._run(FakeBrowser(raise_on_search=True))
         self.assertFalse(ok)
+
+    def test_every_browser_error_is_a_failed_search(self) -> None:
+        for marker in ("[访问超时]", "[连接失败]", "[HTTP错误 503]", "[访问失败: error]", "[重定向失败]"):
+            with self.subTest(marker=marker):
+                ok, _ = self._run(FakeBrowser(text=marker))
+                self.assertFalse(ok)
 
 
 if __name__ == "__main__":

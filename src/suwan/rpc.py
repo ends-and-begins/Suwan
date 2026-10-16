@@ -20,11 +20,17 @@ class RpcTimeoutError(TimeoutError):
     """请求/应答超时。"""
 
 
-async def remember(bus, content: str, importance: float = 5.0, emotion: float = 50.0) -> bool:
+async def remember(
+    bus, content: str, importance: float = 5.0, emotion: float = 50.0,
+    *, persist: bool = False, receipt: str | None = None,
+) -> bool:
     """经总线请求记忆写入（等待应答）；失败记录并返回 False，不阻塞业务。"""
     try:
-        await request(bus, MEMORY_ADD_REQUEST, MEMORY_ADDED, {"content": content, "importance": float(importance), "emotion": float(emotion)})
-        return True
+        data = await request(bus, MEMORY_ADD_REQUEST, MEMORY_ADDED, {
+            "content": content, "importance": float(importance), "emotion": float(emotion),
+            "persist": bool(persist), "receipt": receipt,
+        })
+        return bool(data.get("ok", True))
     except RpcTimeoutError:
         logger.warning("记忆写入应答超时，内容已忽略: %s", str(content)[:40])
         return False
@@ -54,13 +60,20 @@ async def request(bus, request_topic: str, reply_topic: str, payload: dict, *, t
             future.set_result(dict(event.data))
 
     sub = bus.subscribe(reply_topic, on_reply)
-    try:
+
+    async def roundtrip() -> dict:
+        # 排队背压也属于请求耗时，不能在 publish 返回后才开始计时。
         await bus.publish(request_topic, {**payload, "rid": rid})
+        return await future
+
+    try:
         try:
-            return await asyncio.wait_for(future, timeout)
+            return await asyncio.wait_for(roundtrip(), timeout)
         except asyncio.TimeoutError as exc:
             raise RpcTimeoutError(f"RPC 超时: {request_topic} -> {reply_topic}") from exc
     finally:
         # 无论成功/超时/取消都要退订临时应答订阅（unsubscribe 幂等；
         # 成功路径 handler 已退订，此处重复调用无害）
         sub.unsubscribe()
+        if not future.done():
+            future.cancel()

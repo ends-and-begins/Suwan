@@ -26,6 +26,7 @@ USER_ACTIVE = "user.active"                   # {} 用户刚互动（更新时�
 
 # 输入（传感器）
 SENSOR_USER_MESSAGE = "sensor.user_message"   # {text, source, ts}
+SENSOR_RECORDED = "sensor.recorded"           # {rid, kind} 感官已记录回执
 SENSOR_SHARE_FILE = "sensor.share_file"       # {name, path, content}
 
 # 认知
@@ -37,8 +38,8 @@ ACT_CHOSEN = "act.chosen"                     # {action} 决策广播
 ACT_DONE = "act.done"                         # {action, note}
 
 # 记忆（增删走总线请求/应答；纯查询直调器官方法）
-MEMORY_ADD_REQUEST = "memory.add.request"     # {content, importance, emotion, rid}
-MEMORY_ADDED = "memory.added"                 # {rid, content, importance, emotion} 应答/通报
+MEMORY_ADD_REQUEST = "memory.add.request"     # {content, importance, emotion, rid, persist?, receipt?}
+MEMORY_ADDED = "memory.added"                 # {rid, content, importance, emotion, ok, error?} 应答/通报
 MEMORY_CLEANED = "memory.cleaned"             # {n} 通报
 MEMORY_COMPACTED = "memory.compacted"         # {n} 通报
 

@@ -79,10 +79,10 @@ class MemoryOrganTest(unittest.TestCase):
         organ.add("新近重要记忆", importance=9.0)
         clock.advance(40 * 24 * 3600)  # 40 天
         merged = organ.compress_old(keep_count=2)
-        self.assertGreater(merged, 0)
+        self.assertEqual(merged, 0)
         contents = [m.content for m in organ.items]
         self.assertIn("新近重要记忆", contents)  # importance 9 不受压缩影响
-        self.assertTrue(any(c.startswith("旧日摘要") for c in contents))
+        self.assertEqual(contents, [f"旧片段{i}" for i in range(10)] + ["新近重要记忆"])
 
     def test_load_tolerant_of_missing(self) -> None:
         bus, clock, organ = self._make()

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 
+from suwan.adapters.browser import is_browser_error
 from suwan.bus import EventBus
 from suwan.clock import Clock
 from suwan.events import SEARCH_REQUESTED, SEARCH_RESULT
@@ -33,5 +34,5 @@ class SearchService(Organ):
         except Exception as exc:  # noqa: BLE001
             await self.bus.publish(SEARCH_RESULT, {"rid": rid, "query": query, "ok": False, "text": f"[搜索异常: {exc}]"})
             return
-        ok = bool(raw) and not any(marker in raw for marker in ("[访问失败]", "[浏览器不可用]", "[不在白名单]", "[未找到"))
+        ok = bool(raw) and not is_browser_error(raw)
         await self.bus.publish(SEARCH_RESULT, {"rid": rid, "query": query, "ok": ok, "text": raw or "[未找到有效信息]"})

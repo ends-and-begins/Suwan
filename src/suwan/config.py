@@ -1,7 +1,7 @@
 """配置：Settings 数据类 + 环境变量加载。
 
 约定（吸取旧版教训，见 bug-registry B05/B13）：
-- .env 在 Settings.from_env()/load_environment() 时统一加载，绝不依赖调用方；
+- .env 在 Settings.from_env()/load_environment() 时统一加载；离线复验显式禁用；
 - 没有"运行时才想起来 load"的隐式流程；key 一律从环境变量读取；
 - 数据默认根仍为 D:/SuwanData（与旧版一致），v2 数据放 <root>/v2，不覆盖旧文件；
   旧数据只读导入（Migrator，见 M4）。
@@ -70,8 +70,10 @@ def load_environment(env_file: str | Path | None = None) -> bool:
     不再回退到"当前工作目录/.env"，杜绝 docs/reference 等子目录副本被误读。
     .env 采用 override=True：即使系统/父进程已有同名（可能为空的）环境变量，
     也以 .env 文件里的值为准——否则会出现"明明填了 key 却没生效"。
+    SUWAN_SKIP_DOTENV=1 时直接返回，不检查或读取候选文件。
     """
-    if load_dotenv is None:
+    # 测试/离线子进程必须能在任何隐式调用之前禁止读取真实配置。
+    if os.environ.get("SUWAN_SKIP_DOTENV") == "1" or load_dotenv is None:
         return False
     project_root = Path(__file__).resolve().parents[2]
     candidates: list[Path] = []
@@ -171,9 +173,15 @@ class Settings:
         *,
         env_file: str | Path | None = None,
         home_dir: str | Path | None = None,
+        load_env: bool = True,
     ) -> "Settings":
-        """从环境变量构造 Settings（会触发 .env 加载）。"""
-        load_environment(env_file)
+        """从环境变量构造设置；load_env=False 时绝不读取 dotenv 文件。
+
+        env={} 只选择配置映射，并不自动禁用 dotenv；离线调用应同时设置
+        load_env=False。进程级 SUWAN_SKIP_DOTENV=1 也会阻止环境文件加载。
+        """
+        if load_env:
+            load_environment(env_file)
         e: Mapping[str, str] = env if env is not None else os.environ
 
         root = Path(home_dir) if home_dir is not None else Path(e.get("SUWAN_HOME", str(DEFAULT_HOME_DIR)))

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 
+from suwan.adapters.tts import TTS_TIMEOUT_SECONDS
 from suwan.bus import EventBus
 from suwan.clock import Clock
 from suwan.events import TTS_DONE, TTS_REQUEST
@@ -27,5 +28,11 @@ class TtsService(Organ):
         if not text:
             await self.bus.publish(TTS_DONE, {"rid": rid, "file": None, "ok": False, "error": "文本为空"})
             return
-        path, error = await asyncio.to_thread(self.tts_client.synthesize, text, voice=voice, save_dir=self.save_dir)
+        try:
+            path, error = await asyncio.wait_for(
+                asyncio.to_thread(self.tts_client.synthesize, text, voice=voice, save_dir=self.save_dir),
+                timeout=TTS_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            path, error = None, f"语音合成失败: {type(exc).__name__}: {exc}"
         await self.bus.publish(TTS_DONE, {"rid": rid, "file": path, "ok": path is not None, "error": error})

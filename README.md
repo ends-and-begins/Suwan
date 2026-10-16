@@ -1,8 +1,8 @@
 # 苏晚 v2 —— 系统工程级重构版
 
-> 状态：当前代码已包含核心器官、认知服务、REPL 与 tkinter 桌面界面；当前环境的运行和接口效果待复验。
+> 状态：2026-10-16 第一轮本地可靠性验收通过，126 个测试与六项离线门禁通过，并完成真实 REPL/Tk 控件及备份恢复演练。真实 LLM、搜索、语音接口尚未验证。
 > 本项目承接旧版模块拆分代码，采用 **asyncio 事件总线 + 器官(organ) 架构**。
-> 下一轮目标、实施路径与验收标准见 [阶段性迭代计划](docs/iteration-plan.md)（2026-10-15）。
+> 本轮修复、验收范围及剩余限制见 [第一轮验收报告](docs/round1-report.md)；后续目标见 [阶段性迭代计划](docs/iteration-plan.md)。
 
 ## 历史重构路线（详见 docs/milestones.md；下列勾选为历史记录）
 - M0 规划/基线盘点 ✅
@@ -11,15 +11,18 @@
 - M3 认知服务（对话/独白/自主行为）✅
 - M4 适配器与持久化（LLM/TTS/浏览器/存储/迁移器/reflection/share/doc）✅
 - M5 前端（REPL、tkinter 界面与桥接代码已具备）✅
-- M6 验收：历史记录为主体完成，最终人工验收待完成；当前环境需重新复验
+- M6 验收：历史记录为主体完成、人工验收待完成；当前本地可靠性复验见第一轮验收报告
 
 ## 运行
 ```powershell
-# 质量门禁（纯标准库：compile + unittest(打印实际用例数) + import 守卫 + CLI 冒烟）
+# 离线门禁：临时源码副本；禁用 dotenv/真实网络；编译、测试、静态守卫、冒烟、对照、自检
 python scripts/run_tests.py
 
 # 行为对照（本地兜底类别断言 6/6）
 python scripts/parity.py
+
+# 集成演练：10次重启、备份恢复、真实 REPL 进程和 Tk 控件（需可用桌面与 tkinter）
+python scripts/acceptance_round1.py --output acceptance-result.json
 
 # 交互 REPL（含 /tts <话> /voice <名> /api /net /doc /status /cfg）
 $env:PYTHONPATH="src"; python -m suwan.frontends.repl --home <数据目录>
@@ -31,13 +34,17 @@ python -m suwan.frontends.repl --smoke "你是谁？" --home <数据目录>
 # 也可直接双击根目录一键启动：start_repl.bat（对话）/ start_gui.bat（图形界面）
 pip install -e ".[dev]"
 ```
-> 首次启动自动把旧版 `<home>/data` 的记忆与用户名**只读、幂等**迁移到 `<home>/v2`
-> （不修改旧文件）。数据默认根为 `D:/SuwanData`（`SUWAN_HOME` 可覆盖）。
+> 保留旧版 `<home>/data` 到 `<home>/v2` 的导入入口，不修改旧文件；迁移前请备份。
+> 正常迁移样例已测，全面故障验收留阶段 1。当前没有旧数据也会写迁移标记，之后补放旧数据不会自动重导。
+> 数据默认根为 `D:/SuwanData`（`SUWAN_HOME` 可覆盖）。
 > 浏览器白名单：默认内置清单；可用 `SUWAN_BROWSER_CONFIG=<json>` 覆盖（单一来源）。
 > EventBus 持久化/重放为保留能力，默认不启用（重放会对副作用订阅者重复分发）。
 > `.env` **权威来源=项目根 `.env`**（不受启动目录影响）；可用 `SUWAN_ENV_FILE=<路径>` 显式指定。
+> 离线工具自动设置 `SUWAN_SKIP_DOTENV=1`；程序构造隔离配置可使用 `Settings.from_env(env={}, load_env=False, home_dir=...)`。
+> 同一 `<home>/v2` 目录只允许一个运行实例。关键数据损坏时拒绝启动并保留原件；恢复步骤见验收报告。
+> 分享文件确认记忆落盘后移入 `<home>/share/.processed/`，失败保留原件。第一轮已暂停破坏性记忆压缩。
 > `docs/reference/` 只保留盘点清单（`suwan23-inventory.md`/`suwan-mvp-inventory.md`）；
-> 旧版大体积代码副本已删除（需要的可在原目录 `D:\suwan project` / `D:\suwan_mvp` 查阅）。
+> 历史源码可在当前工作区上级目录的 `suwan project`、`suwan_project 模块拆分`、`suwan_mvp` 查阅。
 
 ## 模型供应商配置
 在项目根 `.env`（已 gitignore）填写密钥；`Settings.from_env()` 顶层自动加载。

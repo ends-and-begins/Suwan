@@ -9,7 +9,7 @@ from datetime import datetime
 
 from suwan.bus import EventBus
 from suwan.clock import Clock
-from suwan.events import ACT_DONE, CHAT_REPLY, MONOLOGUE_GENERATED, SENSOR_USER_MESSAGE
+from suwan.events import ACT_DONE, CHAT_REPLY, MONOLOGUE_GENERATED, SENSOR_RECORDED, SENSOR_USER_MESSAGE
 from suwan.organs.base import Organ
 
 
@@ -30,9 +30,15 @@ class SensoryBufferOrgan(Organ):
 
     async def _on_user(self, event) -> None:  # noqa: ANN001
         self._push("user", str(event.data.get("text", "")).strip())
+        await self._ack(event, "user")
 
     async def _on_reply(self, event) -> None:  # noqa: ANN001
         self._push("suwan", str(event.data.get("text", "")).strip())
+        await self._ack(event, "suwan")
+
+    async def _ack(self, event, kind: str) -> None:  # noqa: ANN001
+        if event.data.get("rid"):
+            await self.bus.publish(SENSOR_RECORDED, {"rid": event.data["rid"], "kind": kind})
 
     async def _on_monologue(self, event) -> None:  # noqa: ANN001
         self._push("inner", str(event.data.get("text", "")).strip())

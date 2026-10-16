@@ -3,6 +3,7 @@ import asyncio
 import shutil
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from suwan.adapters.filestore import ensure_dir
 from suwan.bus import EventBus
@@ -15,7 +16,7 @@ from suwan.organs.memory import MemoryOrgan
 from suwan.organs.relation import RelationOrgan
 from suwan.organs.sensory import SensoryBufferOrgan
 from suwan.services.chat import ChatService
-from suwan.events import SENSOR_USER_MESSAGE
+from suwan.events import CHAT_REPLY, SENSOR_USER_MESSAGE
 
 TMP = Path(__file__).resolve().parent / ".tmp_chat"
 
@@ -88,6 +89,92 @@ class ChatServiceTest(unittest.TestCase):
             return lines
 
         self.assertGreaterEqual(run(scenario()), 2)  # user + suwan 各一行
+
+    def test_direct_entry_records_each_turn_once_and_orders_concurrent_inputs(self) -> None:
+        async def scenario() -> None:
+            bus, organs, service = self._make()
+            await bus.start()
+            for organ in organs.values():
+                await organ.start()
+            await service.start()
+            replies = []
+
+            async def observe(event) -> None:
+                replies.append(dict(event.data))
+
+            bus.subscribe(CHAT_REPLY, observe)
+            inputs = ["你是谁？", "你在干嘛？", "你心情怎么样？"]
+            answers = await asyncio.gather(*(service.chat(text) for text in inputs))
+            await bus.flush()
+            lines = organs["sensory"].recent(10)
+            self.assertEqual([line["kind"] for line in lines], ["user", "suwan"] * 3)
+            self.assertEqual([line["text"] for line in lines[::2]], inputs)
+            self.assertEqual([line["text"] for line in lines[1::2]], answers)
+            self.assertEqual([reply["user_text"] for reply in replies], inputs)
+            self.assertEqual(len({reply["turn_id"] for reply in replies}), 3)
+            await service.stop()
+            for organ in organs.values():
+                await organ.stop()
+            await bus.stop()
+
+        run(scenario())
+
+    def test_llm_prompt_contains_previous_user_and_reply(self) -> None:
+        class RecordingLLM:
+            available = True
+
+            def __init__(self):
+                self.prompts = []
+
+            def chat(self, system, user, max_tokens=None):
+                self.prompts.append(user)
+                return f"答复{len(self.prompts)}"
+
+        async def scenario() -> None:
+            bus, organs, service = self._make()
+            service.llm = RecordingLLM()
+            service.api_enabled = True
+            await bus.start()
+            for organ in organs.values():
+                await organ.start()
+            await service.start()
+            await service.chat("我喜欢蓝色")
+            await service.chat("刚才提到什么颜色")
+            prompt = service.llm.prompts[-1]
+            self.assertIn("你: 我喜欢蓝色", prompt)
+            self.assertIn("苏晚: 答复1", prompt)
+            self.assertIn("你: 刚才提到什么颜色", prompt)
+            await service.stop()
+            for organ in organs.values():
+                await organ.stop()
+            await bus.stop()
+
+        run(scenario())
+
+    def test_llm_timeout_returns_local_reply(self) -> None:
+        async def delayed_reply(*args, **kwargs):
+            await asyncio.sleep(1)
+            return "不能等待此回复"
+
+        async def scenario() -> None:
+            bus, organs, service = self._make()
+            service.api_enabled = True
+            service.llm = type("AvailableLLM", (), {"available": True})()
+            await bus.start()
+            for organ in organs.values():
+                await organ.start()
+            await service.start()
+            # 阻塞的线程入口作为等待对象替换，验证服务期限和降级决策。
+            with patch("suwan.services.chat.LLM_TIMEOUT_SECONDS", 0.01), patch("suwan.services.chat.asyncio.to_thread", side_effect=delayed_reply):
+                reply = await service.chat("你是谁？")
+            self.assertIn("苏晚", reply)
+            self.assertEqual(service.last_via, "local")
+            await service.stop()
+            for organ in organs.values():
+                await organ.stop()
+            await bus.stop()
+
+        run(scenario())
 
 
 if __name__ == "__main__":
