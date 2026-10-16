@@ -1,0 +1,23 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# --- 敏感/本地 ---
+.env
+
+# --- 参考源副本（含旧版硬编码 key，不入库）---
+docs/reference/suwan23.py
+docs/reference/suwan_mvp/
+
+# --- 运行数据 ---
+data/
+*.log
+tests/.tmp*/
+.tmp*/
