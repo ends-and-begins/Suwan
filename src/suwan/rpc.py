@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import datetime
 
 from suwan.events import MEMORY_ADD_REQUEST, MEMORY_ADDED, NAME_REGISTER_REQUEST, NAME_UPDATED
 
@@ -23,16 +24,23 @@ class RpcTimeoutError(TimeoutError):
 async def remember(
     bus, content: str, importance: float = 5.0, emotion: float = 50.0,
     *, persist: bool = False, receipt: str | None = None,
+    kind: str = "event", source: str = "system", source_ref: str | None = None,
+    occurred_at: datetime | None = None, topic: str = "", derived_from=(), explicit: bool = False,
+    expected_generation: int | None = None,
 ) -> bool:
     """经总线请求记忆写入（等待应答）；失败记录并返回 False，不阻塞业务。"""
     try:
         data = await request(bus, MEMORY_ADD_REQUEST, MEMORY_ADDED, {
             "content": content, "importance": float(importance), "emotion": float(emotion),
             "persist": bool(persist), "receipt": receipt,
+            "kind": kind, "source": source, "source_ref": source_ref,
+            "occurred_at": occurred_at.isoformat() if isinstance(occurred_at, datetime) else occurred_at,
+            "topic": topic, "derived_from": list(derived_from), "explicit": bool(explicit),
+            "expected_generation": expected_generation,
         })
         return bool(data.get("ok", True))
     except RpcTimeoutError:
-        logger.warning("记忆写入应答超时，内容已忽略: %s", str(content)[:40])
+        logger.warning("记忆写入应答超时，状态未确认")
         return False
 
 

@@ -116,7 +116,7 @@ def repl_flow(base: Path) -> dict:
     snapshot = json.loads((home / "v2" / "state.json").read_text(encoding="utf-8"))
     assert snapshot["organs"]["identity"]["user_name"] == "小明"
     records = json.loads((home / "v2" / "memories.json").read_text(encoding="utf-8"))
-    assert any("昨天我们一起看了星空" in item["content"] for item in records)
+    assert any("昨天我们一起看了星空" in item["content"] for item in records["items"])
     return {"real_repl_processes": 2, "exit_codes": [0, 0], "name_and_experience_saved": True}
 
 
@@ -127,6 +127,7 @@ def gui_flow(base: Path) -> dict:
     runtime = SuwanRuntime(settings(home), clock=ManualClock(), migrate_legacy_data=False)
     app = TkApp(runtime)
     app.root.withdraw()
+    tab_count = len(app._tab_chat.master.tabs())
     errors = []
     completed = []
     started = time.monotonic()
@@ -189,7 +190,7 @@ def gui_flow(base: Path) -> dict:
     assert not app.server._thread.is_alive()
     snapshot = json.loads((home / "v2" / "state.json").read_text(encoding="utf-8"))
     assert snapshot["organs"]["identity"]["user_name"] == "小明"
-    return {"real_tk_widgets": True, "messages": 2, "all_six_tabs_opened": True,
+    return {"real_tk_widgets": True, "messages": 2, "all_tabs_opened": True, "tab_count": tab_count,
             "work_created": True, "name_saved_on_close": True, "method": "自动操作真实控件与mainloop"}
 
 
@@ -211,7 +212,7 @@ def gui_close_pending(base: Path) -> dict:
     app = TkApp(runtime)
     app.root.withdraw()
     errors = []
-    elapsed = []
+    closing_started = []
     started = time.monotonic()
 
     def close_when_entered():
@@ -222,12 +223,12 @@ def gui_close_pending(base: Path) -> dict:
                 return
             app.root.after(20, close_when_entered)
             return
-        closing_at = time.monotonic()
+        closing_started.append(time.monotonic())
         app.on_close()
-        elapsed.append(time.monotonic() - closing_at)
 
     def begin():
-        app.entry_var.set("我叫小明")
+        app.server.memory_command("/memory set user.name=小明").result(timeout=3)
+        app.entry_var.set("请聊聊今天的计划")
         app.send()
         app.root.after(20, close_when_entered)
 
@@ -235,12 +236,13 @@ def gui_close_pending(base: Path) -> dict:
         app.root.after(0, begin)
         app.run()
     assert not errors, errors
-    assert elapsed and elapsed[0] < 5, elapsed
+    elapsed = time.monotonic() - closing_started[0] if closing_started else None
+    assert elapsed is not None and elapsed < 5, elapsed
     assert not app.server._thread.is_alive()
     snapshot = json.loads((home / "v2" / "state.json").read_text(encoding="utf-8"))
     assert snapshot["organs"]["identity"]["user_name"] == "小明"
     return {"pending_reply_cancelled": True, "worker_exited": True, "name_saved": True,
-            "close_seconds": round(elapsed[0], 3)}
+            "close_seconds": round(elapsed, 3)}
 
 
 def main() -> int:

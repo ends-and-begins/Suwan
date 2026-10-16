@@ -13,7 +13,7 @@ dependencies = [
     "python-dotenv",
     "beautifulsoup4",
     "requests",
-    "playsound3",
+    "playsound3>=3.0",
 ]
 
 [project.optional-dependencies]

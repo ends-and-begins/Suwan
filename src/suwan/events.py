@@ -46,7 +46,7 @@ MEMORY_COMPACTED = "memory.compacted"         # {n} 通报
 # 产物
 STORY_GENERATED = "story.generated"           # {date, text}
 DOC_GENERATED = "doc.generated"               # {name, path}
-TTS_REQUEST = "tts.request"                   # {text, voice, rid}
+TTS_REQUEST = "tts.request"                   # {text, voice, rid, generation:int}；API/生命周期切换使旧代数失效
 TTS_DONE = "tts.done"                         # {rid, file, ok, error}
 
 # 对外输出
@@ -66,13 +66,18 @@ NAME_UPDATED = "identity.name_updated"        # {rid, name} 应答/通报
 NAME_REGISTER_REQUEST = "identity.name.register.request"  # {name, rid} 请求（Identity 应答）
 
 
+def event_timestamp() -> float:
+    """事件与清理水位共用单调时钟；不受系统日期校时影响。"""
+    return _time.monotonic()
+
+
 @dataclass
 class Event:
     """总线上的事件：topic + 任意 JSON 安全 payload + 时间戳。"""
 
     topic: str
     data: dict[str, Any] = field(default_factory=dict)
-    ts: float = field(default_factory=_time.monotonic)
+    ts: float = field(default_factory=event_timestamp)
 
     def to_jsonable(self) -> dict[str, Any]:
         return {"topic": self.topic, "data": self.data, "ts": self.ts}

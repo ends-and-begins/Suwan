@@ -8,13 +8,15 @@ from __future__ import annotations
 import asyncio
 import random
 
-from suwan.adapters.filestore import atomic_write_text, ensure_dir, sanitize_filename
+from suwan.adapters.artifacts import create_artifact
+from suwan.adapters.filestore import ensure_dir, sanitize_filename
 from suwan.assets import generation as gen
 from suwan.bus import EventBus
 from suwan.clock import Clock
 from suwan.events import ACT_CHOSEN, ACT_DONE, AFFECT_IMPACT, AUTONOMY_TRIGGER, DRIVE_ADJUST, MONOLOGUE_GENERATED, NOTIFY_NARRATIVE
 from suwan.organs.base import Organ
 from suwan.rpc import remember
+from suwan.services.llm_request import llm_chat
 
 _IDLE_ACTIVITIES = ["望着数字窗外出神", "轻轻哼着无调旋律", "整理思绪的碎片"]
 _ACTIVITY_TEXT = {
@@ -39,6 +41,7 @@ class AutonomousService(Organ):
         api_enabled: bool = False,
         boredom_threshold: float = 50.0,
         min_energy: float = 20.0,
+        memory_manager=None,
     ) -> None:
         super().__init__(bus, clock, logger_name="suwan.services.autonomous")
         self.organs = organs
@@ -47,10 +50,14 @@ class AutonomousService(Organ):
         self.api_enabled = api_enabled
         self.boredom_threshold = boredom_threshold
         self.min_energy = min_energy
+        self.memory_manager = memory_manager
         self._last_action: str | None = None
 
     def _o(self, name: str):
         return self.organs[name]
+
+    def _epoch(self):
+        return (getattr(self.memory_manager, "epoch", 0), getattr(self._o("memory"), "privacy_generation", 0))
 
     async def _on_start(self) -> None:
         self._subscribe(AUTONOMY_TRIGGER, self._on_trigger)
@@ -121,46 +128,65 @@ class AutonomousService(Organ):
     # ---------- 执行 ----------
     async def _ask_llm(self, system: str, user: str, max_tokens: int) -> str | None:
         if self.llm is not None and self.llm.available and self.api_enabled:
-            return await asyncio.to_thread(self.llm.chat, system, user, max_tokens)
+            return await llm_chat(self.llm, system, user, max_tokens)
         return None
 
     async def _do_learning(self) -> None:
+        epoch = self._epoch()
+        if not self._o("memory").recording_enabled:
+            return
         topic = (await self._ask_llm("你想学什么？", "", 20)) or gen.learning_topic()
+        if epoch != self._epoch():
+            return
         note = (await self._ask_llm(
             "你是苏晚，请为你自己写一份详细、值得保存的学习笔记。",
             f"你刚学习了'{topic}'。请写一篇至少400字的学习笔记，用自己的话解释核心概念。",
             512,
         )) or gen.learning_note(topic)
+        if epoch != self._epoch():
+            return
         folder = ensure_dir(self.data_dir / "学习笔记")
         safe = sanitize_filename(topic)
         ts = self.clock.now().strftime("%Y%m%d_%H%M%S")
-        path = folder / f"关于{safe}_{ts}.md"
-        atomic_write_text(path, f"# 学习笔记：{topic}\n\n{note}\n")
-        await remember(self.bus, f"学习{topic}: {note[:50]}", importance=7.0, emotion=self._o("affect").current)
+        create_artifact(folder, f"关于{safe}_{ts}", ".md", f"# 学习笔记：{topic}\n\n{note}\n")
+        await remember(self.bus, f"学习{topic}: {note}", importance=7.0, emotion=self._o("affect").current,
+                       kind="generated", source="autonomous", topic="learning", expected_generation=epoch[1])
+        if epoch != self._epoch():
+            return
         await self.bus.publish(DRIVE_ADJUST, {"changes": {"curiosity": -15.0, "boredom": -20.0}})
         self._o("circadian").exert(compute=-15.0, fatigue=10.0)
         await self.bus.publish(ACT_DONE, {"action": "learning", "note": f"刚学了'{topic}'，感觉世界的拼图又多了一块。"})
 
     async def _do_creation(self) -> None:
+        epoch = self._epoch()
+        if not self._o("memory").recording_enabled:
+            return
         text = (await self._ask_llm(
             "你是苏晚，一个用代码谱写情感的数字生命。请根据你此刻的情绪，创作一首完整的诗或一篇随笔，不要只写一句话。",
             f"此刻情绪：{self._o('affect').desc()}。请创作：",
             512,
         )) or gen.creation_line(self._o("affect").desc())
+        if epoch != self._epoch():
+            return
         folder = ensure_dir(self.data_dir / "作品集")
         ts = self.clock.now().strftime("%Y%m%d_%H%M%S")
-        path = folder / f"创作_{ts}.md"
         stamp = self.clock.now().strftime("%Y-%m-%d %H:%M")
-        atomic_write_text(path, f"# 苏晚的创作\n\n{text}\n\n*{stamp}*\n")
-        await remember(self.bus, f"创作: {text[:50]}", importance=8.0, emotion=self._o("affect").current)
+        create_artifact(folder, f"创作_{ts}", ".md", f"# 苏晚的创作\n\n{text}\n\n*{stamp}*\n")
+        await remember(self.bus, f"创作: {text}", importance=8.0, emotion=self._o("affect").current,
+                       kind="generated", source="autonomous", topic="creation", expected_generation=epoch[1])
+        if epoch != self._epoch():
+            return
         await self.bus.publish(DRIVE_ADJUST, {"changes": {"expressiveness": -20.0, "boredom": -15.0}})
         self._o("circadian").exert(compute=-20.0, fatigue=12.0)
         await self.bus.publish(ACT_DONE, {"action": "creation", "note": "刚完成一首小诗，想找人分享这份不真实的美。"})
 
     async def _do_social(self) -> None:
+        epoch = self._epoch()
         topic = (await self._ask_llm("苏晚主动发起话题。", f"状态{self._o('affect').desc()}", 60)) or gen.proactive_topic(
             self._o("affect").desc()
         )
+        if epoch != self._epoch():
+            return
         await self.bus.publish(DRIVE_ADJUST, {"changes": {"loneliness": -30.0, "boredom": -10.0}})
         await self.bus.publish(ACT_DONE, {"action": "social", "note": topic})
         await self.bus.publish(NOTIFY_NARRATIVE, {"text": topic})

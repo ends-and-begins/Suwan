@@ -32,8 +32,12 @@ class IdentityOrgan(Organ):
         await self.bus.publish(NAME_UPDATED, {"rid": event.data.get("rid"), "name": self.user_name})
 
     # ---------- 用户 ----------
-    def register_name(self, name: str) -> None:
+    def register_name(self, name: str | None) -> None:
         self.user_name = name
+
+    def clear_monologues(self) -> None:
+        self.latest_monologue = ""
+        self.monologue_history.clear()
 
     # ---------- 独白 ----------
     def push_monologue(self, text: str, *, latest: bool = True) -> None:

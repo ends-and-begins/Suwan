@@ -57,7 +57,7 @@ class MemorySafetyTest(unittest.TestCase):
                     memory._load()
                     memory.add("恢复后新增")
                     memory.force_save()
-                    self.assertEqual(len(json.loads(path.read_text(encoding="utf-8"))), 2)
+                    self.assertEqual(len(json.loads(path.read_text(encoding="utf-8"))["items"]), 2)
 
     def test_direct_write_validates_existing_file_before_modification(self):
         with TemporaryDirectory() as td:
@@ -172,7 +172,7 @@ class ShareSafetyTest(unittest.TestCase):
             self.assertEqual(await watcher.scan(), 1)
             await bus.flush()
             self.assertEqual(len(memory.items), 1)
-            self.assertEqual(len(json.loads((home / "memory.json").read_text(encoding="utf-8"))), 1)
+            self.assertEqual(len(json.loads((home / "memory.json").read_text(encoding="utf-8"))["items"]), 1)
             self.assertEqual(events.count(SENSOR_SHARE_FILE), 1)
         self.run_scenario(exercise)
 

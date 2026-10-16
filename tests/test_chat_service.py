@@ -159,7 +159,7 @@ class ChatServiceTest(unittest.TestCase):
         async def scenario() -> None:
             bus, organs, service = self._make()
             service.api_enabled = True
-            service.llm = type("AvailableLLM", (), {"available": True})()
+            service.llm = type("AvailableLLM", (), {"available": True, "chat": lambda *args: None})()
             await bus.start()
             for organ in organs.values():
                 await organ.start()

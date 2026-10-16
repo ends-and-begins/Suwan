@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import uuid
 from pathlib import Path
 
 from suwan.adapters.filestore import append_line
@@ -46,6 +47,17 @@ class LLMClient:
         # 云端供应商需 key；keyless（如本地 ollama）无需 key
         return bool(self.api_key) or self._keyless
 
+    def invalidate_pending(self) -> None:
+        """撤销旧上下文的结果与日志；不改变当前启用状态。"""
+        with self._lifecycle_guard:
+            self._generation += 1
+
+    @property
+    def request_generation(self) -> int:
+        """构造提示词时捕获，在线程池排队后仍能识别旧上下文。"""
+        with self._lifecycle_guard:
+            return self._generation
+
     def _get_client(self):
         if self._client is None and self.available:
             from openai import OpenAI  # 延迟导入：不可用/未安装时不拉包
@@ -64,6 +76,9 @@ class LLMClient:
         error: str = "",
         max_tokens: int = 0,
         generation: int | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        call_id: str | None = None,
     ) -> None:
         """写用量日志（线程安全追加 JSONL）。"""
         with self._lifecycle_guard:
@@ -71,12 +86,12 @@ class LLMClient:
                 return
             record = {
                 "time": self._clock.now().isoformat(timespec="seconds"),
-                "provider": self.provider,
-                "model": self.model,
-                "system_prompt": system_prompt[:200],
-                "user_prompt": user_prompt[:200],
-                "response": response[:300],
-                "error": error[:200],
+                "provider": self.provider if provider is None else provider,
+                "model": self.model if model is None else model,
+                "call_id": call_id or str(uuid.uuid4()),
+                "prompt_chars": len(system_prompt) + len(user_prompt),
+                "response_chars": len(response),
+                "error": "request_failed" if error else "",
                 "max_tokens": max_tokens,
                 "success": success,
             }
@@ -85,30 +100,41 @@ class LLMClient:
             except OSError:  # noqa: BLE001
                 self._log.warning("API 用量日志写入失败: %s", self.api_log_file)
 
-    def chat(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None) -> str | None:
+    def chat(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None, *, expected_generation: int | None = None, cancelled: threading.Event | None = None) -> str | None:
         with self._lifecycle_guard:
-            if not self._active:
+            if not self._active or (cancelled is not None and cancelled.is_set()):
                 return None
             generation = self._generation
-        tokens = max_tokens or self.default_max_tokens
+            if expected_generation is not None and expected_generation != generation:
+                return None
+            # GUI 可在请求进行中切换模型，网络参数和审计必须共用同一快照。
+            provider, model = self.provider, self.model
+            tokens = max_tokens or self.default_max_tokens
+            call_id = str(uuid.uuid4())
         try:
             client = self._get_client()
             if client is None:
                 return None
+            with self._lifecycle_guard:
+                # 这是请求的发送授权边界。初始化/排队期间已撤销的提示词
+                # 不进入 SDK；授权后已在途的外部请求不能由本地取消撤回。
+                if not self._active or generation != self._generation or (cancelled is not None and cancelled.is_set()):
+                    return None
             resp = client.chat.completions.create(
-                model=self.model,
+                model=model,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
                 temperature=0.85,
                 max_tokens=tokens,
                 timeout=LLM_TIMEOUT_SECONDS,
             )
             text = (resp.choices[0].message.content or "").strip() or None
-            self._log_call(success=True, system_prompt=system_prompt, user_prompt=user_prompt, response=text or "", max_tokens=tokens, generation=generation)
             with self._lifecycle_guard:
-                if not self._active or self._generation != generation:
+                if not self._active or self._generation != generation or (cancelled is not None and cancelled.is_set()):
                     return None
+                self._log_call(success=True, system_prompt=system_prompt, user_prompt=user_prompt, response=text or "", max_tokens=tokens, generation=generation, provider=provider, model=model, call_id=call_id)
             return text
         except Exception as exc:  # noqa: BLE001 任何失败都降级
-            self._log.warning("LLM 调用失败(%s/%s): %s", self.provider, self.model, exc)
-            self._log_call(success=False, system_prompt=system_prompt, user_prompt=user_prompt, error=str(exc), max_tokens=tokens, generation=generation)
+            self._log.warning("LLM 调用失败(%s/%s): %s", provider, model, type(exc).__name__)
+            if cancelled is None or not cancelled.is_set():
+                self._log_call(success=False, system_prompt=system_prompt, user_prompt=user_prompt, error=str(exc), max_tokens=tokens, generation=generation, provider=provider, model=model, call_id=call_id)
             return None

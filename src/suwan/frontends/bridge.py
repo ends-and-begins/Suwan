@@ -19,6 +19,7 @@ _FORWARD = {
     NOTIFY_NARRATIVE: "narrative",
     MONOLOGUE_GENERATED: "inner",
     DOC_GENERATED: "doc",
+    "memory.context_reset": "memory_reset",
 }
 
 
@@ -27,6 +28,10 @@ class TkBridge:
 
     def __init__(self) -> None:
         self.inbox: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=500)
+        self._reset: dict[str, Any] | None = None
+        self._reset_lock = threading.Lock()
+        self.context_epoch = None
+        self.accepts_event = None
         self._subs: list[Any] = []
 
     async def start(self, bus) -> None:
@@ -40,8 +45,18 @@ class TkBridge:
 
     def _make_handler(self, kind: str):
         async def handler(event) -> None:  # noqa: ANN001
+            if kind != "memory_reset" and self.accepts_event is not None and not self.accepts_event(event):
+                return
+            item = {"kind": kind, "topic": event.topic, "data": dict(event.data)}
+            if self.context_epoch is not None:
+                item["epoch"] = self.context_epoch()
+            if kind == "memory_reset":
+                # Reset must survive a full notifications queue and be processed first.
+                with self._reset_lock:
+                    self._reset = item
+                return
             try:
-                self.inbox.put_nowait({"kind": kind, "topic": event.topic, "data": dict(event.data)})
+                self.inbox.put_nowait(item)
             except queue.Full:
                 pass  # GUI 太慢就丢弃，绝不阻塞事件循环
 
@@ -49,6 +64,10 @@ class TkBridge:
 
     def drain(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
+        with self._reset_lock:
+            if self._reset is not None:
+                out.append(self._reset)
+                self._reset = None
         while True:
             try:
                 out.append(self.inbox.get_nowait())
@@ -63,12 +82,15 @@ class RuntimeThread:
     def __init__(self, runtime, bridge: TkBridge | None = None) -> None:
         self.runtime = runtime
         self.bridge = bridge or TkBridge()
+        self.bridge.context_epoch = self.context_epoch
+        self.bridge.accepts_event = lambda event: self.runtime.organs["sensory"].accepts(event)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ready = threading.Event()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._serve, name="suwan-runtime", daemon=True)
         self._startup_error: BaseException | None = None
         self._shutdown_error: BaseException | None = None
+        self._runtime_stopped = threading.Event()
 
     def start(self) -> None:
         self._thread.start()
@@ -111,6 +133,8 @@ class RuntimeThread:
                 await self.runtime.stop()
             except BaseException as exc:
                 self._shutdown_error = exc
+            finally:
+                self._runtime_stopped.set()
 
     # ---------- 从 GUI 线程调用 ----------
     def _submit(self, coro) -> Future:
@@ -128,21 +152,50 @@ class RuntimeThread:
         """把一句话提交给运行时；返回 Future[str]，用回调取回。"""
         return self._submit(self.runtime.ask(text))
 
-    def speak(self, text: str, voice: str | None = None) -> Future:
+    def ask_with_context(self, text: str) -> Future:
+        """Reply plus the epoch of the context that produced it; GUI must retain both."""
+        return self._submit(self.runtime.ask_with_context(text))
+
+    def context_epoch(self) -> tuple[int, int]:
+        return self.runtime.context_epoch()
+
+    def context_current(self, epoch) -> bool:
+        return self.runtime.context_current(epoch)
+
+    def speak(self, text: str, voice: str | None = None, *, expected_epoch=None) -> Future:
         """请求 TTS（走总线）；返回 Future[(path|None, error|None)]。"""
-        return self._submit(self.runtime.speak(text, voice=voice))
+        return self._submit(self.runtime.speak(text, voice=voice, expected_epoch=expected_epoch))
+
+    def document(self, topic: str) -> Future:
+        return self._submit(self.runtime.doc_service.generate(topic))
 
     def api_check(self) -> Future:
         """请求 API 连通性探测；返回 Future[(ok, msg)]。"""
         return self._submit(self.runtime.check_api_connection())
 
+    def memory_command(self, command: str) -> Future:
+        async def execute():
+            result = await self.runtime.memory_command(command)
+            return {**result, "_context_epoch": self.context_epoch()}
+        return self._submit(execute())
+
     def set_tts_voice(self, voice: str) -> None:
         self.runtime.set_tts_voice(voice)
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        """非阻塞发出退出请求，GUI 用 shutdown_status 轮询实际退出。"""
         self._stop.set()
+
+    def shutdown_status(self) -> dict:
+        """区分数据收尾与同步外部线程退出，避免提前销毁窗口。"""
+        return {"finished": not self._thread.is_alive(),
+                "runtime_stopped": self._runtime_stopped.is_set(),
+                "error": self._shutdown_error}
+
+    def stop(self, timeout: float = 15.0) -> None:
+        self.request_stop()
         if self._thread.is_alive():
-            self._thread.join(timeout=15)
+            self._thread.join(timeout=timeout)
         if self._thread.is_alive():
             raise TimeoutError("运行时尚未完成退出，不能确认保存已完成")
         if self._shutdown_error is not None:

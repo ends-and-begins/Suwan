@@ -54,6 +54,29 @@ class CompletionQueueTest(unittest.TestCase):
         callback(*args)
         self.assertEqual(rendered, [(False, "模拟失败")])
 
+    def test_reply_context_is_preserved_on_the_ui_queue(self):
+        app = self.app_without_widgets()
+        rendered = []
+        app._render_reply = lambda text, epoch: rendered.append((text, epoch))
+        future = Future()
+        future.set_result({"text": "本轮答复", "epoch": (4, 7)})
+        app._on_reply_done(future)
+        callback, args = app._ui_callbacks.get_nowait()
+        callback(*args)
+        self.assertEqual(rendered, [("本轮答复", (4, 7))])
+
+    def test_reply_without_provenance_cannot_be_promoted_to_current_context(self):
+        app = self.app_without_widgets()
+        errors = []
+        app._log_msg = lambda text, level: errors.append((text, level))
+        future = Future()
+        future.set_result("没有来源版本的旧正文")
+        app._on_reply_done(future)
+        callback, args = app._ui_callbacks.get_nowait()
+        callback(*args)
+        self.assertIn("ValueError", errors[0][0])
+        self.assertNotIn("旧正文", errors[0][0])
+
 
 if __name__ == "__main__":
     unittest.main()

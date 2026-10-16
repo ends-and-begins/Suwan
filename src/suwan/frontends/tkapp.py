@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import argparse
 import queue
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
 from suwan.adapters.tts import VOICE_PRESETS
+from suwan.adapters.playback import AudioPlayback
 from suwan.config import ENDPOINT_ENV, MODEL_CANDIDATES, PROVIDER_LABELS, Settings
 from suwan.frontends.bridge import RuntimeThread, TkBridge
 
@@ -46,6 +48,9 @@ class TkApp:
         self._ui_callbacks = queue.SimpleQueue()
         self._closing = False
         self._after_ids: set[str] = set()
+        self._speech_generation = 0
+        self._speech_future = None
+        self._playback = AudioPlayback()
         self.server = RuntimeThread(runtime, TkBridge())
         self.server.start()
         self.root = tk.Tk()
@@ -57,6 +62,13 @@ class TkApp:
 
         self._provider_by_label = {PROVIDER_LABELS[p]: p for p in ENDPOINT_ENV}
         self._last_reply = ""
+        self._last_reply_epoch = None
+        self._ui_context_epoch = self.server.context_epoch()
+        self._memory_generation = 0
+        self._memory_rows: dict[str, dict] = {}
+        self._memory_page = self._memory_pages = 1
+        self._memory_mode = "list"
+        self._memory_search_text = ""
         self._log_entries: list[tuple[str, str]] = []  # (level, text)
         self._toggles: list = []  # (canvas, oval, var, on_color, on_toggle)
 
@@ -71,7 +83,12 @@ class TkApp:
         self._sync_settings_from_runtime()
         self._refresh_api_indicator()
         self._log_msg("苏晚 v2 已启动 · API/联网/模型/音色等设置在“设置”页", "info")
+        for warning in getattr(runtime.settings, "configuration_warnings", ()):
+            self._log_msg(warning, "warn")
+        for warning in getattr(runtime, "startup_warnings", ()):
+            self._log_msg(warning, "warn")
         self._schedule_views()
+        self._memory_list()
 
     # ---------- 样式 ----------
     def _style(self) -> None:
@@ -116,15 +133,17 @@ class TkApp:
         nb = ttk.Notebook(self.root)
         nb.grid(row=row, column=0, sticky="nsew", padx=12)
         tabs = {}
-        for key, text in (("chat", "对话"), ("status", "状态板"), ("settings", "设置"),
+        for key, text in (("chat", "对话"), ("memory", "记忆"), ("status", "状态板"), ("settings", "设置"),
                           ("works", "作品集"), ("story", "人生故事"), ("log", "系统日志")):
             frame = tk.Frame(nb, bg=PANEL)
             nb.add(frame, text=text)
             tabs[key] = frame
         self._tab_chat, self._tab_status = tabs["chat"], tabs["status"]
         self._tab_settings = tabs["settings"]
+        self._tab_memory = tabs["memory"]
         self._tab_works, self._tab_story, self._tab_log = tabs["works"], tabs["story"], tabs["log"]
         self._build_chat()
+        self._build_memory()
         self._build_status()
         self._build_settings()
         self._build_works()
@@ -152,6 +171,176 @@ class TkApp:
         self.status_text = tk.StringVar(value="（读取中…）")
         tk.Label(canvas, textvariable=self.status_text, justify="left", anchor="nw", font=("Cascadia Mono", 10), fg=FG, bg=PANEL).pack(fill=tk.BOTH, expand=True)
         self._label(canvas, "状态板为只读视图，每 2s 刷新", color="#5f6670", size=8).pack(anchor="w", pady=(8, 0))
+
+    def _build_memory(self) -> None:
+        head = tk.Frame(self._tab_memory, bg=PANEL)
+        head.pack(fill=tk.X, padx=10, pady=10)
+        self.memory_query = tk.StringVar()
+        entry = tk.Entry(head, textvariable=self.memory_query, bg=FIELD, fg=FG, insertbackground=FG)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
+        entry.bind("<Return>", lambda _event: self._memory_search())
+        ttk.Button(head, text="搜索", command=self._memory_search).pack(side=tk.LEFT, padx=4)
+        ttk.Button(head, text="列表 / 刷新", command=self._memory_list).pack(side=tk.LEFT)
+        self.memory_state = tk.StringVar(value="正在读取记忆…")
+        navigation = tk.Frame(self._tab_memory, bg=PANEL)
+        navigation.pack(fill=tk.X, padx=10)
+        self._memory_kinds = {"全部类型": None, "事实": "fact", "经历": "event", "知识": "knowledge", "生成内容": "generated", "推测": "inference", "历史记录": "legacy"}
+        self.memory_kind = tk.StringVar(value="全部类型")
+        kinds = ttk.Combobox(navigation, textvariable=self.memory_kind, values=list(self._memory_kinds), state="readonly", width=13)
+        kinds.pack(side=tk.LEFT)
+        kinds.bind("<<ComboboxSelected>>", lambda _event: self._memory_list())
+        self.memory_previous = ttk.Button(navigation, text="上一页", command=lambda: self._memory_turn(-1))
+        self.memory_previous.pack(side=tk.LEFT, padx=(8, 4))
+        self.memory_next = ttk.Button(navigation, text="下一页", command=lambda: self._memory_turn(1))
+        self.memory_next.pack(side=tk.LEFT)
+        self.memory_page_label = tk.StringVar(value="第 1 / 1 页")
+        tk.Label(navigation, textvariable=self.memory_page_label, bg=PANEL, fg=SUB).pack(side=tk.LEFT, padx=8)
+        ttk.Button(navigation, text="按 ID 定位", command=self._memory_locate).pack(side=tk.RIGHT)
+        self._label(self._tab_memory, "每页100条活动记忆；列表可筛选类型，管理搜索包含生成内容与推测。", color=SUB).pack(anchor="w", padx=12)
+        self.memory_tree = ttk.Treeview(self._tab_memory, columns=("kind", "source", "time", "content"), show="headings", height=10)
+        for key, text, width in (("kind", "类型", 75), ("source", "来源", 90), ("time", "记录时间", 155), ("content", "内容", 560)):
+            self.memory_tree.heading(key, text=text)
+            self.memory_tree.column(key, width=width, minwidth=55, stretch=key == "content")
+        self.memory_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        self.memory_tree.bind("<<TreeviewSelect>>", self._memory_selected)
+        self.memory_detail = self._scrolled(self._tab_memory)
+        self.memory_detail.configure(height=6, state="disabled")
+        self.memory_detail.pack(fill=tk.X, padx=10, pady=(0, 6))
+        row = tk.Frame(self._tab_memory, bg=PANEL)
+        row.pack(fill=tk.X, padx=10, pady=4)
+        for label, callback in (("补充经历", self._memory_add), ("设置事实", self._memory_set), ("纠正选中记录", self._memory_correct), ("遗忘选中及派生", self._memory_forget)):
+            ttk.Button(row, text=label, command=callback).pack(side=tk.LEFT, padx=(0, 6))
+        self.memory_pause = ttk.Button(row, text="暂停记录", command=self._memory_toggle)
+        self.memory_pause.pack(side=tk.RIGHT)
+        tk.Label(self._tab_memory, textvariable=self.memory_state, bg=PANEL, fg=ACCENT, anchor="w", wraplength=1050).pack(fill=tk.X, padx=12, pady=4)
+        self._label(self._tab_memory, "遗忘清理活动记忆和会话缓存；备份、分享归档及已导出作品仍保留。暂停期间显式管理仍可用。", color=SUB, size=8).pack(anchor="w", padx=12, pady=(0, 10))
+
+    def _memory_search(self) -> None:
+        query = self.memory_query.get().strip()
+        if not query:
+            self._memory_list()
+            return
+        self._memory_mode, self._memory_search_text, self._memory_page = "find", query, 1
+        self._memory_load_page()
+
+    def _memory_list(self) -> None:
+        self._memory_mode, self._memory_page = "list", 1
+        self._memory_load_page()
+
+    def _memory_turn(self, delta: int) -> None:
+        page = self._memory_page + delta
+        if 1 <= page <= self._memory_pages:
+            self._memory_page = page
+            self._memory_load_page()
+
+    def _memory_load_page(self) -> None:
+        if self._memory_mode == "find":
+            command = f"/memory find --all --page {self._memory_page} {self._memory_search_text}"
+        else:
+            command = f"/memory list {self._memory_page}"
+            kind = self._memory_kinds.get(self.memory_kind.get())
+            if kind:
+                command += f" --kind {kind}"
+        self._memory_request(command)
+
+    def _memory_locate(self) -> None:
+        item_id = simpledialog.askstring("按 ID 定位", "输入完整记忆 ID：", parent=self.root)
+        if item_id and item_id.strip():
+            self._memory_request("/memory show " + item_id.strip())
+
+    def _memory_request(self, command: str) -> None:
+        if self._closing:
+            return
+        self._memory_generation += 1
+        generation = self._memory_generation
+        try:
+            future = self.server.memory_command(command)
+        except RuntimeError as exc:
+            self.memory_state.set(str(exc))
+            return
+
+        def done(fut):
+            try:
+                result = fut.result()
+            except Exception as exc:
+                result = {"ok": False, "text": f"记忆操作失败：{type(exc).__name__}"}
+            self._queue_ui(self._render_memory, result, generation)
+        future.add_done_callback(done)
+
+    def _render_memory(self, result: dict, generation: int) -> None:
+        if self._closing or generation != self._memory_generation:
+            return
+        if "_context_epoch" in result and not self.server.context_current(result["_context_epoch"]):
+            return
+        self._memory_recording = result.get("recording_enabled", True)
+        self.memory_pause.configure(text="暂停记录" if self._memory_recording else "恢复记录")
+        if "items" in result:
+            self._memory_page = result.get("page", 1)
+            self._memory_pages = max(1, result.get("pages", 1))
+            self.memory_page_label.set(f"第 {self._memory_page} / {self._memory_pages} 页 · 共 {result.get('total', len(result['items']))} 条")
+            self.memory_previous.configure(state="normal" if self._memory_page > 1 else "disabled")
+            self.memory_next.configure(state="normal" if self._memory_page < self._memory_pages else "disabled")
+            self._memory_rows = {row["id"]: row for row in result["items"]}
+            self.memory_tree.delete(*self.memory_tree.get_children())
+            for item_id, row in self._memory_rows.items():
+                self.memory_tree.insert("", "end", iid=item_id, values=(row["kind"], row["source"], (row["created"] or "未知")[:19], row["content"][:200]))
+            self.memory_state.set(f"自动长期记录：{'开启' if self._memory_recording else '暂停'} · 显示 {len(self._memory_rows)} 条")
+            self.memory_detail.configure(state="normal")
+            self.memory_detail.delete("1.0", tk.END)
+            self.memory_detail.configure(state="disabled")
+            if result.get("action") == "show" and result["items"]:
+                self.memory_tree.selection_set(result["items"][0]["id"])
+                self._memory_selected()
+        else:
+            self.memory_state.set(result.get("text", ""))
+            if result.get("ok") and result.get("action") not in {"status", "help"}:
+                self._last_reply = ""
+                self._last_reply_epoch = None
+                self._stop_speaking()
+                self._memory_list()
+
+    def _memory_selected(self, _event=None) -> None:
+        selection = self.memory_tree.selection()
+        if not selection:
+            return
+        row = self._memory_rows.get(selection[0])
+        if not row:
+            return
+        detail = f"ID: {row['id']}\n类型/来源: {row['kind']} / {row['source']}\n来源引用: {row['source_ref'] or '无'}\n事实键: {row['fact_key'] or '无'}\n派生来源: {', '.join(row['derived_from']) or '无'}\n\n{row['content']}"
+        self.memory_detail.configure(state="normal")
+        self.memory_detail.delete("1.0", tk.END)
+        self.memory_detail.insert(tk.END, detail)
+        self.memory_detail.configure(state="disabled")
+
+    def _memory_add(self) -> None:
+        content = simpledialog.askstring("补充经历", "输入要保存的经历：", parent=self.root)
+        if content and content.strip():
+            self._memory_request("/memory add " + content.strip())
+
+    def _memory_set(self) -> None:
+        text = simpledialog.askstring("设置事实", "输入 键=值，例如 user.name=小明 或 user.city=苏州：", parent=self.root)
+        if text:
+            self._memory_request("/memory set " + text)
+
+    def _memory_correct(self) -> None:
+        selection = self.memory_tree.selection()
+        if not selection:
+            self.memory_state.set("请先选中一条记忆。")
+            return
+        row = self._memory_rows[selection[0]]
+        text = simpledialog.askstring("纠正记录", "输入新的事实值：" if row["fact_key"] else "输入纠正后的完整内容：", initialvalue=row["fact_value"] or row["content"], parent=self.root)
+        if text and text.strip():
+            self._memory_request(f"/memory correct {selection[0]} {text.strip()}")
+
+    def _memory_forget(self) -> None:
+        selection = self.memory_tree.selection()
+        if selection:
+            self._memory_request("/memory forget " + selection[0])
+        else:
+            self.memory_state.set("请先选中一条记忆；遗忘将同时移除关联修订和派生记忆。")
+
+    def _memory_toggle(self) -> None:
+        self._memory_request("/memory pause" if getattr(self, "_memory_recording", True) else "/memory resume")
 
     # ---------- 设置页（控制面板搬家） ----------
     def _build_settings(self) -> None:
@@ -195,21 +384,24 @@ class TkApp:
         row3 = tk.Frame(ctl, bg=PANEL)
         row3.pack(fill=tk.X, pady=(8, 4))
         self._label(row3, "音色", color=SUB).pack(side=tk.LEFT)
-        self.voice_var = tk.StringVar(value="mimo_default")
+        self.voice_var = tk.StringVar(value=VOICE_PRESETS[0])
         voice_cb = ttk.Combobox(row3, textvariable=self.voice_var, values=list(VOICE_PRESETS), state="readonly", width=16)
         voice_cb.pack(side=tk.LEFT, padx=(8, 4))
         voice_cb.bind("<<ComboboxSelected>>", self._on_voice_selected)
         self.read_var = tk.BooleanVar(value=False)
-        read_group = self._add_dot_toggle(row3, self.read_var, "自动朗读", "#c792ea", None)
+        read_group = self._add_dot_toggle(row3, self.read_var, "自动朗读", "#c792ea", self._on_auto_read)
         read_group.pack(side=tk.LEFT, padx=(12, 0))
         ttk.Button(row3, text="🔊 朗读上句", command=self._speak_last).pack(side=tk.LEFT, padx=(12, 0))
-        self._label(row3, "（朗读需要 MiniMax 密钥；模型候选可用 .env 的 MODEL_XX 追加）", color="#5f6670", size=8).pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Button(row3, text="停止朗读", command=self._stop_speaking).pack(side=tk.LEFT, padx=(6, 0))
+        self._label(row3, "（朗读需要 MiMo 的 MIMO_API_KEY；模型候选可用 MODEL_XX 追加）", color="#5f6670", size=8).pack(side=tk.LEFT, padx=(16, 0))
 
         self._label(self._tab_settings,
                     "提示：.env 的 MODEL_<供应商>（如 MODEL_OPENAI=gpt-4o）会作为该供应商的默认模型；切换供应商/模型即时生效。",
                     color="#5f6670", size=9).pack(anchor="w", padx=14, pady=(4, 0))
 
     def _toggle_api(self, _event=None) -> None:
+        if self._closing:
+            return
         self.api_var.set(not self.api_var.get())
         self._on_api()
 
@@ -223,6 +415,8 @@ class TkApp:
         lbl.pack(side=tk.LEFT, padx=(4, 0))
 
         def flip(_event=None) -> None:
+            if self._closing:
+                return
             var.set(not var.get())
             self._sync_toggle_dots()
             if on_toggle:
@@ -372,6 +566,7 @@ class TkApp:
             self._log_msg("已开启 API，正在自动探测连接…", "info")
             self._after(500, self._test_api)
         else:
+            self._stop_speaking()
             self._log_msg("已关闭 API，将使用本地模式", "warn")
 
     def _on_net(self) -> None:
@@ -383,50 +578,150 @@ class TkApp:
         self._log_msg(f"音色已切换：{self.voice_var.get()}", "info")
 
     def send(self, _event=None) -> None:
+        if self._closing:
+            return
         text = self.entry_var.get().strip()
         if not text:
             return
         self.entry_var.set("")
         self._show_chat("你", text)
-        future = self.server.ask(text)
+        if self._route_command(text):
+            return
+        future = self.server.ask_with_context(text)
         future.add_done_callback(self._on_reply_done)
+
+    def _route_command(self, text: str) -> bool:
+        command, _, argument = text.partition(" ")
+        if command in {"/api", "/net"}:
+            value = argument.strip().lower()
+            if value not in {"on", "off", "1", "0", "true", "false"}:
+                self._log_msg(f"用法：{command} on|off", "warn")
+                return True
+            enabled = value in {"on", "1", "true"}
+            if command == "/api":
+                self.api_var.set(enabled)
+                self.server.set_api(enabled)
+                if not enabled:
+                    self._stop_speaking()
+                self._refresh_api_indicator()
+            else:
+                self.net_var.set(enabled)
+                self.server.set_network(enabled)
+            self._sync_toggle_dots()
+            self._log_msg(f"{'API' if command == '/api' else '联网'} -> {'开启' if enabled else '关闭'}", "info")
+            return True
+        if command == "/tts":
+            if argument.strip():
+                self._speak(argument.strip(), expected_epoch=self.server.context_epoch())
+            else:
+                self._log_msg("用法：/tts 文本", "warn")
+            return True
+        if command == "/doc":
+            if not argument.strip():
+                self._log_msg("用法：/doc 主题", "warn")
+                return True
+            epoch = self.server.context_epoch()
+            future = self.server.document(argument.strip())
+            def done(fut):
+                try:
+                    path = fut.result()
+                    text = f"文档已生成：{path}" if path else "文档生成失败（需先开启 API）"
+                    level = "ok" if path else "warn"
+                except Exception as exc:
+                    text, level = f"文档操作失败：{type(exc).__name__}", "error"
+                self._queue_ui(self._render_command_result, text, level, epoch)
+            future.add_done_callback(done)
+            return True
+        return False
+
+    def _render_command_result(self, text: str, level: str, epoch) -> None:
+        if not self._closing and self.server.context_current(epoch):
+            self._log_msg(text, level)
 
     def _on_reply_done(self, future) -> None:
         try:
-            reply = future.result(timeout=0.1)
+            result = future.result(timeout=0.1)
+            if not isinstance(result, dict) or "text" not in result or "epoch" not in result:
+                raise ValueError("回复缺少上下文版本")
         except Exception as exc:  # noqa: BLE001
             message = f"回复失败：{type(exc).__name__} {str(exc)[:80]}"
             self._queue_ui(self._log_msg, message, "error")
             return
-        self._queue_ui(self._render_reply, reply)
+        self._queue_ui(self._render_reply, result["text"], result["epoch"])
 
-    def _render_reply(self, reply: str) -> None:
+    def _render_reply(self, reply: str, epoch) -> None:
+        if self._closing or not self.server.context_current(epoch):
+            return
+        self._sync_ui_context()
         self._last_reply = reply
+        self._last_reply_epoch = epoch
         self._show_chat("苏晚", reply)
         if self.read_var.get() and reply:
-            self._speak(reply)
+            self._speak(reply, expected_epoch=epoch)
 
     def _speak_last(self) -> None:
         if not self._last_reply:
             self._log_msg("还没有可朗读的回复", "warn")
             return
-        self._speak(self._last_reply)
+        epoch = getattr(self, "_last_reply_epoch", None)
+        if epoch is None or not self.server.context_current(epoch):
+            self._last_reply, self._last_reply_epoch = "", None
+            self._log_msg("记忆设置已变更，请先获取新回复。", "warn")
+            return
+        self._speak(self._last_reply, expected_epoch=epoch)
 
-    def _speak(self, text: str) -> None:
-        voice = self.voice_var.get() or "mimo_default"
-        future = self.server.speak(text, voice=voice)
+    def _speak(self, text: str, *, expected_epoch=None) -> None:
+        if self._closing:
+            return
+        epoch = self.server.context_epoch() if expected_epoch is None else expected_epoch
+        if not self.server.context_current(epoch):
+            return
+        self._stop_speaking()
+        generation = self._speech_generation
+        voice = self.voice_var.get() or VOICE_PRESETS[0]
+        future = self.server.speak(text, voice=voice, expected_epoch=epoch)
+        self._speech_future = future
 
         def done(fut) -> None:
             try:
                 path, error = fut.result(timeout=0.1)
             except Exception as exc:  # noqa: BLE001
                 path, error = None, f"{type(exc).__name__}: {str(exc)[:80]}"
-            if error:
-                self._queue_ui(self._log_msg, f"语音失败：{error}", "error")
-            elif path:
-                self._queue_ui(self._log_msg, f"语音已生成：{Path(path).name}", "ok")
+            self._queue_ui(self._render_audio, path, error, generation, epoch)
 
         future.add_done_callback(done)
+
+    def _on_auto_read(self) -> None:
+        if not self.read_var.get():
+            self._stop_speaking()
+
+    def _stop_speaking(self) -> None:
+        self._speech_generation += 1
+        if self._speech_future is not None:
+            self._speech_future.cancel()
+            self._speech_future = None
+        self._playback.stop()
+
+    def _render_audio(self, path, error, generation: int, epoch=None) -> None:
+        if self._closing or generation != self._speech_generation:
+            return
+        if epoch is None or not self.server.context_current(epoch):
+            return
+        if error:
+            self._log_msg(f"语音失败：{error}", "error")
+        elif path:
+            try:
+                self._playback.play(
+                    path,
+                    on_started=lambda: self._queue_ui(self._audio_feedback, generation, f"正在朗读：{Path(path).name}", "ok", epoch),
+                    on_error=lambda message: self._queue_ui(self._audio_feedback, generation, f"播放失败：{message}", "error", epoch),
+                )
+            except Exception as exc:
+                self._log_msg(f"播放失败：{exc}", "error")
+
+    def _audio_feedback(self, generation: int, message: str, level: str, epoch=None) -> None:
+        if not self._closing and generation == self._speech_generation and epoch is not None and self.server.context_current(epoch):
+            self._log_msg(message, level)
 
     # ---------- API 指示 ----------
     def _set_api_dot_color(self, color: str) -> None:
@@ -498,16 +793,23 @@ class TkApp:
     def _pump(self) -> None:
         if self._closing:
             return
+        items = self.server.bridge.drain()
+        # Check the runtime directly as well: a reset notification may arrive late.
+        self._sync_ui_context()
         while True:
             try:
                 callback, args = self._ui_callbacks.get_nowait()
             except queue.Empty:
                 break
             callback(*args)
-        for item in self.server.bridge.drain():
+        for item in items:
             kind, data = item["kind"], item["data"]
             text = data.get("text", data.get("name", ""))
-            if kind == "doc":
+            if kind == "memory_reset":
+                self._sync_ui_context()
+            elif not self.server.context_current(item.get("epoch")):
+                continue
+            elif kind == "doc":
                 self._log_msg(f"文档已生成：{text}", "ok")
             elif kind == "toast":
                 self._log_msg(text, "info")
@@ -516,6 +818,23 @@ class TkApp:
             elif kind == "narrative":
                 self._show_chat("苏晚·主动", text)
         self._after(100, self._pump)
+
+    def _sync_ui_context(self) -> None:
+        epoch = self.server.context_epoch()
+        if epoch == self._ui_context_epoch:
+            return
+        self._ui_context_epoch = epoch
+        self._last_reply, self._last_reply_epoch = "", None
+        self._stop_speaking()
+        self.chat_area.configure(state="normal")
+        self.chat_area.delete("1.0", tk.END)
+        self.chat_area.configure(state="disabled")
+        self._memory_rows.clear()
+        self.memory_tree.delete(*self.memory_tree.get_children())
+        self.memory_detail.configure(state="normal")
+        self.memory_detail.delete("1.0", tk.END)
+        self.memory_detail.configure(state="disabled")
+        self._memory_list()
 
     # ---------- 轮询视图 ----------
     def _schedule_views(self) -> None:
@@ -592,15 +911,42 @@ class TkApp:
         if self._closing:
             return
         self._closing = True
+        self._stop_speaking()
+        self._playback.stop(close=True)
         for after_id in self._after_ids:
             self.root.after_cancel(after_id)
         self._after_ids.clear()
-        try:
-            self.server.stop()
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("退出保存未完成", f"{exc}\n\n请保留现有数据与备份，检查问题后再启动。", parent=self.root)
-        finally:
+        self._disable_inputs(self.root)
+        self._close_started = time.monotonic()
+        self.server.request_stop()
+        self.root.title("苏晚 · 正在保存并退出")
+        self._poll_close()
+
+    def _disable_inputs(self, parent) -> None:
+        for widget in parent.winfo_children():
+            if isinstance(widget, (tk.Entry, ttk.Button, ttk.Combobox, ttk.Radiobutton, ttk.Checkbutton)):
+                widget.configure(state="disabled")
+            self._disable_inputs(widget)
+
+    def _poll_close(self) -> None:
+        state = self.server.shutdown_status()
+        if state["finished"] and self._playback.idle:
+            if state["error"] is not None:
+                messagebox.showerror("退出保存未完成", f"{state['error']}\n\n请保留现有数据与备份，检查问题后再启动。", parent=self.root)
+            if self._playback.stop_error:
+                messagebox.showerror("停止播放失败", self._playback.stop_error, parent=self.root)
             self.root.destroy()
+            return
+        if state["finished"]:
+            message = "数据收尾已完成，正在停止音频播放…"
+        elif state["runtime_stopped"]:
+            message = "数据收尾已完成，正在等待外部请求线程退出…" if state["error"] is None else "保存发生错误，正在等待线程退出后显示详情…"
+        else:
+            message = "正在取消请求并保存数据…"
+        if time.monotonic() - self._close_started >= 15:
+            message += " 窗口将继续等待，可以移动窗口。"
+        self.hint_lbl.configure(text=message)
+        self.root.after(100, self._poll_close)
 
     def run(self) -> None:
         self.root.mainloop()

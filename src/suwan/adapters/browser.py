@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlparse
@@ -43,10 +44,27 @@ class BrowserAccessError(ValueError):
     pass
 
 
+class BrowserConfigurationError(ValueError):
+    """An explicitly configured allowlist cannot be safely loaded."""
+
+
 class SafeBrowser:
     def __init__(self, whitelist: list[str] | None = None) -> None:
         self.available = _HAS_DEPS
-        self.whitelist = list(whitelist) if whitelist is not None else list(DEFAULT_WHITELIST)
+        values = whitelist if whitelist is not None else DEFAULT_WHITELIST
+        if not isinstance(values, list):
+            raise BrowserConfigurationError("browser_whitelist 必须是域名字符串列表；空列表表示全部禁止")
+        self.whitelist = []
+        for value in values:
+            if not isinstance(value, str):
+                raise BrowserConfigurationError("browser_whitelist 每项必须是域名字符串")
+            try:
+                domain = value.strip().rstrip(".").encode("idna").decode("ascii").lower()
+            except UnicodeError as exc:
+                raise BrowserConfigurationError("browser_whitelist 含非法域名") from exc
+            if len(domain) > 253 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*", domain):
+                raise BrowserConfigurationError("browser_whitelist 只能包含域名，不接受 URL、端口、凭据或通配符")
+            self.whitelist.append(domain)
         self.session = requests.Session() if self.available else None
         if self.available:
             self.session.headers.update({"User-Agent": "Mozilla/5.0"})  # type: ignore[union-attr]
@@ -55,9 +73,13 @@ class SafeBrowser:
     def from_json(cls, path: str | Path, fallback: list[str] | None = None) -> "SafeBrowser":
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
-            whitelist = data.get("browser_whitelist") or fallback
-        except (OSError, ValueError):
-            whitelist = fallback
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise BrowserConfigurationError(f"无法安全加载浏览器白名单配置：{path}（{type(exc).__name__}）") from exc
+        if not isinstance(data, dict):
+            raise BrowserConfigurationError("浏览器配置必须是 JSON 对象")
+        if "browser_whitelist" in data and not isinstance(data["browser_whitelist"], list):
+            raise BrowserConfigurationError("browser_whitelist 必须是域名字符串列表；空列表表示全部禁止")
+        whitelist = data["browser_whitelist"] if "browser_whitelist" in data else fallback
         return cls(whitelist=whitelist)
 
     def is_allowed(self, url: str) -> bool:

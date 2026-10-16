@@ -35,7 +35,7 @@ class RuntimeSmokeTest(unittest.TestCase):
         async def scenario() -> tuple[str, str]:
             r1 = SuwanRuntime(settings)
             await r1.start()
-            first = await r1.ask("你好，我是阿晚")
+            first = await r1.ask("你好，我叫阿晚")
             await r1.ask("你会唱什么歌吗？")
             await r1.stop()
 
@@ -171,7 +171,7 @@ class RuntimeSmokeTest(unittest.TestCase):
             runtime = SuwanRuntime(settings, api_enabled=True, migrate_legacy_data=False)
             runtime.llm.api_key = "offline-test-value"
 
-            def delayed_llm(*args):
+            def delayed_llm(*args, **kwargs):
                 entered.set()
                 release.wait(timeout=2)
                 return "迟到的回复"
@@ -180,7 +180,7 @@ class RuntimeSmokeTest(unittest.TestCase):
             try:
                 with patch.object(runtime.llm, "chat", side_effect=delayed_llm):
                     pending = asyncio.create_task(runtime.ask("一条普通消息"))
-                    await asyncio.wait_for(asyncio.to_thread(entered.wait), 1)
+                    self.assertTrue(await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), 2))
                     await runtime.stop()
                     with self.assertRaises(asyncio.CancelledError):
                         await pending

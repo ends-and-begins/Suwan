@@ -6,10 +6,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 
 from suwan.bus import EventBus
 from suwan.clock import Clock
-from suwan.events import ACT_DONE, CHAT_REPLY, MONOLOGUE_GENERATED, SENSOR_RECORDED, SENSOR_USER_MESSAGE
+from suwan.events import ACT_DONE, CHAT_REPLY, MONOLOGUE_GENERATED, SENSOR_RECORDED, SENSOR_USER_MESSAGE, event_timestamp
 from suwan.organs.base import Organ
 
 
@@ -20,6 +21,7 @@ class SensoryBufferOrgan(Organ):
         super().__init__(bus, clock)
         self.capacity = capacity
         self.lines: list[dict] = []  # {kind, text, time}
+        self._cleared_at = 0.0
 
     # ---------- 生命周期 ----------
     async def _on_start(self) -> None:
@@ -29,11 +31,13 @@ class SensoryBufferOrgan(Organ):
         self._subscribe(ACT_DONE, self._on_act)
 
     async def _on_user(self, event) -> None:  # noqa: ANN001
-        self._push("user", str(event.data.get("text", "")).strip())
+        if self.accepts(event) and not event.data.get("suppress_context"):
+            self._push("user", str(event.data.get("text", "")).strip())
         await self._ack(event, "user")
 
     async def _on_reply(self, event) -> None:  # noqa: ANN001
-        self._push("suwan", str(event.data.get("text", "")).strip())
+        if self.accepts(event) and not event.data.get("suppress_context"):
+            self._push("suwan", str(event.data.get("text", "")).strip())
         await self._ack(event, "suwan")
 
     async def _ack(self, event, kind: str) -> None:  # noqa: ANN001
@@ -41,9 +45,12 @@ class SensoryBufferOrgan(Organ):
             await self.bus.publish(SENSOR_RECORDED, {"rid": event.data["rid"], "kind": kind})
 
     async def _on_monologue(self, event) -> None:  # noqa: ANN001
-        self._push("inner", str(event.data.get("text", "")).strip())
+        if self.accepts(event):
+            self._push("inner", str(event.data.get("text", "")).strip())
 
     async def _on_act(self, event) -> None:  # noqa: ANN001
+        if not self.accepts(event):
+            return
         note = event.data.get("note")
         if note:
             self._push("narrative", str(note).strip())
@@ -56,6 +63,24 @@ class SensoryBufferOrgan(Organ):
             del self.lines[: len(self.lines) - self.capacity]
 
     # ---------- 读取 ----------
+    def clear(self) -> None:
+        self.lines.clear()
+        self._cleared_at = event_timestamp()
+
+    def accepts(self, event) -> bool:
+        """清理前已排队的输入/叙事不能在清理后回填短期上下文。"""
+        # RPC 可能在构造 payload 后才调度到 publish。来源时间必须保留
+        # 构造旧答复的时点，不能用稍后创建的 Event.ts 重新授权它。
+        for stamp in (event.ts, event.data.get("context_ts", event.ts)):
+            if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+                return False
+            try:
+                if not math.isfinite(stamp) or stamp < self._cleared_at:
+                    return False
+            except OverflowError:
+                return False
+        return True
+
     def recent(self, n: int = 10) -> list[dict]:
         return self.lines[-n:]
 

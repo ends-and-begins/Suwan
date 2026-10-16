@@ -29,14 +29,18 @@ def _build_settings(home: str | None) -> Settings:
 async def amain(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     settings = _build_settings(args.home)
+    for warning in getattr(settings, "configuration_warnings", ()):
+        print(f"配置提示：{warning}")
     runtime = SuwanRuntime(settings)
     await runtime.start()
+    for warning in getattr(runtime, "startup_warnings", ()):
+        print(f"启动提示：{warning}")
     try:
         if args.smoke:
             reply = await runtime.ask(args.smoke)
             print(f"苏晚：{reply}")
             return 0
-        print("—— 苏晚 v2（本地模式）已苏醒。命令：/quit /status /cfg /api on|off /net on|off /model <名> /voice <名> /tts <话> /doc <主题>")
+        print("—— 苏晚 v2（本地模式）已苏醒。命令：/quit /status /cfg /memory help /api on|off /net on|off /model <名> /voice <名> /tts <话> /doc <主题>")
         while True:
             line = await asyncio.to_thread(input, "你> ")
             line = line.strip()

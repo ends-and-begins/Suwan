@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import random
 import re
+from dataclasses import dataclass
 from typing import Callable, Iterable
+
+from suwan.context import excerpt
 
 NAME = "苏晚"
 
@@ -20,22 +23,102 @@ _GENERIC = [
     "这个问题好难，我得想想……",
 ]
 
-_NAME_PATTERN = re.compile(r"(?:我是|我叫|你可以叫我|我的名字是)\s*([\u4e00-\u9fa5A-Za-z0-9_\- ]{1,20}?)(?:[，。！？\s]|$)")
+_NAME_PATTERN = re.compile(r"(?:你好[，,！!]?\s*)?(?:我叫|你可以叫我|我的名字是|我现在改叫|我的名字现在改为)\s*([\u4e00-\u9fa5A-Za-z0-9_\- ]{1,20}?)(?:了)?[。！!]?$")
 _NAME_NOISE = {"什么", "谁", "啥", "名字", "我吗", "我的名字", "什么吗"}
 _ASK_OWN_NAME = re.compile(r"(我叫什么|我的名字(?:是)?(?:什么|啥)|你还记得我叫什么|我叫啥)")
+_NON_ASSERTION = re.compile(
+    r"假设|假定|设想|例如|比如|举例|开玩笑|玩笑|并非|不是真的|不一定|"
+    r"可能|也许|或许|大概|好像|应该|听说|据说|恐怕|难道|"
+    r"对不对|好不好|行不行|可不可以|是不是|还是|或者|是否|能否|"
+    r"(?:正确|对么|吧|呢|嘛)[。！!\s]*$"
+)
 
 
 def extract_intro_name(user_text: str) -> str | None:
     """若句子是真正的自我介绍，返回名字；否则返回 None（问句/噪音不误抓）。"""
     if _ASK_OWN_NAME.search(user_text):
         return None
-    m = _NAME_PATTERN.search(user_text)
+    if _NON_ASSERTION.search(user_text):
+        return None
+    # 只支持完整、明确的介绍；引用、否定、假设、询问不会改变身份。
+    if any(mark in user_text for mark in ('?', '？', '吗', '如果', '假如', '不是', '不叫', '不要', '别记', '“', '”', '"', "'", '「', '」')):
+        return None
+    m = _NAME_PATTERN.fullmatch(user_text.strip())
     if not m:
         return None
     name = m.group(1).strip()
     if not name or name in _NAME_NOISE:
         return None
     return name
+
+
+FACT_LABELS = {
+    "user.name": "名字", "user.city": "居住城市", "user.birthday": "生日",
+    "preference.drink": "饮品偏好", "preference.weekend_activity": "周末活动",
+    "preference.contact_time": "联系时间偏好",
+}
+
+
+def parse_fact_statement(text: str, *, current_values: dict[str, str] | None = None) -> tuple[str, str] | None:
+    """有限的中文事实语法。没有命中完整句式时，不从聊天自由推断事实。"""
+    name = extract_intro_name(text)
+    if name:
+        return "user.name", name
+    current_values = current_values or {}
+    match = re.fullmatch(r"(上午|下午|晚上|早上|中午|白天|夜里)(可以主动提醒我|别提醒我了?|不要提醒我了?)[。！!]?", text.strip())
+    if match:
+        permission = "可以提醒" if match.group(2).startswith("可以") else "别提醒"
+        return "preference.contact_time", match.group(1) + permission
+    if _NON_ASSERTION.search(text) or any(mark in text for mark in ('?', '？', '吗', '如果', '假如', '不是', '不要', '别记', '“', '”', '"', "'", '「', '」')):
+        return None
+    rules = (
+        ("user.city", r"我(?:现在)?(?:住在|居住在|搬到)([^，。！？,!?]{1,40}?)(?:住)?(?:了)?[。！!]?"),
+        ("preference.drink", r"我(?:现在|平时)?(?:喜欢喝|爱喝|改喝)([^，。！？,!?]{1,40}?)(?:了)?[。！!]?"),
+        ("preference.weekend_activity", r"(?:我(?:周末|休息日)|(?:周末|休息日)我)(?:喜欢去|喜欢|一般会|一般|通常会|通常)([^，。！？,!?]{1,60}?)(?:了)?[。！!]?"),
+        ("preference.contact_time", r"我(?:现在)?希望你在([^，。！？,!?]{1,40}?)联系我[。！!]?"),
+    )
+    for key, pattern in rules:
+        match = re.fullmatch(pattern, text.strip())
+        if match:
+            value = match.group(1).strip()
+            # 防止宽松的 value 部分重新接纳条件或否定。
+            if value and not re.search(r"不|别|假设|可能|也许|还是|或者|的话|是什么|什么|谁|哪里|哪儿", value):
+                return key, value
+    if "preference.drink" in current_values:
+        match = re.fullmatch(r"(?:现在|最近)改喝([^，。！？,!?]{1,40}?)了?[。！!]?", text.strip())
+        if match and not re.search(r"不|别|什么|谁", match.group(1)):
+            return "preference.drink", match.group(1).strip()
+    if "preference.weekend_activity" in current_values:
+        match = re.fullmatch(r"我(?:现在|最近)改成([^，。！？,!?]{1,60}?)了?[。！!]?", text.strip())
+        if match and not re.search(r"不|别|什么|哪里|谁", match.group(1)):
+            return "preference.weekend_activity", match.group(1).strip()
+        match = re.fullmatch(r"(?:现在|最近)不([^，。！？,!?]+)[，,]\s*改为([^，。！？,!?]{1,60}?)[。！!]?", text.strip())
+        if match and match.group(1) == current_values["preference.weekend_activity"] and not re.search(r"不|别|什么|谁", match.group(2)):
+            return "preference.weekend_activity", match.group(2).strip()
+    return None
+
+
+def fact_query_key(text: str) -> str | None:
+    """只识别有限的问题意图；未有记录时也必须返回明确的未知回答。"""
+    text = text.strip().rstrip("？?。！! ")
+    patterns = (
+        ("user.name", r"(?:你还记得)?(?:我叫什么(?:名字)?|我叫啥|我的名字(?:是)?(?:什么|啥)|你知道我叫什么)(?:吗)?"),
+        ("user.city", r"(?:你还记得)?(?:我(?:现在)?住(?:在)?(?:哪里|哪儿|哪个城市)|我(?:现在)?的(?:城市|住址)是什么)(?:吗)?"),
+        ("user.birthday", r"(?:你还记得)?(?:我的生日(?:是)?(?:什么时候|哪天|几月几日)|我什么时候生日)(?:吗)?"),
+        ("preference.drink", r"(?:你还记得)?(?:我(?:现在)?(?:喜欢|爱|平时)?喝什么|我的饮品偏好(?:是)?什么)(?:吗)?"),
+        ("preference.weekend_activity", r"(?:你还记得)?(?:(?:我(?:周末|休息日)|(?:周末|休息日)我)(?:一般|通常|喜欢)?(?:会)?(?:做什么|干什么|干嘛|有什么活动)|我的周末活动(?:是)?什么)(?:吗)?"),
+        ("preference.contact_time", r"(?:你还记得)?(?:我希望你(?:在)?(?:什么时候|几点)联系我|你(?:应该)?(?:在)?(?:什么时候|几点)联系我|我的联系时间偏好(?:是)?什么|(?:上午|下午|晚上|早上|中午|白天|夜里)可以主动提醒我)(?:吗)?"),
+    )
+    return next((key for key, pattern in patterns if re.fullmatch(pattern, text)), None)
+
+
+@dataclass(frozen=True)
+class LocalRecall:
+    """正文与追溯标签分开，标签不能消耗本地回答的正文额度。"""
+    content: str
+    record_id: str = ""
+    kind: str = ""
+    source: str = ""
 
 
 class LocalReplyBank:
@@ -48,7 +131,7 @@ class LocalReplyBank:
         affect_desc: Callable[[], str],
         activity: Callable[[], str],
         energy: Callable[[], float],
-        recall: Callable[[str, int], Iterable[str]],
+        recall: Callable[[str, int], Iterable[str | LocalRecall]],
     ) -> None:
         self._user_name = user_name
         self._affect_desc = affect_desc
@@ -74,13 +157,18 @@ class LocalReplyBank:
             name = self._user_name()
             if name:
                 return f"你的名字是{name}，我怎么会忘呢。"
+            return "你还没有告诉我名字，我目前不知道。"
         name_given = extract_intro_name(text)
         if name_given:
             # 名字注册与记忆写入由调用方统一负责（避免双写），这里只回话
             return f"{name_given}，我记住了，以后就这么叫你。"
         recalled = list(self._recall(t, 1))
         if recalled:
-            return f"我记得一点：{recalled[0][:60]}……你想再详细聊聊这个吗？"
+            hit = recalled[0]
+            body = hit.content if isinstance(hit, LocalRecall) else str(hit)
+            reference = (f"（记录：{hit.record_id}；{hit.kind}/{hit.source}）"
+                         if isinstance(hit, LocalRecall) and hit.record_id else "")
+            return f"我记得一点：{excerpt(body, 180, query=t)}{reference}。你想再详细聊聊这个吗？"
         if len(text) > 30:
             return "你说得挺长的，我现在没开 API，等我缓一缓再认真回复你。可以先简单告诉我一句吗？"
         if self._energy() < 30:

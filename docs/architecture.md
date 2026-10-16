@@ -1,6 +1,9 @@
 # 苏晚 v2 目标架构（事件总线 + 器官）
 
 > 文档状态：目标架构与实现说明。2026-10-16 第一轮本地验收与实际限制见 [round1-report.md](round1-report.md)。原则中的完全事件化、跨线程一致快照仍是逐步收敛目标。
+> 当前补充：[严格审查修复报告](review-fix-report.md)。迁移后台线程只读准备，主循环持锁提交；TTS 请求携带开关代数，产物以唯一名称禁止覆盖发布；GUI 轮询实际退出状态并控制音频播放/停止。
+> 第二版补充：[记忆规范](memory-v2.md)与 [验收报告](round2-report.md)。记忆文件是事实权威，MemoryManager 在所属循环同步提交管理动作并投影身份；自动写入带代数经总线确认。检索为确定性本地规则，生成内容与用户事实分型。该管理路径采用同一循环直调，完全事件化仍是目标，不把两个文件写入称为事务。
+> 2026-10-17 补修：`context.py` 为所有 LLM 生产者提供字符预算与候选片段；`services/llm_request.py` 在所属循环固定请求代数后再排队线程。GUI 保留答复来源 epoch，经渲染、语音提交及后端入口复核；管理列表与聊天候选采用不同范围。事件与感官撤销水位使用同一进程单调时钟，正文的 `context_ts` 在 RPC 调度前固定；器官演化仍使用注入的 `Clock`。
 > 设计来源：suwan23.py 单体功能 + suwan_mvp 的事件/器官原型 + 现行工作区的后续功能。
 > 旧版所有已知 bug 的修复点见 `docs/bug-registry.md`，实现时逐条对照。
 
@@ -87,6 +90,7 @@ suwan_v2/
 │   ├── bus.py                   # EventBus（asyncio 版，M1 自研/升级 mvp）
 │   ├── events.py                # 事件 topic 常量 + 事件数据类
 │   ├── clock.py                 # Clock 接口 + RealClock/ManualClock
+│   ├── context.py               # 所有模型入口的字符预算与候选片段
 │   ├── organs/                  # 有状态子系统（只经总线耦合）
 │   │   ├── base.py / identity.py / circadian.py / affect.py / drive.py
 │   │   ├── relation.py / goals.py / sensory.py / memory.py
@@ -94,6 +98,7 @@ suwan_v2/
 │   ├── services/                # 编排：订阅事件、经 rpc 请求他人状态
 │   │   ├── chat.py / monologue.py / autonomous.py / reflection.py
 │   │   ├── share.py / doc.py / search.py / tts.py
+│   │   ├── memory_manager.py / llm_request.py（管理入口与请求代数）
 │   ├── adapters/                # 外部能力与存储
 │   │   ├── llm.py（含 api_call_log）/ tts.py / browser.py / filestore.py / migrator.py
 │   ├── assets/                  # 本地文案资产（从旧代码抽出）

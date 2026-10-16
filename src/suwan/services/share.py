@@ -63,13 +63,20 @@ class ShareWatcherService(Organ):
                 digest = hashlib.sha256(f.name.encode("utf-8") + b"\0" + raw).hexdigest()
                 receipt = f"share:{digest}"
                 memory = self._o("memory")
+                generation = memory.privacy_generation
+                if not memory.recording_enabled:
+                    continue
                 already_saved = memory.has_receipt(receipt, durable=True)
                 if not already_saved:
-                    ok = await remember(self.bus, f"收到文件 {f.name}: {text[:300]}", importance=6.0,
-                                        emotion=self._o("affect").current, persist=True, receipt=receipt)
+                    ok = await remember(self.bus, text, importance=6.0,
+                                        emotion=self._o("affect").current, persist=True, receipt=receipt,
+                                        kind="knowledge", source="share", source_ref=f.name, topic="share",
+                                        expected_generation=generation)
                     if not ok or not memory.has_receipt(receipt, durable=True):
                         self._log.error("分享记忆未确认落盘，原文件保留: %s", f)
                         continue
+                if generation != memory.privacy_generation or not memory.recording_enabled:
+                    continue
                 # 等待记忆期间用户可能还在编辑；内容变化时留下新版供下次扫描。
                 if f.read_bytes() != raw:
                     self._log.warning("分享文件在处理期间发生变化，保留等待重试: %s", f)
