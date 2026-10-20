@@ -1,8 +1,8 @@
-# 苏晚 v5 —— 有来源、可核对和可复用的学习
+# 苏晚 v6 —— 今日回顾与桌面控制
 
-> 状态：2026-10-19 第五版本地学习流程及5项严格审查补修完成：原651项测试保留，新增26项，最终677项测试及六项离线门禁通过，详见 [第五版补修报告](docs/round5-fix-report.md)。学习包含隔离基线、资料笔记、独立检查、预留应用、带来源复用和撤销；10组受控任务通过不代表真实模型学习效果。真实模型8/10正确、至少5组有效改善仍待实测。固定记忆检索仍为 Top-3 20/20、Top-1 14/20；真实接口、声卡、人工自然度和长期运行尚未验证。
+> 状态：2026-10-20 第六版4项严格审查补修完成。原729项测试保留、新增31项，最终760项测试及六项离线门禁通过，无跳过；原8项冻结桌面任务全部复验通过，详见 [第六版补修报告](docs/round6-fix-report.md)。今日概览、来源回顾、持久设置、等待取消、应用音量与逻辑导出继续保留，修复了失效学习结果传播、设置同步阻塞、草稿覆盖及旧作品漏计。真实接口、声卡、人工易用性和长期运行尚未验证；第五版真实模型8/10正确、至少5组有效改善仍待实测。固定记忆检索仍为 Top-3 20/20、Top-1 14/20。
 > 本项目承接旧版模块拆分代码，采用 **asyncio 事件总线 + 器官(organ) 架构**。
-> 当前实现与限制见 [第五版验收报告](docs/round5-report.md)、[学习使用说明](docs/learning-v5.md)和 [第五版设计](docs/round5-design.md)。第四版基础见 [严格审查补修报告](docs/round4-fix-report.md)、[第四版验收报告](docs/round4-report.md)及 [活动、预算与恢复说明](docs/activities-v4.md)。人格与记忆沿用 [人格与交流说明](docs/personality-v3.md)、[记忆使用与升级说明](docs/memory-v2.md)。历史验证见 [第三版补修报告](docs/round3-fix-report.md)、[第三版报告](docs/round3-report.md)、[第二版补修报告](docs/round2-fix-report.md)、[第二版验收报告](docs/round2-report.md)、[第一版严格审查修复报告](docs/review-fix-report.md)和 [第一轮验收报告](docs/round1-report.md)，后续目标见 [阶段性迭代计划](docs/iteration-plan.md)。
+> 当前操作与设计见 [第六版桌面说明](docs/desktop-v6.md)及 [第六版设计](docs/round6-design.md)。学习基础见 [第五版补修报告](docs/round5-fix-report.md)、[第五版验收报告](docs/round5-report.md)、[学习使用说明](docs/learning-v5.md)和 [第五版设计](docs/round5-design.md)。第四版基础见 [严格审查补修报告](docs/round4-fix-report.md)、[第四版验收报告](docs/round4-report.md)及 [活动、预算与恢复说明](docs/activities-v4.md)。人格与记忆沿用 [人格与交流说明](docs/personality-v3.md)、[记忆使用与升级说明](docs/memory-v2.md)。历史验证见 [第三版补修报告](docs/round3-fix-report.md)、[第三版报告](docs/round3-report.md)、[第二版补修报告](docs/round2-fix-report.md)、[第二版验收报告](docs/round2-report.md)、[第一版严格审查修复报告](docs/review-fix-report.md)和 [第一轮验收报告](docs/round1-report.md)，后续目标见 [阶段性迭代计划](docs/iteration-plan.md)。
 
 ## 历史重构路线（详见 docs/milestones.md；下列勾选为历史记录）
 - M0 规划/基线盘点 ✅
@@ -17,6 +17,9 @@
 ```powershell
 # 离线门禁：临时源码副本；禁用 dotenv/真实网络；编译、测试、静态守卫、冒烟、对照、自检
 python scripts/run_tests.py
+
+# 机器较慢或完整套件需要更长时限时（不改变单项断言与超时）
+python scripts/run_tests.py --timeout-seconds 600
 
 # 行为对照（本地兜底类别断言 6/6）
 python scripts/parity.py
@@ -39,6 +42,9 @@ python scripts/acceptance_round4.py --output activity-result.json
 
 # 第五版：10组冻结资料任务，受控规则计算器验证学习流程（不测真实模型效果）
 python scripts/acceptance_round5.py --output learning-result.json
+
+# 第六版：8项冻结桌面任务，真实Tk控件、临时数据、假SDK
+python scripts/acceptance_round6.py --output desktop-result.json
 
 # 交互 REPL（含 /tts <话> /voice <名> /api /net /doc /status /cfg）
 $env:PYTHONPATH="src"; python -m suwan.frontends.repl --home <数据目录>
@@ -63,6 +69,7 @@ pip install -e ".[dev]"
 > GUI“记忆”页或 REPL `/memory help` 可查看、搜索、设置、纠正、遗忘及暂停。旧列表首次升级前保留原字节副本；旧代码不能直接读取新版记忆文件。
 > 状态页可查看与控制活动；REPL 支持 `/activities`、`/pause`、`/resume`、`/continue ID`、`/discard ID`。外部调用默认每日40次，文本输出累计预留32768；主动展示每日最多8条、22点至次日8点安静。预留不等于实际token或费用，详细配置和回退规则见第四版使用说明。
 > 学习入口：状态页“查看学习”，或聊天框/REPL `/learn help`。先准备资料记忆ID与任务JSON，再用 `/learn load` 登记、`step` 或 `run` 执行。每项首次完整任务最多四个模型阶段，共用调用预算；本轮不自动在后台学习。原资料更正或遗忘会撤销关联学习内容和当前目标证据，具体见学习使用说明。
+> 桌面入口：对话页“今日回顾”搜索经历、活动与学习来源；设置页可滚动并保存模型、安静时段、主动上限、预算与音量，显示数据位置并导出当前逻辑快照。REPL使用 `/desk today`、`/desk find 关键词`、`/desk settings`、`/desk set volume 60`、`/desk export`。近期对话只属于本次会话，逻辑导出不能代替完整恢复备份。
 > `docs/reference/` 只保留盘点清单（`suwan23-inventory.md`/`suwan-mvp-inventory.md`）；
 > 历史源码可在当前工作区上级目录的 `suwan project`、`suwan_project 模块拆分`、`suwan_mvp` 查阅。
 

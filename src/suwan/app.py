@@ -42,6 +42,7 @@ from suwan.organs.store import StateStoreOrgan
 from suwan.services.autonomous import AutonomousService
 from suwan.services.chat import ChatService
 from suwan.services.doc import DocService
+from suwan.services.desktop import DesktopService
 from suwan.services.monologue import MonologueService
 from suwan.services.memory_manager import MemoryManager
 from suwan.services.llm_request import llm_chat
@@ -63,8 +64,8 @@ class SuwanRuntime:
         bus: EventBus | None = None,
         clock: Clock | None = None,
         llm_provider: str | None = None,
-        api_enabled: bool = False,
-        network_enabled: bool = False,
+        api_enabled: bool | None = None,
+        network_enabled: bool | None = None,
         migrate_legacy_data: bool = True,
         logger_name: str = "suwan.runtime",
     ) -> None:
@@ -82,11 +83,15 @@ class SuwanRuntime:
         self._learning_change_active = False
         self.startup_warnings: list[str] = []
         self.migrate_legacy_data = migrate_legacy_data
-        self._api_enabled = api_enabled
-        self._network_enabled = network_enabled
+        self._desktop_api_override = api_enabled
+        self._desktop_network_override = network_enabled
+        self._desktop_provider_override = llm_provider
+        self._api_enabled = bool(api_enabled)
+        self._network_enabled = bool(network_enabled)
         self._model_config_generation = 0
         self.tts_voice = "mimo_default"
         self.tts_enabled = False
+        self.tts_volume = 100
         self.call_manager = CallManager(self.settings.call_ledger_file, policy=self.settings.call_policy, clock=self.clock)
         self.notification_ledger = NotificationLedger(
             self.settings.data_dir / "notification-v4.json", self.clock, self.settings.proactive_policy)
@@ -196,6 +201,7 @@ class SuwanRuntime:
             self.reflection_service, self.share_service, self.doc_service,
             self.search_service, self.tts_service, self.learning_service,
         ]
+        self.desktop_service = DesktopService(self)
 
     # ---------- 目录 ----------
     def _ensure_dirs(self) -> None:
@@ -223,6 +229,9 @@ class SuwanRuntime:
                 for warning in getattr(self.settings, "configuration_warnings", ()):
                     self._log.warning("配置提示: %s", warning)
                 self._ensure_dirs()
+                self.desktop_service.load()
+                if self.desktop_service.error:
+                    self.startup_warnings.append(self.desktop_service.error)
                 if not self.call_manager.start():
                     warning = "调用账本不可用：外部生成已暂停，本地聊天仍可使用。请保留原件并检查账本。"
                     self.startup_warnings.append(warning)
@@ -396,6 +405,7 @@ class SuwanRuntime:
         if self.llm is not None and model:
             if self.llm.model != model:
                 self._model_config_generation += 1
+                self.llm.invalidate_pending()
             self.llm.model = model
 
     # ---------- TTS（端到端入口） ----------
@@ -409,6 +419,7 @@ class SuwanRuntime:
         """经总线请求 TTS 服务合成语音；返回 (filepath, None) 或 (None, error)。"""
         if not self._running:
             return None, "运行时未启动"
+        await self.wait_desktop_settings()
         if expected_epoch is not None and not self.context_current(expected_epoch):
             return None, "记忆设置已变更，语音请求已取消。"
         if not self._api_enabled:
@@ -504,13 +515,19 @@ class SuwanRuntime:
             self._learning_goal_projection = []
             self._log.warning("学习来源清理尚未完成（%s），暂停使用旧学习内容。", type(exc).__name__)
 
-    def _refresh_learning_goals(self) -> None:
+    def _refresh_learning_goals(self, snapshot=None) -> None:
+        # A desktop collection must reuse the exact public learning snapshot;
+        # a second journal read could revoke the first one midway through it.
+        rows = (self.learning_service.goals() if snapshot is None else [
+            {"id": row["id"], "title": row["title"], "progress": row["progress"]["completed"],
+             "total": row["progress"]["total"], "status": row["status"]}
+            for row in snapshot["tasks"]])
         self._learning_goal_projection = [
             {"id": row["id"], "name": "资料检查与应用：" + row["title"],
              "progress": row["progress"], "target": row["total"],
              "complete": row["progress"] == row["total"], "status": row["status"],
              "kind": "learning_evidence"}
-            for row in self.learning_service.goals()
+            for row in rows
         ]
 
     def _invalidate_activity_sources(self) -> None:
@@ -552,10 +569,18 @@ class SuwanRuntime:
         task = asyncio.current_task()
         self._foreground_tasks.add(task)
         try:
+            if not self.is_memory_control(text):
+                await self.wait_desktop_settings()
             with self.call_manager.foreground():
                 return await self.chat_service.chat(text)
         finally:
             self._foreground_tasks.discard(task)
+
+    @staticmethod
+    def is_memory_control(text: str) -> bool:
+        """Pure classification; ChatService remains the sole command executor."""
+        bounded = ChatService._bounded_input((text or "").strip())
+        return ChatService._memory_command(bounded) is not None
 
     def context_epoch(self) -> tuple[int, int]:
         """只读来源标记；跨线程 UI 必须带回原标记而不能重新盖章。"""
@@ -579,6 +604,7 @@ class SuwanRuntime:
         """
         if not self._running:
             return False, "运行时未启动"
+        await self.wait_desktop_settings()
         if not self._api_enabled:
             return False, "API 未开启"
         llm = self.llm
@@ -637,11 +663,49 @@ class SuwanRuntime:
                 "budget": self.call_manager.snapshot(), "proactive": self.notification_ledger.snapshot(),
                 "_context_epoch": self.context_epoch()}
 
+    async def desktop_view(self, query: str = "", kind: str = "all", limit: int = 50) -> dict:
+        if not self._running:
+            raise RuntimeError("运行时未启动")
+        return self.desktop_service.view(query, kind, limit)
+
+    async def update_desktop_settings(self, patch: dict) -> dict:
+        if not self._running:
+            raise RuntimeError("运行时未启动")
+        task = asyncio.current_task()
+        self._foreground_tasks.add(task)
+        try:
+            return await self.desktop_service.update(patch)
+        finally:
+            self._foreground_tasks.discard(task)
+
+    async def wait_desktop_settings(self) -> None:
+        """Await prior settings without delaying cancel, stop or read views."""
+        task = asyncio.current_task()
+        already_tracked = task in self._foreground_tasks
+        self._foreground_tasks.add(task)
+        try:
+            await self.desktop_service.wait_for_settings()
+            if not self._running:
+                raise RuntimeError("运行时未启动")
+        finally:
+            if not already_tracked:
+                self._foreground_tasks.discard(task)
+
+    async def export_data(self) -> dict:
+        if not self._running:
+            raise RuntimeError("运行时未启动")
+        task = asyncio.current_task()
+        self._foreground_tasks.add(task)
+        try:
+            return await self.desktop_service.export()
+        finally:
+            self._foreground_tasks.discard(task)
+
     async def learning_view(self) -> dict:
         if not self._running:
             raise RuntimeError("运行时未启动")
         view = self.learning_service.view()
-        self._refresh_learning_goals()
+        self._refresh_learning_goals(view)
         return {"ok": not bool(view.get("readonly")), **view, "_context_epoch": self.context_epoch()}
 
     async def learning_command(self, command: str) -> dict:
@@ -659,6 +723,8 @@ class SuwanRuntime:
         self._foreground_tasks.add(task)
         result = {}
         try:
+            if action in {"step", "run"}:
+                await self.wait_desktop_settings()
             with self.call_manager.foreground():
                 if action in {"", "help"}:
                     result = {"ok": True, "text": "/learn list | load JSON路径 | step ID | run ID | show ID | find 词语 | cancel ID | revise ID 修改理由；load仅登记，run最多推进四步。"}
@@ -710,9 +776,14 @@ class SuwanRuntime:
             result = {"ok": False, "text": f"学习操作未完成（{type(exc).__name__}）：{str(exc)[:160]}"}
         finally:
             self._foreground_tasks.discard(task)
+        result_epoch = self.context_epoch()
         view = await self.learning_view()
         if view.get("readonly"):
-            result = {**result, "ok": False, "text": result.get("text", "") + "\n学习记录已暂停使用：" + str(view.get("error", "请检查存储并从有效备份恢复。"))}
+            # A final availability check can revoke the result assembled
+            # above. Do not append a warning to notes we no longer trust.
+            result = {"ok": False, "text": "学习记录已暂停使用：" + str(view.get("error", "请检查存储并从有效备份恢复。"))}
+        elif result_epoch != self.context_epoch():
+            result = {"ok": False, "text": "学习资料上下文已变化，本次旧结果已撤回；请重新查询。"}
         return {**view, **result}
 
     @staticmethod
@@ -740,6 +811,8 @@ class SuwanRuntime:
     async def activity_command(self, action: str, id: str | None = None) -> dict:
         if not self._running:
             raise RuntimeError("运行时未启动")
+        if action in {"continue", "resume", "retry"}:
+            await self.wait_desktop_settings()
         if id and id.startswith("calendar:"):
             return {**await self.activity_view(), "ok": False,
                     "text": "日历记录在此处仅供查看；当日失败、暂停或未知占位不会自动重发，次日处理新日期。"}

@@ -27,6 +27,7 @@ class NotificationLedger:
     def __init__(self, path: Path, clock, policy: ProactivePolicy):
         self.path, self.clock, self.policy = Path(path), clock, policy
         self._lock = threading.RLock()
+        self._policy_lock = threading.Lock()
         self._claims = {}
         self._error = None
         self._active = False
@@ -64,15 +65,28 @@ class NotificationLedger:
         with self._lock:
             self._active = False
 
+    def set_policy(self, policy: ProactivePolicy):
+        if not isinstance(policy, ProactivePolicy):
+            raise ValueError("主动消息策略非法")
+        with self._policy_lock:
+            self.policy = policy
+
     def time_allowed(self):
+        with self._policy_lock:
+            policy = self.policy
+        return self._time_allowed(policy)
+
+    def _time_allowed(self, policy):
         hour = self.clock.now().hour
-        start, end = self.policy.quiet_start, self.policy.quiet_end
+        start, end = policy.quiet_start, policy.quiet_end
         quiet = start <= hour < end if start < end else (hour >= start or hour < end) if start != end else False
         return not quiet
 
     def claim(self, key=None):
         with self._lock:
-            if not self._active or self._error or not self.time_allowed():
+            with self._policy_lock:
+                policy = self.policy
+            if not self._active or self._error or not self._time_allowed(policy):
                 return None
             day = self.clock.now().date().isoformat()
             key = str(key or uuid.uuid4().hex)
@@ -80,7 +94,7 @@ class NotificationLedger:
             if any(key in entries for entries in self._claims.values()):
                 return None
             entries = self._claims.get(day, [])
-            if len(entries) >= self.policy.daily_limit:
+            if len(entries) >= policy.daily_limit:
                 return None
             candidate = dict(self._claims, **{day: [*entries, key]})
             try:
@@ -96,14 +110,20 @@ class NotificationLedger:
 
     def current(self, data):
         with self._lock:
+            with self._policy_lock:
+                policy = self.policy
             day, key = data.get("notification_date"), data.get("notification_id")
-            return (self._active and not self._error and self.time_allowed()
+            entries = self._claims.get(day, []) if isinstance(day, str) else []
+            return (self._active and not self._error and self._time_allowed(policy)
                     and day == self.clock.now().date().isoformat()
-                    and isinstance(key, str) and key in self._claims.get(day, []))
+                    and isinstance(key, str) and key in entries
+                    and entries.index(key) < policy.daily_limit)
 
     def snapshot(self):
         with self._lock:
+            with self._policy_lock:
+                policy = self.policy
             day = self.clock.now().date().isoformat()
             return {"date": day, "claimed": len(self._claims.get(day, [])),
-                    "limit": self.policy.daily_limit, "quiet_start": self.policy.quiet_start,
-                    "quiet_end": self.policy.quiet_end, "error": self._error}
+                    "limit": policy.daily_limit, "quiet_start": policy.quiet_start,
+                    "quiet_end": policy.quiet_end, "error": self._error}

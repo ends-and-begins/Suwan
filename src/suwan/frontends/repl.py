@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from pathlib import Path
 
 from suwan.app import SuwanRuntime
@@ -26,6 +27,44 @@ def _build_settings(home: str | None) -> Settings:
     return Settings.from_env(home_dir=Path(home) if home else None)
 
 
+async def desktop_command(runtime, line: str) -> str:
+    try:
+        return await _desktop_command(runtime, line)
+    except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
+        return f"桌面操作未完成（{type(exc).__name__}）：{str(exc)[:160]}"
+
+
+async def _desktop_command(runtime, line: str) -> str:
+    body = line[5:].strip()
+    action, _, argument = body.partition(" ")
+    if action in {"", "today", "find"}:
+        view = await runtime.desktop_view(query=argument if action == "find" else "")
+        today = view.get("today", {})
+        rows = [f"今日 {today.get('date', '')} · {today.get('counts', {})}"]
+        for item in view.get("timeline", []):
+            rows.append(f"[{item.get('id')}] {item.get('kind')} / {item.get('persistence')} / {item.get('time')}\n"
+                        f"{item.get('title')}：{item.get('text')}\n来源：{item.get('source_ids', [])}")
+        rows.extend(str(warning) for warning in view.get("warnings", []))
+        return "\n".join(rows)
+    if action == "settings":
+        view = await runtime.desktop_view()
+        return json.dumps(view.get("settings", {}), ensure_ascii=False, indent=2)
+    if action == "set":
+        key, _, raw = argument.partition(" ")
+        if not key or not raw.strip():
+            return "用法：/desk set 设置键 JSON值，例如 /desk set quiet_start 21"
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            value = raw.strip()
+        result = await runtime.update_desktop_settings({key: value})
+        return result.get("text", "设置已保存。" if result.get("ok") else "设置未保存。")
+    if action == "export":
+        result = await runtime.export_data()
+        return result.get("text", str(result.get("file") or "导出未完成。"))
+    return "/desk today | find 关键词 | settings | set 设置键 JSON值 | export；导出为查阅快照，非恢复备份。"
+
+
 async def amain(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     settings = _build_settings(args.home)
@@ -40,7 +79,7 @@ async def amain(argv: list[str] | None = None) -> int:
             reply = await runtime.ask(args.smoke)
             print(f"苏晚：{reply}")
             return 0
-        print("—— 苏晚 v5 已苏醒。命令：/quit /status /learn list|load <JSON路径>|step ID|run ID|cancel ID|revise ID 理由|find 查询 /activities /pause /resume /continue <ID> /discard <ID> /like <ID> /dislike <ID> /cfg /memory help /api on|off /net on|off /model <名> /voice <名> /tts <话> /doc <主题>")
+        print("—— 苏晚 v6 已苏醒。命令：/quit /status /desk today|find 词语|settings|set 键 JSON值|export /learn list|load <JSON路径>|step ID|run ID|cancel ID|revise ID 理由|find 查询 /activities /pause /resume /continue <ID> /discard <ID> /like <ID> /dislike <ID> /cfg /memory help /api on|off /net on|off /model <名> /voice <名> /tts <话> /doc <主题>")
         while True:
             line = await asyncio.to_thread(input, "你> ")
             line = line.strip()
@@ -55,6 +94,9 @@ async def amain(argv: list[str] | None = None) -> int:
             if line == "/cfg":
                 flags = runtime.status()["flags"]
                 print(f"API={flags['api']} 联网={flags['network']} 模型={flags['llm_provider']}（可用：{', '.join(ENDPOINT_ENV)}）")
+                continue
+            if line == "/desk" or line.startswith("/desk "):
+                print(await desktop_command(runtime, line))
                 continue
             if line == "/learn" or line.startswith("/learn "):
                 result = await runtime.learning_command(line)
@@ -88,22 +130,30 @@ async def amain(argv: list[str] | None = None) -> int:
             if line.startswith("/model "):
                 name = line[7:].strip()
                 if name in ENDPOINT_ENV:
-                    runtime.set_llm_provider(name)
-                    print(f"模型 -> {name}（{runtime.llm.model}）")
+                    result = await runtime.update_desktop_settings({"provider": name})
+                    print(result.get("text", f"模型 -> {name}（{runtime.llm.model}）"))
                 else:
                     print(f"未知供应商，可用：{', '.join(ENDPOINT_ENV)}")
                 continue
-            if line.startswith("/api"):
-                runtime.set_api_enabled(line.split()[-1] in ("on", "1", "true"))
-                print(f"API -> {runtime.api_enabled}")
+            if line == "/api" or line.startswith("/api "):
+                value = line.partition(" ")[2].lower()
+                if value not in {"on", "off", "1", "0", "true", "false"}:
+                    print("用法：/api on|off")
+                    continue
+                result = await runtime.update_desktop_settings({"api_enabled": value in ("on", "1", "true")})
+                print(result.get("text", f"API -> {runtime.api_enabled}"))
                 continue
-            if line.startswith("/net"):
-                runtime.set_network_enabled(line.split()[-1] in ("on", "1", "true"))
-                print(f"联网 -> {runtime.network_enabled}")
+            if line == "/net" or line.startswith("/net "):
+                value = line.partition(" ")[2].lower()
+                if value not in {"on", "off", "1", "0", "true", "false"}:
+                    print("用法：/net on|off")
+                    continue
+                result = await runtime.update_desktop_settings({"network_enabled": value in ("on", "1", "true")})
+                print(result.get("text", f"联网 -> {runtime.network_enabled}"))
                 continue
             if line.startswith("/voice "):
-                runtime.set_tts_voice(line[7:].strip())
-                print(f"音色 -> {runtime.tts_voice}")
+                result = await runtime.update_desktop_settings({"voice": line[7:].strip()})
+                print(result.get("text", f"音色 -> {runtime.tts_voice}"))
                 continue
             if line.startswith("/tts "):
                 path, error = await runtime.speak(line[5:].strip())

@@ -219,11 +219,18 @@ class RuntimeThread:
 
     def ask(self, text: str) -> Future:
         """把一句话提交给运行时；返回 Future[str]，用回调取回。"""
-        return self._submit(self.runtime.ask(text))
+        return self._submit(self._after_settings(lambda: self.runtime.ask(text), control=self.runtime.is_memory_control(text)))
+
+    async def _after_settings(self, work, *, control=False):
+        # Enter the runtime operation only after earlier GUI settings commits;
+        # constructing a coroutine late also avoids unawaited work on cancel.
+        if not control:
+            await self.runtime.wait_desktop_settings()
+        return await work()
 
     def ask_with_context(self, text: str) -> Future:
         """Reply plus the epoch of the context that produced it; GUI must retain both."""
-        return self._submit(self.runtime.ask_with_context(text))
+        return self._submit(self._after_settings(lambda: self.runtime.ask_with_context(text), control=self.runtime.is_memory_control(text)))
 
     def context_epoch(self) -> tuple[int, int]:
         return self.runtime.context_epoch()
@@ -233,14 +240,17 @@ class RuntimeThread:
 
     def speak(self, text: str, voice: str | None = None, *, expected_epoch=None) -> Future:
         """请求 TTS（走总线）；返回 Future[(path|None, error|None)]。"""
-        return self._submit(self.runtime.speak(text, voice=voice, expected_epoch=expected_epoch))
+        return self._submit(self._after_settings(lambda: self.runtime.speak(text, voice=voice, expected_epoch=expected_epoch)))
 
     def document(self, topic: str) -> Future:
-        return self._submit(self.runtime.doc_service.generate(topic))
+        async def generate():
+            await self.runtime.wait_desktop_settings()
+            return await self.runtime.doc_service.generate(topic)
+        return self._submit(generate())
 
     def api_check(self) -> Future:
         """请求 API 连通性探测；返回 Future[(ok, msg)]。"""
-        return self._submit(self.runtime.check_api_connection())
+        return self._submit(self._after_settings(self.runtime.check_api_connection))
 
     def memory_command(self, command: str) -> Future:
         async def execute():
@@ -267,6 +277,16 @@ class RuntimeThread:
 
     def learning_command(self, command: str) -> Future:
         return self._submit(self.runtime.learning_command(command))
+
+    def desktop_view(self, query: str = "", kind: str = "all", limit: int = 50) -> Future:
+        """Read desktop projections on the runtime owner loop."""
+        return self._submit(self.runtime.desktop_view(query=query, kind=kind, limit=limit))
+
+    def update_desktop_settings(self, patch: dict) -> Future:
+        return self._submit(self.runtime.update_desktop_settings(dict(patch)))
+
+    def export_data(self) -> Future:
+        return self._submit(self.runtime.export_data())
 
     def notification_current(self, data: dict) -> bool:
         interaction = getattr(self.runtime, "interaction", None)

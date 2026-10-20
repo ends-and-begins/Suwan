@@ -129,6 +129,9 @@ class CallManager:
         self.policy = policy or CallPolicy()
         self.clock = clock or RealClock()
         self._condition = threading.Condition(threading.RLock())
+        # Policy installation must not wait behind ledger fsync. Admission
+        # captures one immutable policy before starting its durable reserve.
+        self._policy_lock = threading.Lock()
         # Queue/UI operations must never wait for full-ledger fsync. The
         # original condition remains the lifecycle fence for durable writes.
         self._queue_condition = threading.Condition(threading.RLock())
@@ -342,8 +345,10 @@ class CallManager:
                 raise CallDenied("already_sent", state=existing["state"])
             today = [item for item in self._records if item["day"] == row["day"] and item["state"] != "cancelled_unsent"]
             allocated = sum(item["max_output_tokens"] or 0 for item in today)
-            call_limit = self.policy.daily_calls - (self.policy.foreground_reserved_calls if priority == 10 else 0)
-            output_limit = self.policy.daily_output_tokens - (self.policy.foreground_reserved_output_tokens if priority == 10 else 0)
+            with self._policy_lock:
+                policy = self.policy
+            call_limit = policy.daily_calls - (policy.foreground_reserved_calls if priority == 10 else 0)
+            output_limit = policy.daily_output_tokens - (policy.foreground_reserved_output_tokens if priority == 10 else 0)
             if len(today) + 1 > call_limit or (max_output_tokens is not None and allocated + max_output_tokens > output_limit):
                 raise CallDenied("budget_exhausted")
             epoch = self._epoch
@@ -400,9 +405,10 @@ class CallManager:
 
     def snapshot(self):
         records = self._records
+        policy = self.policy
         cache = self._snapshot_cache
         day = self.clock.now().date().isoformat()
-        if cache is None or cache[0] is not records or cache[1] != day:
+        if cache is None or cache[0] is not records or cache[1] != day or cache[3] is not policy:
             day = self.clock.now().date().isoformat()
             today = [row for row in records if row["day"] == day and row["state"] != "cancelled_unsent"]
             allocated = sum(row["max_output_tokens"] or 0 for row in today)
@@ -412,9 +418,9 @@ class CallManager:
                 known = [value for value in values if value is not None]
                 usage_totals[key] = sum(known) if known else None
             base = {"day": day,
-                    "daily_calls": self.policy.daily_calls, "daily_output_tokens": self.policy.daily_output_tokens,
-                    "foreground_reserved_calls": self.policy.foreground_reserved_calls,
-                    "foreground_reserved_output_tokens": self.policy.foreground_reserved_output_tokens,
+                    "daily_calls": policy.daily_calls, "daily_output_tokens": policy.daily_output_tokens,
+                    "foreground_reserved_calls": policy.foreground_reserved_calls,
+                    "foreground_reserved_output_tokens": policy.foreground_reserved_output_tokens,
                     "used_calls": len(today), "allocated_output_tokens": allocated,
                     "reserved_calls": sum(row["state"] == "reserved" for row in today),
                     "in_flight_calls": sum(row["state"] == "in_flight" for row in today),
@@ -422,17 +428,24 @@ class CallManager:
                     "today_unknown_calls": sum(row["state"] == "unknown" for row in today),
                     "reserved_output_tokens": sum((row["max_output_tokens"] or 0) for row in today if row["state"] in {"reserved", "in_flight"}),
                     "unknown_output_tokens": sum((row["max_output_tokens"] or 0) for row in today if (row["actual_usage"] or {}).get("completion_tokens") is None),
-                    "remaining_calls": max(0, self.policy.daily_calls - len(today)),
-                    "remaining_output_tokens": max(0, self.policy.daily_output_tokens - allocated),
+                    "remaining_calls": max(0, policy.daily_calls - len(today)),
+                    "remaining_output_tokens": max(0, policy.daily_output_tokens - allocated),
                     "actual_usage_known_calls": sum(row["actual_usage"] is not None for row in today),
                     "actual_usage_unknown_calls": sum(row["actual_usage"] is None for row in today),
                     "actual_output_unknown_calls": sum((row["actual_usage"] or {}).get("completion_tokens") is None for row in today),
                     "known_actual_usage": usage_totals,
                     "unknown_calls": sum(row["state"] == "unknown" for row in records),
                     "records": records[-100:]}
-            cache = (records, day, base)
+            cache = (records, day, base, policy)
             self._snapshot_cache = cache
         with self._queue_condition:
             live = {"active": self._active, "ledger_error": self._error,
                     "pending": len(self._queue), "in_flight": self._current_priority is not None}
         return {**deepcopy(cache[2]), **live}
+
+    def set_policy(self, policy: CallPolicy) -> None:
+        if not isinstance(policy, CallPolicy):
+            raise ValueError("调用预算策略非法")
+        with self._policy_lock:
+            self.policy = policy
+            self._snapshot_cache = None

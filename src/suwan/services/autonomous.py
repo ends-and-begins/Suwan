@@ -238,11 +238,23 @@ class AutonomousService(Organ):
     def view(self) -> dict:
         if not self._refresh_sources():
             return {"paused": True, "last_error": self.last_error, "activities": []}
+        return self._current_view()
+
+    def _current_view(self) -> dict:
         return {"paused": self.journal.paused, "last_error": self.last_error, "activities": [
             {**{key: list(row[key]) if key == "source_ids" else row[key] for key in ("id", "action", "reason", "topic", "status", "phase", "source_ids",
                 "created", "updated", "artifact_path", "memory_saved", "goal_saved", "notification_claimed", "feedback", "error")},
              "expected_result": ACTIVITY_PLANS[row["action"]][0], "completion_condition": ACTIVITY_PLANS[row["action"]][1]}
             for row in self.journal.records[-20:]]}
+
+    def desktop_snapshot(self) -> tuple[dict, list[dict]]:
+        """One source validation for recent metadata and the full work registry."""
+        if not self._refresh_sources():
+            return {"paused": True, "last_error": self.last_error, "activities": []}, []
+        works = [dict(row) for row in self.journal.records
+                 if row["action"] == "creation" and row["status"] == "completed"
+                 and row["artifact_path"] and self._valid(row)]
+        return self._current_view(), works
 
     def feedback(self, identifier: str, liked: bool) -> dict:
         if not self._refresh_sources():

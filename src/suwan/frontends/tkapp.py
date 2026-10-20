@@ -2,7 +2,7 @@
 
 布局（grid）：
   row0 标题栏（极简：品牌 + 当前供应商/模型）
-  row1 Notebook：对话 | 状态板 | 设置 | 作品集 | 人生故事 | 系统日志
+  row1 Notebook：对话 | 记忆 | 状态板 | 设置 | 作品集 | 人生故事 | 系统日志
   row2 底部状态栏：API ✓/✕/◦ 指示 · 音色
 "设置"页：API/联网开关、模型=供应商+具体模型二级下拉、音色/自动朗读/朗读上句、测试连接
 "系统日志"页：日志正文 + 级别过滤(全部/INFO/OK/WARN/ERROR) + 清空
@@ -15,6 +15,7 @@ import argparse
 import queue
 import time
 import tkinter as tk
+import weakref
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
@@ -79,6 +80,26 @@ class TkApp:
         self._learning_generation = 0
         self._works_generation = 0
         self._api_probe_generation = 0
+        self._chat_generation = 0
+        self._chat_future = None
+        self._chat_started = 0.0
+        self._desktop_generation = 0
+        self._desktop_pending = False
+        self._desktop_settings_loaded = False
+        self._settings_generation = 0
+        self._settings_pending = False
+        self._settings_flush_id = None
+        self._pending_settings_patch: dict = {}
+        self._pending_settings_revisions: dict[str, int] = {}
+        self._desktop_draft_revisions: dict[str, int] = {}
+        self._desktop_dirty_fields: set[str] = set()
+        self._desktop_applying_settings = False
+        self._desktop_committed_settings: dict = {}
+        self._settings_future = None
+        self._playback_volume = getattr(runtime, "tts_volume", 100)
+        self._playback_auto_read = bool(getattr(runtime, "tts_enabled", False))
+        self._review_rows: dict[str, dict] = {}
+        self.review_window = None
         self._log_entries: list[tuple[str, str]] = []  # (level, text)
         self._toggles: list = []  # (canvas, oval, var, on_color, on_toggle)
 
@@ -91,8 +112,10 @@ class TkApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._pump()
         self._sync_settings_from_runtime()
+        self._desktop_draft_revisions["model"] = 0
+        self.model_var.trace_add("write", lambda *_args: self._desktop_draft_edited("model"))
         self._refresh_api_indicator()
-        self._log_msg("苏晚 v5 已启动 · /learn 可管理有来源的学习任务；状态板可查看学习、活动与调用预算", "info")
+        self._log_msg("苏晚 v6 已启动 · 今日回顾可查询共同经历、活动和学习；设置集中管理声音、安静时段与调用预算", "info")
         for warning in getattr(runtime.settings, "configuration_warnings", ()):
             self._log_msg(warning, "warn")
         for warning in getattr(runtime, "startup_warnings", ()):
@@ -141,6 +164,7 @@ class TkApp:
     # ---------- row1 主区 ----------
     def _build_notebook(self, row: int) -> None:
         nb = ttk.Notebook(self.root)
+        self.notebook = nb
         nb.grid(row=row, column=0, sticky="nsew", padx=12)
         tabs = {}
         for key, text in (("chat", "对话"), ("memory", "记忆"), ("status", "状态板"), ("settings", "设置"),
@@ -161,6 +185,16 @@ class TkApp:
         self._build_log()
 
     def _build_chat(self) -> None:
+        overview = tk.Frame(self._tab_chat, bg=PANEL)
+        overview.pack(fill=tk.X, padx=10, pady=(8, 0))
+        self.today_summary = tk.StringVar(value="正在读取今日概览…")
+        tk.Label(overview, textvariable=self.today_summary, bg=PANEL, fg=ACCENT,
+                 font=("Microsoft YaHei UI", 9), justify="left", anchor="w", wraplength=620).pack(
+                     side=tk.LEFT, fill=tk.X, expand=True)
+        self.review_button = ttk.Button(overview, text="今日回顾", command=self._open_review)
+        self.review_button.pack(side=tk.RIGHT)
+        self.today_works_button = ttk.Button(overview, text="查看作品", command=self._show_works)
+        self.today_works_button.pack(side=tk.RIGHT, padx=6)
         self.chat_area = self._scrolled(self._tab_chat)
         self.chat_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 6))
         tip = self._label(self._tab_chat, "回车发送 · /api on|off · /net on|off · /doc 主题 · /tts 文本", color="#5f6670", size=8)
@@ -172,7 +206,15 @@ class TkApp:
                          insertbackground=FG, relief=tk.FLAT)
         entry.pack(fill=tk.X, side=tk.LEFT, expand=True, ipady=7, padx=(0, 8))
         entry.bind("<Return>", self.send)
-        ttk.Button(row, text="发送", style="Accent.TButton", command=self.send).pack(side=tk.RIGHT)
+        self.send_button = ttk.Button(row, text="发送", style="Accent.TButton", command=self.send)
+        self.send_button.pack(side=tk.RIGHT)
+        wait_row = tk.Frame(self._tab_chat, bg=PANEL)
+        wait_row.pack(fill=tk.X, padx=10, pady=(0, 6))
+        self.chat_wait_var = tk.StringVar(value="近期对话仅属于本次会话；持久记忆请在“记忆”或“今日回顾”查看。")
+        tk.Label(wait_row, textvariable=self.chat_wait_var, bg=PANEL, fg=SUB, anchor="w",
+                 font=("Microsoft YaHei UI", 8)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.chat_cancel_button = ttk.Button(wait_row, text="取消等待", state="disabled", command=self._cancel_chat)
+        self.chat_cancel_button.pack(side=tk.RIGHT)
         entry.focus_set()
 
     def _build_status(self) -> None:
@@ -238,6 +280,7 @@ class TkApp:
     def _request_learning(self, command: str | None = None) -> None:
         if self._closing:
             return
+        self._flush_desktop_settings()
         self._learning_generation += 1
         generation = self._learning_generation
         epoch = self.server.context_epoch()
@@ -294,6 +337,8 @@ class TkApp:
         self._request_activities(action, selected[0])
 
     def _request_activities(self, action: str | None = None, activity_id: str | None = None) -> None:
+        if action is not None:
+            self._flush_desktop_settings()
         if self._closing or not hasattr(self, "activity_tree"):
             return
         if self._activity_pending and (action is None or self._activity_mutating):
@@ -554,7 +599,17 @@ class TkApp:
 
     # ---------- 设置页（控制面板搬家） ----------
     def _build_settings(self) -> None:
-        ctl = tk.LabelFrame(self._tab_settings, text="连接与声音", bg=PANEL, fg=ACCENT,
+        self.settings_canvas = tk.Canvas(self._tab_settings, bg=PANEL, highlightthickness=0)
+        self.settings_scrollbar = ttk.Scrollbar(self._tab_settings, orient="vertical", command=self.settings_canvas.yview)
+        self.settings_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.settings_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.settings_canvas.configure(yscrollcommand=self.settings_scrollbar.set)
+        body = tk.Frame(self.settings_canvas, bg=PANEL)
+        window = self.settings_canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda _event: self.settings_canvas.configure(scrollregion=self.settings_canvas.bbox("all")))
+        self.settings_canvas.bind("<Configure>", lambda event: self.settings_canvas.itemconfigure(window, width=event.width))
+        self.root.bind("<MouseWheel>", self._settings_mousewheel, add="+")
+        ctl = tk.LabelFrame(body, text="连接与声音", bg=PANEL, fg=ACCENT,
                             font=("Microsoft YaHei UI", 9, "bold"), padx=14, pady=10)
         ctl.pack(fill=tk.X, padx=12, pady=(12, 6))
 
@@ -587,9 +642,11 @@ class TkApp:
         self.provider_cb.bind("<<ComboboxSelected>>", self._on_provider_selected)
         self._label(row2, "具体模型", color=SUB).pack(side=tk.LEFT, padx=(12, 0))
         self.model_var = tk.StringVar()
-        self.model_cb = ttk.Combobox(row2, textvariable=self.model_var, state="readonly", width=26)
+        self.model_cb = ttk.Combobox(row2, textvariable=self.model_var, state="normal", width=26)
         self.model_cb.pack(side=tk.LEFT, padx=(8, 0))
         self.model_cb.bind("<<ComboboxSelected>>", self._on_model_selected)
+        self.model_cb.bind("<Return>", self._on_model_selected)
+        ttk.Button(row2, text="应用模型", command=self._on_model_selected).pack(side=tk.LEFT, padx=6)
 
         row3 = tk.Frame(ctl, bg=PANEL)
         row3.pack(fill=tk.X, pady=(8, 4))
@@ -603,12 +660,12 @@ class TkApp:
         read_group.pack(side=tk.LEFT, padx=(12, 0))
         ttk.Button(row3, text="🔊 朗读上句", command=self._speak_last).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Button(row3, text="停止朗读", command=self._stop_speaking).pack(side=tk.LEFT, padx=(6, 0))
-        self._label(row3, "（朗读需要 MiMo 的 MIMO_API_KEY；模型候选可用 MODEL_XX 追加）", color="#5f6670", size=8).pack(side=tk.LEFT, padx=(16, 0))
+        self._label(ctl, "朗读需要 MiMo 通用 API 密钥。模型名可直接输入，回车或点击“应用模型”保存。",
+                    color=SUB, bg=PANEL, size=8).pack(anchor="w", pady=(3, 0))
 
-        self._label(self._tab_settings,
-                    "提示：.env 的 MODEL_<供应商>（如 MODEL_OPENAI=gpt-4o）会作为该供应商的默认模型；切换供应商/模型即时生效。",
-                    color="#5f6670", size=9).pack(anchor="w", padx=14, pady=(4, 0))
-        preferences = tk.LabelFrame(self._tab_settings, text="交流偏好", bg=PANEL, fg=ACCENT,
+        self._label(body, "连接与声音选项保存后生效并在重启后保持，密钥仍由原环境配置管理。",
+                    color=SUB, size=8).pack(anchor="w", padx=14, pady=(4, 0))
+        preferences = tk.LabelFrame(body, text="交流偏好", bg=PANEL, fg=ACCENT,
                                     font=("Microsoft YaHei UI", 9, "bold"), padx=14, pady=10)
         preferences.pack(fill=tk.X, padx=12, pady=(16, 6))
         row = tk.Frame(preferences, bg=PANEL)
@@ -633,6 +690,440 @@ class TkApp:
                  bg=PANEL, fg=ACCENT, font=("Microsoft YaHei UI", 9)).pack(fill=tk.X, pady=(8, 4))
         self._label(preferences, "选择后立即保存，重启后保持。停止主动消息时，你发来的消息仍会正常回应。",
                     color=SUB, bg=PANEL, size=8).pack(anchor="w")
+
+        advanced = tk.LabelFrame(body, text="安静时段、限额与音量", bg=PANEL, fg=ACCENT,
+                                 font=("Microsoft YaHei UI", 9, "bold"), padx=14, pady=10)
+        advanced.pack(fill=tk.X, padx=12, pady=6)
+        # Direct attributes own Tcl variables.  The lookup must not keep an
+        # extra reference after normal owner-thread variable cleanup.
+        self.desktop_setting_vars = weakref.WeakValueDictionary()
+        fields = (("quiet_start", "安静开始（0–23时）", "22"), ("quiet_end", "安静结束（0–23时）", "8"),
+                  ("proactive_limit", "每日主动消息上限", "8"), ("volume", "朗读音量（0–100）", "100"),
+                  ("daily_calls", "每日调用次数上限", "40"), ("daily_output_tokens", "每日分配输出 token 上限", "32768"),
+                  ("foreground_reserved_calls", "前台保留调用次数", "4"),
+                  ("foreground_reserved_output_tokens", "前台保留输出 token", "4096"))
+        for index, (key, label, default) in enumerate(fields):
+            r, c = divmod(index, 2)
+            self._label(advanced, label, color=SUB, bg=PANEL).grid(row=r, column=c * 2, sticky="w", pady=3, padx=(0, 8))
+            value = tk.StringVar(value=default)
+            setattr(self, "_desktop_" + key + "_var", value)
+            self.desktop_setting_vars[key] = value
+            self._desktop_draft_revisions[key] = 0
+            value.trace_add("write", lambda *_args, field=key: self._desktop_draft_edited(field))
+            tk.Entry(advanced, textvariable=value, width=10, bg=FIELD, fg=FG, insertbackground=FG,
+                     relief=tk.FLAT).grid(row=r, column=c * 2 + 1, sticky="ew", padx=(0, 20), ipady=3)
+        self.volume_var = self.desktop_setting_vars["volume"]
+        for column in (1, 3):
+            advanced.grid_columnconfigure(column, weight=1)
+        tk.Label(advanced, text="安静开始与结束相同时不设安静时段；音量在下次播放生效。token 为分配上限，实际用量以账目为准。",
+                 bg=PANEL, fg=SUB, font=("Microsoft YaHei UI", 8), wraplength=810, anchor="w", justify="left").grid(
+                     row=4, column=0, columnspan=4, sticky="ew", pady=(6, 3))
+        self.desktop_save_button = ttk.Button(advanced, text="保存时段与限额", command=self._save_desktop_controls)
+        self.desktop_save_button.grid(row=5, column=0, sticky="w", pady=3)
+        self.desktop_settings_state = tk.StringVar(value="正在读取桌面设置…")
+        tk.Label(advanced, textvariable=self.desktop_settings_state, bg=PANEL, fg=ACCENT,
+                 font=("Microsoft YaHei UI", 8), wraplength=580, anchor="w", justify="left").grid(
+                     row=5, column=1, columnspan=3, sticky="ew")
+        self.desktop_committed_state = tk.StringVar(value="当前生效设置正在读取；输入框中的修改需保存后生效。")
+        tk.Label(advanced, textvariable=self.desktop_committed_state, bg=PANEL, fg=SUB,
+                 font=("Microsoft YaHei UI", 8), wraplength=810, anchor="w", justify="left").grid(
+                     row=6, column=0, columnspan=4, sticky="ew", pady=(3, 0))
+
+        data = tk.LabelFrame(body, text="数据位置与导出", bg=PANEL, fg=ACCENT,
+                             font=("Microsoft YaHei UI", 9, "bold"), padx=14, pady=10)
+        data.pack(fill=tk.X, padx=12, pady=(6, 12))
+        self.data_info = tk.StringVar(value="正在读取本地数据位置…")
+        tk.Label(data, textvariable=self.data_info, bg=PANEL, fg=FG, font=("Microsoft YaHei UI", 8),
+                 wraplength=820, justify="left", anchor="w").pack(fill=tk.X)
+        self.retention_info = tk.StringVar(value="正在读取保留范围说明…")
+        tk.Label(data, textvariable=self.retention_info, bg=PANEL, fg=SUB, font=("Microsoft YaHei UI", 8),
+                 wraplength=820, justify="left", anchor="w").pack(fill=tk.X, pady=(6, 3))
+        self.export_button = ttk.Button(data, text="导出逻辑数据 JSON", command=self._export_data)
+        self.export_button.pack(anchor="w", pady=(6, 3))
+        self._label(data, "导出用于查看和迁移参考，不是完整恢复备份；修改代码前仍须另做完整备份。",
+                    color=SUB, bg=PANEL, size=8).pack(anchor="w")
+        self.export_state = tk.StringVar(value="尚未导出。")
+        tk.Label(data, textvariable=self.export_state, bg=PANEL, fg=ACCENT, wraplength=820,
+                 justify="left", anchor="w", font=("Microsoft YaHei UI", 8)).pack(fill=tk.X, pady=(4, 0))
+
+    def _settings_mousewheel(self, event):
+        if str(event.widget).startswith(str(self._tab_settings)):
+            self.settings_canvas.yview_scroll(-int(event.delta / 120), "units")
+            return "break"
+        return None
+
+    def _save_desktop_controls(self) -> None:
+        try:
+            patch = {key: int(value.get().strip()) for key, value in self.desktop_setting_vars.items()}
+        except ValueError:
+            self.desktop_settings_state.set("这些选项须填写整数；开始和结束是 0–23 时，音量是 0–100。")
+            return
+        self._stop_speaking()
+        self._save_desktop_settings(patch)
+
+    def _desktop_draft_edited(self, key: str) -> None:
+        if self._desktop_applying_settings:
+            return
+        self._desktop_draft_revisions[key] += 1
+        self._desktop_dirty_fields.add(key)
+        self._refresh_desktop_committed_state()
+
+    def _refresh_desktop_committed_state(self) -> None:
+        if not hasattr(self, "desktop_committed_state") or not self._desktop_committed_settings:
+            return
+        values = self._desktop_committed_settings
+        self.desktop_committed_state.set(
+            f"当前生效模型：{values['provider']} / {values['model']}\n"
+            f"安静 {values['quiet_start']}–{values['quiet_end']} 时 · 主动上限 {values['proactive_limit']} · 音量 {values['volume']}\n"
+            f"每日调用 {values['daily_calls']} · 输出 token {values['daily_output_tokens']} · 前台保留 {values['foreground_reserved_calls']} 次/{values['foreground_reserved_output_tokens']} token"
+            + ("（输入框有未保存草稿）" if self._desktop_dirty_fields else ""))
+
+    def _save_desktop_settings(self, patch: dict) -> None:
+        if self._closing:
+            return
+        self._settings_generation += 1
+        self._settings_pending = True
+        self.desktop_settings_state.set("正在保存桌面设置…")
+        if set(patch) & {"provider", "model", "api_enabled"}:
+            self._api_probe_generation += 1
+        # Coalesce edits made in one Tk turn.  Apart from avoiding transient
+        # on/off states, this keeps saving asynchronous even on a busy disk.
+        self._pending_settings_patch.update(patch)
+        # Capture when the user clicks save, not when after_idle later submits
+        # the batch: the user can already be editing the next draft by then.
+        revision_keys = set(patch) | ({"model"} if "provider" in patch else set())
+        self._pending_settings_revisions.update({key: self._desktop_draft_revisions[key]
+                                                for key in revision_keys if key in self._desktop_draft_revisions})
+        if self._settings_flush_id is None:
+            self._settings_flush_id = self.root.after_idle(self._flush_desktop_settings)
+            self._after_ids.add(self._settings_flush_id)
+
+    def _flush_desktop_settings(self) -> None:
+        if not hasattr(self, "_pending_settings_patch"):
+            return
+        if self._settings_flush_id is not None:
+            self.root.after_cancel(self._settings_flush_id)
+            self._after_ids.discard(self._settings_flush_id)
+            self._settings_flush_id = None
+        if self._closing or not self._pending_settings_patch:
+            return
+        patch, self._pending_settings_patch = self._pending_settings_patch, {}
+        revisions, self._pending_settings_revisions = self._pending_settings_revisions, {}
+        generation = self._settings_generation
+        epoch = self.server.context_epoch()
+        try:
+            future = self.server.update_desktop_settings(patch)
+            self._settings_future = future
+        except Exception as exc:
+            self._settings_pending = False
+            self.desktop_settings_state.set(f"桌面设置未保存：{type(exc).__name__}")
+            return
+        def done(fut):
+            try:
+                result = fut.result()
+            except Exception as exc:
+                result = {"ok": False, "text": f"桌面设置未保存：{type(exc).__name__}", "_context_epoch": epoch}
+            self._queue_ui(self._render_desktop_settings, result, generation, patch, revisions)
+        future.add_done_callback(done)
+
+    def _apply_desktop_settings(self, settings: dict, committed_revisions: dict | None = None) -> None:
+        self._desktop_settings_loaded = True
+        provider = str(settings.get("provider", "mimo"))
+        self.provider_var.set(PROVIDER_LABELS.get(provider, provider))
+        model_submitted_current = (committed_revisions is not None and "model" in committed_revisions
+                                   and committed_revisions["model"] == self._desktop_draft_revisions["model"])
+        model_dirty = "model" in self._desktop_dirty_fields and not model_submitted_current
+        model = self.model_var.get() if model_dirty else str(settings.get("model", ""))
+        self._desktop_applying_settings = True
+        try:
+            self._refresh_model_options(provider)
+            self.model_var.set(model)
+        finally:
+            self._desktop_applying_settings = False
+        if not model_dirty:
+            self._desktop_dirty_fields.discard("model")
+        self.voice_var.set(str(settings.get("voice", VOICE_PRESETS[0])))
+        self.read_var.set(bool(settings.get("auto_read", False)))
+        self._playback_auto_read = self.read_var.get()
+        self._playback_volume = int(settings.get("volume", 100))
+        self.api_var.set(bool(settings.get("api_enabled", False)))
+        self.net_var.set(bool(settings.get("network_enabled", False)))
+        self._desktop_committed_settings.update(settings)
+        self._desktop_applying_settings = True
+        try:
+            for key, value in self.desktop_setting_vars.items():
+                if key not in settings:
+                    continue
+                submitted_current = (committed_revisions is not None and key in committed_revisions
+                                     and committed_revisions[key] == self._desktop_draft_revisions[key])
+                if key not in self._desktop_dirty_fields or submitted_current:
+                    value.set(str(settings[key]))
+                    self._desktop_dirty_fields.discard(key)
+        finally:
+            self._desktop_applying_settings = False
+        self._refresh_desktop_committed_state()
+        self._sync_toggle_dots()
+        self._refresh_api_indicator()
+
+    def _render_desktop_settings(self, result: dict, generation: int, patch: dict,
+                                 revisions: dict | None = None) -> None:
+        if self._closing:
+            return
+        if generation != self._settings_generation:
+            # A newer unrelated save owns the full snapshot, but an earlier
+            # successful save can still acknowledge its unchanged draft.  Do
+            # not label that already saved input as permanently unsaved.
+            epoch = result.get("_context_epoch")
+            if result.get("ok") and epoch is not None and self.server.context_current(epoch):
+                for key, revision in (revisions or {}).items():
+                    if self._desktop_draft_revisions.get(key) == revision:
+                        self._desktop_dirty_fields.discard(key)
+                self._refresh_desktop_committed_state()
+            return
+        self._settings_pending = False
+        epoch = result.get("_context_epoch")
+        if epoch is None or not self.server.context_current(epoch):
+            # A submitted model choice whose receipt lost its source context
+            # must be reconciled with the current runtime.  A newer unsubmitted
+            # draft and the independent numeric drafts remain editable.
+            if ("model" in patch and revisions is not None
+                    and revisions.get("model") == self._desktop_draft_revisions["model"]):
+                self._desktop_dirty_fields.discard("model")
+            self.desktop_settings_state.set("设置期间来源已变更，正在重新读取。")
+            self._desktop_settings_loaded = False
+            self._request_desktop()
+            return
+        if isinstance(result.get("settings"), dict):
+            self._apply_desktop_settings(result["settings"], revisions if result.get("ok") else None)
+        self.desktop_settings_state.set(str(result.get("text") or ("桌面设置已保存。" if result.get("ok") else "桌面设置未保存。")))
+        if result.get("settings_readonly"):
+            self.desktop_save_button.configure(state="disabled")
+        if result.get("ok") and patch.get("api_enabled"):
+            self._after(500, self._test_api)
+        self._request_desktop()
+
+    def _export_data(self) -> None:
+        if self._closing:
+            return
+        self.export_state.set("正在导出本地逻辑数据…")
+        self.export_button.configure(state="disabled")
+        epoch = self.server.context_epoch()
+        try:
+            future = self.server.export_data()
+        except Exception as exc:
+            self.export_button.configure(state="normal")
+            self.export_state.set(f"导出未完成：{type(exc).__name__}")
+            return
+        def done(fut):
+            try:
+                result = fut.result()
+            except Exception as exc:
+                result = {"ok": False, "text": f"导出未完成：{type(exc).__name__}", "_context_epoch": epoch}
+            self._queue_ui(self._render_export, result)
+        future.add_done_callback(done)
+
+    def _render_export(self, result: dict) -> None:
+        if self._closing:
+            return
+        self.export_button.configure(state="normal")
+        epoch = result.get("_context_epoch")
+        if epoch is None or not self.server.context_current(epoch):
+            self.export_state.set("来源已变更，旧导出回执已忽略。")
+            return
+        message = str(result.get("text", "导出未完成。"))
+        if result.get("ok") and result.get("path"):
+            message += "\n" + str(result["path"])
+        self.export_state.set(message)
+
+    # ---------- 今日概览与跨来源回顾 ----------
+    def _show_works(self) -> None:
+        self.notebook.select(self._tab_works)
+        self._refresh_files()
+
+    def _review_open(self) -> bool:
+        return self.review_window is not None and bool(self.review_window.winfo_exists())
+
+    def _open_review(self) -> None:
+        if self._closing:
+            return
+        if self._review_open():
+            self.review_window.lift()
+            self._request_desktop()
+            return
+        window = self.review_window = tk.Toplevel(self.root)
+        window.title("苏晚 · 今日回顾与时间线")
+        window.geometry("960x740")
+        window.minsize(780, 560)
+        window.configure(bg=PANEL)
+        window.protocol("WM_DELETE_WINDOW", self._close_review)
+        tk.Label(window, textvariable=self.today_summary, bg=PANEL, fg=ACCENT, justify="left",
+                 anchor="w", wraplength=900, font=("Microsoft YaHei UI", 10)).pack(fill=tk.X, padx=12, pady=10)
+        self.review_today = tk.StringVar(value="正在读取近期活动与待办…")
+        tk.Label(window, textvariable=self.review_today, bg=PANEL, fg=FG, justify="left", anchor="w",
+                 wraplength=900, font=("Microsoft YaHei UI", 8)).pack(fill=tk.X, padx=12, pady=(0, 6))
+        filters = tk.Frame(window, bg=PANEL)
+        filters.pack(fill=tk.X, padx=12)
+        self.review_query_var = tk.StringVar()
+        query_entry = tk.Entry(filters, textvariable=self.review_query_var, bg=FIELD, fg=FG,
+                               insertbackground=FG, relief=tk.FLAT, font=("Microsoft YaHei UI", 10))
+        query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5)
+        query_entry.bind("<Return>", lambda _event: self._request_desktop())
+        self._review_kinds = {"全部": "all", "记忆": "memory", "活动": "activity", "学习": "learning"}
+        self.review_kind_var = tk.StringVar(value="全部")
+        kind = ttk.Combobox(filters, textvariable=self.review_kind_var, values=list(self._review_kinds),
+                            state="readonly", width=9)
+        kind.pack(side=tk.LEFT, padx=8)
+        kind.bind("<<ComboboxSelected>>", lambda _event: self._request_desktop())
+        self.review_search_button = ttk.Button(filters, text="查询时间线", command=self._request_desktop)
+        self.review_search_button.pack(side=tk.RIGHT)
+        self.review_tree = ttk.Treeview(window, columns=("kind", "time", "title", "state"), show="headings", height=10)
+        for key, label, width in (("kind", "类型", 65), ("time", "发生时间", 150), ("title", "共同经历与进展", 400),
+                                   ("state", "状态 / 保存", 180)):
+            self.review_tree.heading(key, text=label)
+            self.review_tree.column(key, width=width, minwidth=50, stretch=True)
+        self.review_tree.pack(fill=tk.BOTH, expand=True, padx=12, pady=(8, 4))
+        self.review_tree.bind("<<TreeviewSelect>>", self._review_selected)
+        self.review_detail = self._scrolled(window)
+        self.review_detail.configure(height=6, state="disabled")
+        self.review_detail.pack(fill=tk.X, padx=12, pady=4)
+        self.review_status = tk.StringVar(value="请选择记录查看来源 ID 与保存状态。")
+        tk.Label(window, textvariable=self.review_status, bg=PANEL, fg=SUB, justify="left", anchor="w",
+                 wraplength=900, font=("Microsoft YaHei UI", 8)).pack(fill=tk.X, padx=12)
+        self._label(window, "近期对话（仅本次会话，不在退出后恢复；正式记忆另列于上方时间线）", color=ACCENT,
+                    bg=PANEL, size=8).pack(anchor="w", padx=12, pady=(8, 0))
+        self.review_recent = self._scrolled(window)
+        self.review_recent.configure(height=4, state="disabled", font=("Microsoft YaHei UI", 8))
+        self.review_recent.pack(fill=tk.X, padx=12, pady=(4, 12))
+        self._request_desktop()
+
+    def _close_review(self) -> None:
+        self._desktop_generation += 1
+        self._desktop_pending = False
+        self._review_rows.clear()
+        if self._review_open():
+            self.review_window.destroy()
+        self.review_window = None
+
+    def _request_desktop(self, *, background: bool = False) -> None:
+        if self._closing or (background and self._desktop_pending):
+            return
+        self._desktop_generation += 1
+        generation = self._desktop_generation
+        self._desktop_pending = True
+        epoch = self.server.context_epoch()
+        query = self.review_query_var.get().strip() if self._review_open() else ""
+        kind = self._review_kinds.get(self.review_kind_var.get(), "all") if self._review_open() else "all"
+        try:
+            future = self.server.desktop_view(query=query, kind=kind, limit=50)
+        except Exception as exc:
+            self._desktop_pending = False
+            self.today_summary.set(f"今日概览暂不可读：{type(exc).__name__}")
+            return
+        def done(fut):
+            try:
+                result = fut.result()
+            except Exception as exc:
+                result = {"ok": False, "text": f"回顾读取失败：{type(exc).__name__}", "_context_epoch": epoch}
+            self._queue_ui(self._render_desktop, result, generation)
+        future.add_done_callback(done)
+
+    @staticmethod
+    def _persistence_label(row: dict) -> str:
+        if row.get("pending_save") or row.get("persistence") == "pending":
+            return "待保存"
+        return {"saved": "本地已保存", "session_only": "仅本次会话", "metadata_only": "仅进度记录"}.get(
+            str(row.get("persistence", "")), str(row.get("persistence", "未确认保存")))
+
+    def _render_desktop(self, result: dict, generation: int) -> None:
+        if self._closing or generation != self._desktop_generation:
+            return
+        self._desktop_pending = False
+        epoch = result.get("_context_epoch")
+        if epoch is None or not self.server.context_current(epoch):
+            return
+        if not result.get("ok"):
+            self.today_summary.set(str(result.get("text", "今日概览暂不可读。")))
+            return
+        today = result.get("today", {})
+        summary = str(today.get("summary") or "今天还没有已记录的活动。")
+        self.today_summary.set(summary)
+        if not self._desktop_settings_loaded and not self._settings_pending and isinstance(result.get("settings"), dict):
+            self._apply_desktop_settings(result["settings"])
+            self.desktop_settings_state.set("桌面设置已读取。")
+        if result.get("settings_readonly"):
+            self.desktop_save_button.configure(state="disabled")
+            self.desktop_settings_state.set("设置文件异常，已保留原文件并暂停设置写入；请修复后重启。")
+        storage = result.get("storage", {})
+        paths = (("home_dir", "数据根目录"), ("data_dir", "持久数据"), ("share_dir", "投喂资料"),
+                 ("output_dir", "作品输出"), ("settings_file", "桌面设置"), ("export_dir", "逻辑导出"))
+        self.data_info.set("\n".join(f"{label}：{storage[key]}" for key, label in paths if storage.get(key)))
+        retention = result.get("retention", {})
+        self.retention_info.set("数据保留范围：\n" + "\n".join(str(value) for value in retention.values()))
+        if not self._review_open():
+            return
+        describe = lambda rows: "；".join(f"{str(row.get('title', '活动'))[:30]}（{row.get('status', '')}）"
+                                        for row in rows[:3]) or "暂无记录"
+        self.review_today.set("今日活动：" + describe(today.get("activities", [])) +
+                              "\n待办事项：" + describe(today.get("todos", [])))
+        selected = self.review_tree.selection()
+        self._review_rows.clear()
+        self.review_tree.delete(*self.review_tree.get_children())
+        labels = {"memory": "记忆", "activity": "活动", "learning": "学习"}
+        for row in result.get("timeline", []):
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
+                continue
+            iid = row["id"]
+            if iid in self._review_rows:
+                continue
+            self._review_rows[iid] = dict(row)
+            self.review_tree.insert("", tk.END, iid=iid, values=(labels.get(row.get("kind"), row.get("kind", "")),
+                str(row.get("time", ""))[:19], str(row.get("title", "")),
+                f"{row.get('status', '')} · {self._persistence_label(row)}"))
+        if selected and selected[0] in self._review_rows:
+            self.review_tree.selection_set(selected[0])
+        self._review_selected()
+        warnings = [str(value) for value in result.get("warnings", [])]
+        self.review_status.set(f"显示 {len(self._review_rows)} 条记录，最多 50 条；可按关键词与类型筛选。" +
+                               ("\n" + "；".join(warnings) if warnings else ""))
+        recent = []
+        for row in result.get("recent_chat", [])[-8:]:
+            recent.append(f"{row.get('kind', '对话')} · {str(row.get('time', ''))[:19]} · 仅本次会话\n{row.get('text', '')}")
+        self._replace_text(self.review_recent, "\n\n".join(recent) if recent else "本次会话还没有近期对话。")
+
+    def _review_selected(self, _event=None) -> None:
+        selected = self.review_tree.selection()
+        row = self._review_rows.get(selected[0]) if selected else None
+        if row is None:
+            self._replace_text(self.review_detail, "选择一条记录可查看正文、来源与保存状态。")
+            return
+        sources = list(row.get("source_ids", []))
+        if row.get("source_id") and row["source_id"] not in sources:
+            sources.insert(0, row["source_id"])
+        text = f"{row.get('title', '')}\n类型：{row.get('kind', '')} · 状态：{row.get('status', '')} · {self._persistence_label(row)}\n"
+        text += "来源 ID：" + ("、".join(map(str, sources)) if sources else "无；此记录没有可引用的原文来源")
+        text += "\n记录 ID：" + str(row.get("entity_id", row.get("id", "")))
+        text += "\n\n" + str(row.get("text", ""))
+        self._replace_text(self.review_detail, text)
+
+    @staticmethod
+    def _replace_text(widget, text: str) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", tk.END)
+        widget.insert(tk.END, text)
+        widget.configure(state="disabled")
+
+    def _clear_desktop_view(self) -> None:
+        self._desktop_generation += 1
+        self._desktop_pending = False
+        self._review_rows.clear()
+        self.today_summary.set("来源已变更，正在重新读取今日概览…")
+        self.export_state.set("来源已变更；后续导出使用当前有效数据。")
+        if self._review_open():
+            self.review_tree.delete(*self.review_tree.get_children())
+            self.review_today.set("来源已变更，旧活动与待办概览已清空。")
+            self._replace_text(self.review_detail, "来源已变更，旧回顾已清空。")
+            self._replace_text(self.review_recent, "来源已变更，旧近期对话已清空。")
+        self._request_desktop()
 
     def _set_interaction_preference(self, key: str) -> None:
         if key == "preference.response_style":
@@ -872,40 +1363,37 @@ class TkApp:
         provider = self._current_provider()
         if not provider:
             return
-        self.server.set_provider(provider)
-        runtime_model = getattr(self.server.runtime.llm, "model", "")
-        self._log_msg(f"模型供应商切换为 {PROVIDER_LABELS[provider]}", "info")
-        self._refresh_model_options(provider)
-        if runtime_model:
-            self.model_var.set(runtime_model)
-        self._refresh_api_indicator()
+        # A model draft belongs to the previous provider.  Do not carry it
+        # into this provider's implicit default, even if its old save was still
+        # waiting for after_idle to flush.
+        self._desktop_dirty_fields.discard("model")
+        self._desktop_draft_revisions["model"] += 1
+        self._pending_settings_patch.pop("model", None)
+        self._pending_settings_revisions.pop("model", None)
+        self._save_desktop_settings({"provider": provider})
+        # A provider selection is already a completed choice.  Submit it now
+        # so an in-flight probe is followed by the new owner's configuration.
+        self._flush_desktop_settings()
 
     def _on_model_selected(self, _event=None) -> None:
         model = self.model_var.get().strip()
         provider = self._current_provider()
         if not model or not provider:
             return
-        self.server.set_model(model)
-        self._log_msg(f"具体模型切换为 {provider}/{model}", "info")
-        self._refresh_api_indicator()
+        self._save_desktop_settings({"model": model})
 
     def _on_api(self) -> None:
-        self.server.set_api(self.api_var.get())
-        self._refresh_api_indicator()
-        if self.api_var.get():
-            self._log_msg("已开启 API，正在自动探测连接…", "info")
-            self._after(500, self._test_api)
-        else:
+        if not self.api_var.get():
             self._stop_speaking()
-            self._log_msg("已关闭 API，将使用本地模式", "warn")
+        self._save_desktop_settings({"api_enabled": self.api_var.get()})
+        self._refresh_api_indicator()
 
     def _on_net(self) -> None:
-        self.server.set_network(self.net_var.get())
-        self._log_msg("联网已开启" if self.net_var.get() else "联网已关闭", "info")
+        self._save_desktop_settings({"network_enabled": self.net_var.get()})
 
     def _on_voice_selected(self, _event=None) -> None:
-        self.server.set_tts_voice(self.voice_var.get())
-        self._log_msg(f"音色已切换：{self.voice_var.get()}", "info")
+        self._stop_speaking()
+        self._save_desktop_settings({"voice": self.voice_var.get()})
 
     def send(self, _event=None) -> None:
         if self._closing:
@@ -913,12 +1401,48 @@ class TkApp:
         text = self.entry_var.get().strip()
         if not text:
             return
+        if (self._chat_future is not None and not self._chat_future.done()
+                and text.partition(" ")[0] not in {"/api", "/net", "/tts", "/doc", "/learn"}):
+            self.chat_wait_var.set("正在等待回复；可先取消本次等待，再发送新消息。")
+            return
         self.entry_var.set("")
         self._show_chat("你", text)
         if self._route_command(text):
             return
-        future = self.server.ask_with_context(text)
-        future.add_done_callback(self._on_reply_done)
+        self._chat_generation += 1
+        generation = self._chat_generation
+        self._flush_desktop_settings()
+        try:
+            future = self.server.ask_with_context(text)
+        except Exception as exc:
+            self._log_msg(f"发送未完成：{type(exc).__name__}", "error")
+            return
+        self._chat_future = future
+        self._chat_started = time.monotonic()
+        self.send_button.configure(state="disabled")
+        self.chat_cancel_button.configure(state="normal")
+        self._update_chat_wait(generation)
+        future.add_done_callback(lambda done: self._on_reply_done(done, generation))
+
+    def _update_chat_wait(self, generation: int) -> None:
+        if self._closing or generation != self._chat_generation or self._chat_future is None:
+            return
+        seconds = int(time.monotonic() - self._chat_started)
+        self.chat_wait_var.set(f"正在等苏晚回应 · {seconds} 秒；可以取消本次等待。")
+        self._after(1000, lambda: self._update_chat_wait(generation))
+
+    def _cancel_chat(self, *, log: bool = True) -> None:
+        future = getattr(self, "_chat_future", None)
+        self._chat_generation = getattr(self, "_chat_generation", 0) + 1
+        self._chat_future = None
+        if future is not None:
+            future.cancel()
+        if hasattr(self, "chat_wait_var"):
+            self.chat_wait_var.set("已取消本次等待；已经发送的请求仍计入调用额度。")
+            self.chat_cancel_button.configure(state="disabled")
+            self.send_button.configure(state="normal")
+        if log and future is not None:
+            self._log_msg("已取消本次等待，迟到的回复不会显示；已经发送的请求仍计入调用额度。", "info")
 
     def _route_command(self, text: str) -> bool:
         command, _, argument = text.partition(" ")
@@ -933,13 +1457,10 @@ class TkApp:
             enabled = value in {"on", "1", "true"}
             if command == "/api":
                 self.api_var.set(enabled)
-                self.server.set_api(enabled)
-                if not enabled:
-                    self._stop_speaking()
-                self._refresh_api_indicator()
+                self._on_api()
             else:
                 self.net_var.set(enabled)
-                self.server.set_network(enabled)
+                self._on_net()
             self._sync_toggle_dots()
             self._log_msg(f"{'API' if command == '/api' else '联网'} -> {'开启' if enabled else '关闭'}", "info")
             return True
@@ -954,6 +1475,7 @@ class TkApp:
                 self._log_msg("用法：/doc 主题", "warn")
                 return True
             epoch = self.server.context_epoch()
+            self._flush_desktop_settings()
             future = self.server.document(argument.strip())
             def done(fut):
                 try:
@@ -971,16 +1493,35 @@ class TkApp:
         if not self._closing and self.server.context_current(epoch):
             self._log_msg(text, level)
 
-    def _on_reply_done(self, future) -> None:
+    def _on_reply_done(self, future, generation: int | None = None) -> None:
         try:
             result = future.result(timeout=0.1)
             if not isinstance(result, dict) or "text" not in result or "epoch" not in result:
                 raise ValueError("回复缺少上下文版本")
         except Exception as exc:  # noqa: BLE001
-            message = f"回复失败：{type(exc).__name__} {str(exc)[:80]}"
-            self._queue_ui(self._log_msg, message, "error")
+            message = f"回复失败：{type(exc).__name__}"
+            if generation is None:
+                self._queue_ui(self._log_msg, message, "error")
+            else:
+                self._queue_ui(self._render_chat_completion, None, message, generation)
             return
-        self._queue_ui(self._render_reply, result["text"], result["epoch"])
+        if generation is None:
+            self._queue_ui(self._render_reply, result["text"], result["epoch"])
+        else:
+            self._queue_ui(self._render_chat_completion, result, None, generation)
+
+    def _render_chat_completion(self, result: dict | None, error: str | None, generation: int) -> None:
+        if self._closing or generation != self._chat_generation:
+            return
+        self._chat_future = None
+        self.send_button.configure(state="normal")
+        self.chat_cancel_button.configure(state="disabled")
+        self.chat_wait_var.set("近期对话仅属于本次会话；持久记忆可在“今日回顾”查看。")
+        if error:
+            self._log_msg(error, "error")
+        elif result is not None:
+            self._render_reply(str(result["text"]), result["epoch"])
+        self._request_desktop()
 
     def _render_reply(self, reply: str, epoch) -> None:
         if self._closing or not self.server.context_current(epoch):
@@ -989,7 +1530,7 @@ class TkApp:
         self._last_reply = reply
         self._last_reply_epoch = epoch
         self._show_chat("苏晚", reply)
-        if self.read_var.get() and reply:
+        if self._playback_auto_read and self.read_var.get() and reply:
             self._speak(reply, expected_epoch=epoch)
 
     def _speak_last(self) -> None:
@@ -1006,13 +1547,14 @@ class TkApp:
     def _speak(self, text: str, *, expected_epoch=None) -> None:
         if self._closing:
             return
+        self._flush_desktop_settings()
         epoch = self.server.context_epoch() if expected_epoch is None else expected_epoch
         if not self.server.context_current(epoch):
             return
         self._stop_speaking()
         generation = self._speech_generation
-        voice = self.voice_var.get() or VOICE_PRESETS[0]
-        future = self.server.speak(text, voice=voice, expected_epoch=epoch)
+        # Resolve the committed voice on the owner loop, after any queued save.
+        future = self.server.speak(text, voice=None, expected_epoch=epoch)
         self._speech_future = future
 
         def done(fut) -> None:
@@ -1027,6 +1569,7 @@ class TkApp:
     def _on_auto_read(self) -> None:
         if not self.read_var.get():
             self._stop_speaking()
+        self._save_desktop_settings({"auto_read": self.read_var.get()})
 
     def _stop_speaking(self) -> None:
         self._speech_generation += 1
@@ -1046,6 +1589,7 @@ class TkApp:
             try:
                 self._playback.play(
                     path,
+                    volume=getattr(self, "_playback_volume", 100),
                     on_started=lambda: self._queue_ui(self._audio_feedback, generation, f"正在朗读：{Path(path).name}", "ok", epoch),
                     on_error=lambda message: self._queue_ui(self._audio_feedback, generation, f"播放失败：{message}", "error", epoch),
                 )
@@ -1085,6 +1629,10 @@ class TkApp:
 
     def _test_api(self) -> None:
         if self._closing:
+            return
+        self._flush_desktop_settings()
+        if self._settings_future is not None and not self._settings_future.done():
+            self._after(50, self._test_api)
             return
         self._api_probe_generation += 1
         context = self._api_probe_context()
@@ -1190,6 +1738,8 @@ class TkApp:
         self._clear_interaction_view()
         self._clear_activity_view()
         self._learning_generation += 1
+        self._cancel_chat(log=False)
+        self._clear_desktop_view()
         self._clear_works_view()
         self.chat_area.configure(state="normal")
         self.chat_area.delete("1.0", tk.END)
@@ -1207,6 +1757,7 @@ class TkApp:
         self._request_interaction()
         self._request_activities()
         self._refresh_files()
+        self._request_desktop(background=True)
         self._after(2000, self._schedule_views)
 
     def _refresh_status(self) -> None:
@@ -1327,7 +1878,10 @@ class TkApp:
     def on_close(self) -> None:
         if self._closing:
             return
+        if getattr(self, "_settings_flush_id", None) is not None:
+            self._flush_desktop_settings()
         self._closing = True
+        self._cancel_chat(log=False)
         self._stop_speaking()
         self._playback.stop(close=True)
         for after_id in self._after_ids:
@@ -1335,7 +1889,8 @@ class TkApp:
         self._after_ids.clear()
         self._disable_inputs(self.root)
         self._close_started = time.monotonic()
-        self.server.request_stop()
+        self._close_stop_requested = False
+        self._close_settings_error = None
         self.root.title("苏晚 · 正在保存并退出")
         self._poll_close()
 
@@ -1346,10 +1901,26 @@ class TkApp:
             self._disable_inputs(widget)
 
     def _poll_close(self) -> None:
+        if not self._close_stop_requested:
+            settings_future = getattr(self, "_settings_future", None)
+            if settings_future is not None and not settings_future.done():
+                self.hint_lbl.configure(text="正在保存桌面设置，然后保存运行数据…")
+                self.root.after(100, self._poll_close)
+                return
+            if settings_future is not None:
+                try:
+                    result = settings_future.result()
+                    if not result.get("ok"):
+                        self._close_settings_error = RuntimeError(str(result.get("text", "桌面设置未保存。")))
+                except Exception as exc:
+                    self._close_settings_error = exc
+            self.server.request_stop()
+            self._close_stop_requested = True
         state = self.server.shutdown_status()
         if state["finished"] and self._playback.idle:
-            if state["error"] is not None:
-                messagebox.showerror("退出保存未完成", f"{state['error']}\n\n请保留现有数据与备份，检查问题后再启动。", parent=self.root)
+            error = state["error"] or self._close_settings_error
+            if error is not None:
+                messagebox.showerror("退出保存未完成", f"{error}\n\n请保留现有数据与备份，检查问题后再启动。", parent=self.root)
             if self._playback.stop_error:
                 messagebox.showerror("停止播放失败", self._playback.stop_error, parent=self.root)
             self.root.destroy()
