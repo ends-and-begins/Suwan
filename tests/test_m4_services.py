@@ -1,6 +1,7 @@
 """M4 服务测试：reflection/share/doc（本地/桩模式）+ Migrator 幂等。"""
 import asyncio
 import shutil
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from suwan.organs.identity import IdentityOrgan
 from suwan.organs.memory import MemoryOrgan
 from suwan.organs.relation import RelationOrgan
 from suwan.organs.sensory import SensoryBufferOrgan
+from suwan.organs.store import StateStoreOrgan
 from suwan.services.doc import DocService
 from suwan.services.reflection import ReflectionService
 from suwan.services.share import ShareWatcherService
@@ -155,7 +157,9 @@ class DocTest(unittest.TestCase):
 
 class MigratorTest(unittest.TestCase):
     def test_import_and_idempotent(self) -> None:
-        home = ensure_dir(TMP / "legacy_home")
+        temporary = tempfile.TemporaryDirectory(prefix="suwan-m4-migration-")
+        self.addCleanup(temporary.cleanup)
+        home = ensure_dir(Path(temporary.name) / "legacy_home")
         legacy = ensure_dir(home / "data")
         atomic_write_text(legacy / "memories.json", '[{"content": "旧记忆1", "importance": 6, "emotion": 55, "created": "2026-01-01T10:00:00"}]')
         atomic_write_text(legacy / "snapshot.json", '{"user_name": "旧主人"}')
@@ -168,7 +172,8 @@ class MigratorTest(unittest.TestCase):
             await bus.start()
             for o in organs.values():
                 await o.start()
-            first = migrate(settings, organs["memory"], organs["identity"])
+            store = StateStoreOrgan(bus, clock, organs=list(organs.values()), file_path=settings.state_file)
+            first = migrate(settings, organs["memory"], organs["identity"], clock, persist_state=store.save)
             second = migrate(settings, organs["memory"], organs["identity"])
             count = organs["memory"].state()["count"]
             await organs["memory"].stop()

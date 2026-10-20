@@ -29,8 +29,12 @@ def _build_settings(home: str | None) -> Settings:
 async def amain(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     settings = _build_settings(args.home)
+    for warning in getattr(settings, "configuration_warnings", ()):
+        print(f"配置提示：{warning}")
     runtime = SuwanRuntime(settings)
     await runtime.start()
+    for warning in getattr(runtime, "startup_warnings", ()):
+        print(f"启动提示：{warning}")
     try:
         if args.smoke:
             reply = await runtime.ask(args.smoke)

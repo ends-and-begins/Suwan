@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 
-from suwan.adapters.filestore import atomic_write_text, ensure_dir
+from suwan.adapters.artifacts import create_artifact
 from suwan.bus import EventBus
 from suwan.clock import Clock
 from suwan.events import DOC_GENERATED
@@ -48,9 +48,7 @@ class DocService(Organ):
         result = await asyncio.to_thread(self.llm.chat, system, prompt, 2048)
         if not result:
             return None
-        ensure_dir(self.output_dir)
-        filename = f"详细报告_{self.clock.now().strftime('%Y%m%d_%H%M%S')}.md"
-        path = self.output_dir / filename
-        atomic_write_text(path, result)
-        await self.bus.publish(DOC_GENERATED, {"name": filename, "path": str(path)})
+        stem = f"详细报告_{self.clock.now().strftime('%Y%m%d_%H%M%S')}"
+        path = create_artifact(self.output_dir, stem, ".md", result)
+        await self.bus.publish(DOC_GENERATED, {"name": path.name, "path": str(path)})
         return str(path)

@@ -46,7 +46,7 @@ MEMORY_COMPACTED = "memory.compacted"         # {n} 通报
 # 产物
 STORY_GENERATED = "story.generated"           # {date, text}
 DOC_GENERATED = "doc.generated"               # {name, path}
-TTS_REQUEST = "tts.request"                   # {text, voice, rid}
+TTS_REQUEST = "tts.request"                   # {text, voice, rid, generation:int}；API/生命周期切换使旧代数失效
 TTS_DONE = "tts.done"                         # {rid, file, ok, error}
 
 # 对外输出

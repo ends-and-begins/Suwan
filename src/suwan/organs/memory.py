@@ -123,12 +123,32 @@ class MemoryOrgan(Organ):
             return receipt in self._durable_receipts
         return any(m.receipt == receipt for m in self.items)
 
+    @classmethod
+    def normalize_item(cls, item: MemoryItem, now: datetime) -> MemoryItem:
+        """所有输入入口共用验证，返回副本，先验证整批再改变当前集合。"""
+        if not isinstance(item, MemoryItem) or not isinstance(item.content, str):
+            raise ValueError("记忆内容必须为文本")
+        receipt = item.receipt
+        if receipt is not None and (not isinstance(receipt, str) or not receipt):
+            raise ValueError("无效记忆收据")
+        created = item.created if item.created is not None else now
+        if not isinstance(created, datetime):
+            raise ValueError("记忆日期必须为datetime")
+        if created.tzinfo is not None and now.tzinfo is None:
+            created = created.astimezone().replace(tzinfo=None)
+        elif created.tzinfo is None and now.tzinfo is not None:
+            created = created.replace(tzinfo=now.tzinfo)
+        elif now.tzinfo is not None:
+            created = created.astimezone(now.tzinfo)
+        return MemoryItem(item.content, cls._number(item.importance, "importance"),
+                          cls._number(item.emotion, "emotion"), created, receipt)
+
     def add(self, content: str, importance: float = 5.0, emotion: float = 50.0, *, receipt: str | None = None) -> MemoryItem:
         self._ensure_writable()
-        if not isinstance(content, str):
-            raise ValueError("记忆内容必须为文本")
-        item = MemoryItem(content=content.strip(), importance=self._number(importance, "importance"),
-                          emotion=self._number(emotion, "emotion"), created=self.clock.now(), receipt=receipt)
+        item = self.normalize_item(MemoryItem(content, importance, emotion, self.clock.now(), receipt), self.clock.now())
+        item.content = item.content.strip()
+        if receipt is not None and self.has_receipt(receipt):
+            raise ValueError("记忆收据已存在")
         if not item.content:
             return item
         self.items.append(item)
@@ -140,23 +160,22 @@ class MemoryOrgan(Organ):
     def import_memory_items(self, items: list[MemoryItem]) -> int:
         """批量导入（Migrator 用）：保留原 created 时间，追加后落盘。"""
         self._ensure_writable()
-        now = self.clock.now()
-        # 全部验证后再改变当前集合，防止半次导入。
-        for item in items:
-            if not isinstance(item.content, str):
-                raise ValueError("记忆内容必须为文本")
-            self._number(item.importance, "importance")
-            self._number(item.emotion, "emotion")
+        normalized = [self.normalize_item(item, self.clock.now()) for item in items]
+        seen = {item.receipt for item in self.items if item.receipt is not None}
         count = 0
-        for item in items:
+        for item in normalized:
             if not item.content:
                 continue
-            if item.created is None:
-                item.created = now
+            if item.receipt is not None:
+                if item.receipt in seen:
+                    continue
+                seen.add(item.receipt)
             self.items.append(item)
             count += 1
         if count:
             self._dirty = True
+        # 上次写失败后，收据可能只在内存；全重复批次也要重试落盘。
+        if self._dirty:
             self.force_save()
         return count
 
@@ -194,19 +213,14 @@ class MemoryOrgan(Organ):
                     raise ValueError(f"第{index + 1}条记忆含未知字段，需确认格式版本")
                 raw = record.get("created")
                 created = self.clock.now() if raw is None else datetime.fromisoformat(raw)
-                now = self.clock.now()
-                if created.tzinfo is not None and now.tzinfo is None:
-                    created = created.astimezone().replace(tzinfo=None)
-                elif created.tzinfo is None and now.tzinfo is not None:
-                    created = created.replace(tzinfo=now.tzinfo)
                 receipt = record.get("receipt")
                 if receipt is not None:
                     if not isinstance(receipt, str) or not receipt or receipt in receipts:
                         raise ValueError(f"第{index + 1}条记忆收据无效或重复")
                     receipts.add(receipt)
-                loaded.append(MemoryItem(record["content"], self._number(record.get("importance", 5.0), "importance"),
-                                         self._number(record.get("emotion", 50.0), "emotion"), created, receipt))
-        except (OSError, ValueError, TypeError) as exc:
+                loaded.append(self.normalize_item(MemoryItem(record["content"], record.get("importance", 5.0),
+                                                             record.get("emotion", 50.0), created, receipt), self.clock.now()))
+        except (OSError, ValueError, TypeError, OverflowError) as exc:
             error = exc if isinstance(exc, DataFileError) else DataFileError(self._file, str(exc))
             self._read_error = error
             self._log.error("无法恢复记忆，原文件已保护: %s", error)

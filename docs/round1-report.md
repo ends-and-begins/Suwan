@@ -2,6 +2,8 @@
 
 日期：2026-10-16（Asia/Shanghai）。对应阶段性迭代计划的阶段 0。
 
+> 本文记录第一轮当时的 126 测试验收；随后严格审查发现的 12 项问题及修复、173 测试和扩展集成演练见 [严格审查修复报告](review-fix-report.md)。下文保留历史事实，不作为当前所有路径已经可靠的证明。
+
 ## 结论与适用范围
 
 本轮本地可靠性目标已通过验收：修复数据保护、分享收取、真实对话入口、RPC 期限、错误分类及运行时退出；建立离线门禁与可重复的前端/恢复演练。
@@ -10,7 +12,7 @@
 
 ## 修改前备份与原基线
 
-- 完整备份：`backups\suwan-refactor_20261016-001005\suwan_project 重构版`。
+- 完整备份：`<workspace>\backups\suwan-refactor_20261016-001005\suwan_project 重构版`。
 - 463 文件，1,397,819 字节，逐文件 SHA256 对比为零差异。备份包含当时的 `.git`、配置与已有文档，不输出密钥内容。
 - 清单：备份父目录的 `manifest.sha256.json`；摘要：`backup-info.json`。
 - 将完整备份恢复到新的空临时目录，463 文件逐项校验一致。恢复目录只用于核对，未覆盖当前版本。
@@ -103,7 +105,7 @@
 
 ## 证据位置与下一步
 
-本机证据目录：`research\iteration1_20261016`。
+本机证据目录：`<workspace>\research\iteration1_20261016`。
 
 - `baseline_report.md`、`baseline.log`、`baseline_result.json`：改动前实际基线。
 - `integrated_gate.log`：修复后门禁完整输出。

@@ -16,7 +16,7 @@ from pathlib import Path
 from suwan.adapters.browser import SafeBrowser
 from suwan.adapters.filestore import ensure_dir
 from suwan.adapters.llm import LLM_TIMEOUT_SECONDS, LLMClient
-from suwan.adapters.migrator import migrate as migrate_legacy
+from suwan.adapters.migrator import commit as commit_legacy, prepare as prepare_legacy
 from suwan.adapters.tts import TTSClient
 from suwan.bus import EventBus
 from suwan.clock import Clock, RealClock
@@ -68,6 +68,7 @@ class SuwanRuntime:
         self._instance_lock = InstanceLock(self.settings.data_dir)
         self._ticker_task: asyncio.Task | None = None
         self._foreground_tasks: set[asyncio.Task] = set()
+        self.startup_warnings: list[str] = []
         self.migrate_legacy_data = migrate_legacy_data
         self._api_enabled = api_enabled
         self._network_enabled = network_enabled
@@ -85,7 +86,7 @@ class SuwanRuntime:
         self.tts = TTSClient(self.settings, clock=self.clock)
         # 白名单：默认内置清单；可用环境变量 SUWAN_BROWSER_CONFIG 指向 JSON 覆盖（如实化配置源）
         cfg_path = os.getenv("SUWAN_BROWSER_CONFIG")
-        self.browser = SafeBrowser.from_json(cfg_path) if cfg_path and Path(cfg_path).exists() else SafeBrowser()
+        self.browser = SafeBrowser.from_json(cfg_path) if cfg_path else SafeBrowser()
 
         # 器官（store 最后，负责快照恢复）
         th = self.settings.thresholds
@@ -165,10 +166,13 @@ class SuwanRuntime:
                 return
             # 在迁移/恢复或器官写入前持有进程锁；锁失败不能清理其它实例。
             self._instance_lock.acquire()
+            self.startup_warnings.clear()
             attempted = []
             try:
                 self.llm.set_active(True)
                 self.tts.set_active(True)
+                for warning in getattr(self.settings, "configuration_warnings", ()):
+                    self._log.warning("配置提示: %s", warning)
                 self._ensure_dirs()
                 await self.bus.start()
                 for organ in self._all_organs:
@@ -177,12 +181,25 @@ class SuwanRuntime:
                 # 旧数据迁移（只读旧目录；标记幂等）
                 if self.migrate_legacy_data:
                     try:
-                        result = await asyncio.to_thread(migrate_legacy, self.settings, self.organs["memory"], self.organs["identity"], self.clock)
+                        # 后台只读取/验证旧数据。取消等待后即使线程尚未退出，
+                        # 也不能写器官或数据文件；提交在持有实例锁的主循环完成。
+                        plan = await asyncio.to_thread(prepare_legacy, self.settings, self.clock)
+                        result = commit_legacy(
+                            self.settings, self.organs["memory"], self.organs["identity"],
+                            plan, self.clock, persist_state=self.store.save,
+                        )
+                        for warning in result.get("warnings", ()):
+                            self.startup_warnings.append(warning)
+                            self._log.warning("迁移提示: %s", warning)
                         if result["memories"] or result["snapshot_name"]:
                             self._log.info("旧数据迁移完成: %s", result)
                         elif not result["skipped"]:
                             self._log.info("旧数据迁移：无可用数据")
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
+                        self.startup_warnings.append(
+                            f"旧数据迁移未完成（{type(exc).__name__}）。旧来源文件已保留；"
+                            "请先备份，再检查旧 data/memories.json、snapshot.json 与 v2 目标数据，修复后重新启动。"
+                        )
                         self._log.exception("旧数据迁移失败（不影响启动）")
                 for service in self.services:
                     attempted.append(service)
@@ -272,6 +289,7 @@ class SuwanRuntime:
 
     # ---------- 开关（运行时切换） ----------
     def _sync_flags(self) -> None:
+        self.tts.set_api_enabled(self._api_enabled)
         for service in self.services:
             if hasattr(service, "api_enabled"):
                 service.api_enabled = self._api_enabled
@@ -317,7 +335,10 @@ class SuwanRuntime:
         task = asyncio.current_task()
         self._foreground_tasks.add(task)
         try:
-            data = await request(self.bus, TTS_REQUEST, TTS_DONE, {"text": text, "voice": voice}, timeout=60.0)
+            generation = self.tts.request_generation
+            data = await request(self.bus, TTS_REQUEST, TTS_DONE, {
+                "text": text, "voice": voice, "generation": generation,
+            }, timeout=60.0)
         except RpcTimeoutError:
             return None, "语音合成超时"
         finally:

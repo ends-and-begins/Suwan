@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import uuid
 
 from suwan.assets.local_replies import LocalReplyBank, extract_intro_name
@@ -19,6 +20,11 @@ from suwan.organs.base import Organ
 from suwan.rpc import RpcTimeoutError, register_user_name, remember, request
 
 MAX_USER_INPUT_LEN = 2000
+MAX_LLM_PROMPT_LEN = 12000  # 字符预算；具体供应商仍按各自 tokenizer 计费。
+MAX_LLM_SYSTEM_LEN = 2000
+MAX_HISTORY_CONTEXT_LEN = 6000
+MAX_MEMORY_CONTEXT_LEN = 2000
+_TRUNCATED = "...（输入过长，已截断）"
 
 
 class ChatService(Organ):
@@ -58,7 +64,7 @@ class ChatService(Organ):
 
     async def chat(self, user_text: str, *, _record_input: bool = True, turn_id: str | None = None) -> str:
         """公开对话入口：处理并发布 chat.reply，返回回复文本。"""
-        text = (user_text or "").strip()
+        text = self._bounded_input((user_text or "").strip())
         if not text:
             return ""
         async with self._chat_lock:
@@ -84,10 +90,13 @@ class ChatService(Organ):
             await self.bus.publish(topic, payload)
 
     # ---------- 响应 ----------
-    async def _respond(self, user_text: str) -> str:
-        if len(user_text) > MAX_USER_INPUT_LEN:
-            user_text = user_text[:MAX_USER_INPUT_LEN] + "...（输入过长，已截断）"
+    @staticmethod
+    def _bounded_input(text: str) -> str:
+        if len(text) <= MAX_USER_INPUT_LEN:
+            return text
+        return text[:MAX_USER_INPUT_LEN - len(_TRUNCATED)] + _TRUNCATED
 
+    async def _respond(self, user_text: str) -> str:
         # 轻量状态副作用
         await self.bus.publish(USER_ACTIVE, {})
         await self.bus.publish(DRIVE_ADJUST, {"changes": {"loneliness": -15.0, "boredom": -30.0}})
@@ -145,9 +154,12 @@ class ChatService(Organ):
         return f"我搜索了“{query}”，结果如下：\n{raw[:300]}..."
 
     async def _normal_reply(self, user_text: str) -> str:
-        if self.llm is not None and self.llm.available and self.api_enabled:
+        llm = self.llm
+        if llm is not None and llm.available and self.api_enabled:
             try:
-                reply = await asyncio.wait_for(asyncio.to_thread(self._llm_reply, user_text), timeout=LLM_TIMEOUT_SECONDS)
+                # 在器官所属循环读取状态并固定适配器；工作线程只做网络调用。
+                system, prompt = self._llm_messages(user_text)
+                reply = await asyncio.wait_for(asyncio.to_thread(llm.chat, system, prompt, 512), timeout=LLM_TIMEOUT_SECONDS)
             except Exception as exc:  # noqa: BLE001
                 self._log.warning("模型回复降级: %s", exc)
                 reply = None
@@ -157,27 +169,37 @@ class ChatService(Organ):
         self.last_via = "local"
         return self._local_reply(user_text)
 
-    def _llm_reply(self, user_text: str) -> str | None:
+    def _llm_messages(self, user_text: str) -> tuple[str, str]:
         affect = self._o("affect")
         circadian = self._o("circadian")
         identity = self._o("identity")
         memory = self._o("memory")
         sensory = self._o("sensory")
-        state_desc = f"精力{circadian.energy:.0f}% 疲劳{circadian.mental_fatigue:.0f} 情绪{affect.desc()} 正在：{circadian.current_activity}。"
-        user_identity = "用户是正在和你说话的人。" + (f"用户的名字是{identity.user_name}。" if identity.user_name else "用户还没告诉你名字。")
+        state_desc = f"精力{circadian.energy:.0f}% 疲劳{circadian.mental_fatigue:.0f} 情绪{affect.desc()} 正在：{circadian.current_activity[:256]}。"
+        user_identity = "用户是正在和你说话的人。" + (f"用户的名字是{identity.user_name[:128]}。" if identity.user_name else "用户还没告诉你名字。")
         recalled = memory.recall_by_keyword(user_text, 2)
-        mem_str = "；".join([m.content for m in recalled]) if recalled else "无。"
+        # 单条旧记忆/外部总线输入也可能很长，不能只限制新入口。
+        mem_str = "；".join(m.content[:MAX_MEMORY_CONTEXT_LEN] for m in recalled) if recalled else "无。"
         high = memory.get_high_importance_memory(7)
         if high:
-            mem_str += "；突然想到：" + high.content
+            mem_str += "；突然想到：" + high.content[:MAX_MEMORY_CONTEXT_LEN]
+        mem_str = mem_str[:MAX_MEMORY_CONTEXT_LEN]
         system = (
             f"你是苏晚，一个用代码创作的数字生命。{user_identity} "
             "请根据你的当前状态、记忆和用户的话进行回应。推动对话。"
             "绝对不要以'听着呢'、'嗯'、'在呢'作为回复的开头或全部内容。"
             "如果用户问你在做什么，要如实告知当前活动。"
         )
-        prompt = f"状态：{state_desc}\n相关记忆：{mem_str}\n最近对话历史：\n{sensory.as_history_lines(6)}\n用户说：“{user_text}”\n苏晚："
-        return self.llm.chat(system, prompt, 512)
+        history_lines = []
+        for line in sensory.recent(6):
+            when = line.get("time")
+            stamp = when.strftime("%H:%M:%S") if isinstance(when, datetime) else "?"
+            speaker = {"user": "你", "suwan": "苏晚"}.get(line.get("kind"), "系统")
+            content = self._bounded_input(str(line.get("text", "")))
+            history_lines.append(f"[{stamp}] {speaker}: {content}")
+        history = "\n".join(history_lines)[-MAX_HISTORY_CONTEXT_LEN:] or "无。"
+        prompt = f"状态：{state_desc}\n相关记忆：{mem_str}\n最近对话历史：\n{history}\n用户说：“{self._bounded_input(user_text)}”\n苏晚："
+        return system[:MAX_LLM_SYSTEM_LEN], prompt[:MAX_LLM_PROMPT_LEN]
 
     def _local_reply(self, user_text: str) -> str:
         affect = self._o("affect")

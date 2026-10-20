@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import uuid
 from pathlib import Path
 
 from suwan.adapters.filestore import append_line
@@ -64,6 +65,9 @@ class LLMClient:
         error: str = "",
         max_tokens: int = 0,
         generation: int | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        call_id: str | None = None,
     ) -> None:
         """写用量日志（线程安全追加 JSONL）。"""
         with self._lifecycle_guard:
@@ -71,8 +75,9 @@ class LLMClient:
                 return
             record = {
                 "time": self._clock.now().isoformat(timespec="seconds"),
-                "provider": self.provider,
-                "model": self.model,
+                "provider": self.provider if provider is None else provider,
+                "model": self.model if model is None else model,
+                "call_id": call_id or str(uuid.uuid4()),
                 "system_prompt": system_prompt[:200],
                 "user_prompt": user_prompt[:200],
                 "response": response[:300],
@@ -90,25 +95,28 @@ class LLMClient:
             if not self._active:
                 return None
             generation = self._generation
-        tokens = max_tokens or self.default_max_tokens
+            # GUI 可在请求进行中切换模型，网络参数和审计必须共用同一快照。
+            provider, model = self.provider, self.model
+            tokens = max_tokens or self.default_max_tokens
+            call_id = str(uuid.uuid4())
         try:
             client = self._get_client()
             if client is None:
                 return None
             resp = client.chat.completions.create(
-                model=self.model,
+                model=model,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
                 temperature=0.85,
                 max_tokens=tokens,
                 timeout=LLM_TIMEOUT_SECONDS,
             )
             text = (resp.choices[0].message.content or "").strip() or None
-            self._log_call(success=True, system_prompt=system_prompt, user_prompt=user_prompt, response=text or "", max_tokens=tokens, generation=generation)
+            self._log_call(success=True, system_prompt=system_prompt, user_prompt=user_prompt, response=text or "", max_tokens=tokens, generation=generation, provider=provider, model=model, call_id=call_id)
             with self._lifecycle_guard:
                 if not self._active or self._generation != generation:
                     return None
             return text
         except Exception as exc:  # noqa: BLE001 任何失败都降级
-            self._log.warning("LLM 调用失败(%s/%s): %s", self.provider, self.model, exc)
-            self._log_call(success=False, system_prompt=system_prompt, user_prompt=user_prompt, error=str(exc), max_tokens=tokens, generation=generation)
+            self._log.warning("LLM 调用失败(%s/%s): %s", provider, model, exc)
+            self._log_call(success=False, system_prompt=system_prompt, user_prompt=user_prompt, error=str(exc), max_tokens=tokens, generation=generation, provider=provider, model=model, call_id=call_id)
             return None

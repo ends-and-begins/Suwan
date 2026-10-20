@@ -69,6 +69,7 @@ class RuntimeThread:
         self._thread = threading.Thread(target=self._serve, name="suwan-runtime", daemon=True)
         self._startup_error: BaseException | None = None
         self._shutdown_error: BaseException | None = None
+        self._runtime_stopped = threading.Event()
 
     def start(self) -> None:
         self._thread.start()
@@ -111,6 +112,8 @@ class RuntimeThread:
                 await self.runtime.stop()
             except BaseException as exc:
                 self._shutdown_error = exc
+            finally:
+                self._runtime_stopped.set()
 
     # ---------- 从 GUI 线程调用 ----------
     def _submit(self, coro) -> Future:
@@ -139,10 +142,20 @@ class RuntimeThread:
     def set_tts_voice(self, voice: str) -> None:
         self.runtime.set_tts_voice(voice)
 
-    def stop(self) -> None:
+    def request_stop(self) -> None:
+        """非阻塞发出退出请求，GUI 用 shutdown_status 轮询实际退出。"""
         self._stop.set()
+
+    def shutdown_status(self) -> dict:
+        """区分数据收尾与同步外部线程退出，避免提前销毁窗口。"""
+        return {"finished": not self._thread.is_alive(),
+                "runtime_stopped": self._runtime_stopped.is_set(),
+                "error": self._shutdown_error}
+
+    def stop(self, timeout: float = 15.0) -> None:
+        self.request_stop()
         if self._thread.is_alive():
-            self._thread.join(timeout=15)
+            self._thread.join(timeout=timeout)
         if self._thread.is_alive():
             raise TimeoutError("运行时尚未完成退出，不能确认保存已完成")
         if self._shutdown_error is not None:

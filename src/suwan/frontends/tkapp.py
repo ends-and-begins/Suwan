@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import argparse
 import queue
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
 from suwan.adapters.tts import VOICE_PRESETS
+from suwan.adapters.playback import AudioPlayback
 from suwan.config import ENDPOINT_ENV, MODEL_CANDIDATES, PROVIDER_LABELS, Settings
 from suwan.frontends.bridge import RuntimeThread, TkBridge
 
@@ -46,6 +48,9 @@ class TkApp:
         self._ui_callbacks = queue.SimpleQueue()
         self._closing = False
         self._after_ids: set[str] = set()
+        self._speech_generation = 0
+        self._speech_future = None
+        self._playback = AudioPlayback()
         self.server = RuntimeThread(runtime, TkBridge())
         self.server.start()
         self.root = tk.Tk()
@@ -71,6 +76,10 @@ class TkApp:
         self._sync_settings_from_runtime()
         self._refresh_api_indicator()
         self._log_msg("苏晚 v2 已启动 · API/联网/模型/音色等设置在“设置”页", "info")
+        for warning in getattr(runtime.settings, "configuration_warnings", ()):
+            self._log_msg(warning, "warn")
+        for warning in getattr(runtime, "startup_warnings", ()):
+            self._log_msg(warning, "warn")
         self._schedule_views()
 
     # ---------- 样式 ----------
@@ -195,21 +204,24 @@ class TkApp:
         row3 = tk.Frame(ctl, bg=PANEL)
         row3.pack(fill=tk.X, pady=(8, 4))
         self._label(row3, "音色", color=SUB).pack(side=tk.LEFT)
-        self.voice_var = tk.StringVar(value="mimo_default")
+        self.voice_var = tk.StringVar(value=VOICE_PRESETS[0])
         voice_cb = ttk.Combobox(row3, textvariable=self.voice_var, values=list(VOICE_PRESETS), state="readonly", width=16)
         voice_cb.pack(side=tk.LEFT, padx=(8, 4))
         voice_cb.bind("<<ComboboxSelected>>", self._on_voice_selected)
         self.read_var = tk.BooleanVar(value=False)
-        read_group = self._add_dot_toggle(row3, self.read_var, "自动朗读", "#c792ea", None)
+        read_group = self._add_dot_toggle(row3, self.read_var, "自动朗读", "#c792ea", self._on_auto_read)
         read_group.pack(side=tk.LEFT, padx=(12, 0))
         ttk.Button(row3, text="🔊 朗读上句", command=self._speak_last).pack(side=tk.LEFT, padx=(12, 0))
-        self._label(row3, "（朗读需要 MiniMax 密钥；模型候选可用 .env 的 MODEL_XX 追加）", color="#5f6670", size=8).pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Button(row3, text="停止朗读", command=self._stop_speaking).pack(side=tk.LEFT, padx=(6, 0))
+        self._label(row3, "（朗读需要 MiMo 的 MIMO_API_KEY；模型候选可用 MODEL_XX 追加）", color="#5f6670", size=8).pack(side=tk.LEFT, padx=(16, 0))
 
         self._label(self._tab_settings,
                     "提示：.env 的 MODEL_<供应商>（如 MODEL_OPENAI=gpt-4o）会作为该供应商的默认模型；切换供应商/模型即时生效。",
                     color="#5f6670", size=9).pack(anchor="w", padx=14, pady=(4, 0))
 
     def _toggle_api(self, _event=None) -> None:
+        if self._closing:
+            return
         self.api_var.set(not self.api_var.get())
         self._on_api()
 
@@ -223,6 +235,8 @@ class TkApp:
         lbl.pack(side=tk.LEFT, padx=(4, 0))
 
         def flip(_event=None) -> None:
+            if self._closing:
+                return
             var.set(not var.get())
             self._sync_toggle_dots()
             if on_toggle:
@@ -372,6 +386,7 @@ class TkApp:
             self._log_msg("已开启 API，正在自动探测连接…", "info")
             self._after(500, self._test_api)
         else:
+            self._stop_speaking()
             self._log_msg("已关闭 API，将使用本地模式", "warn")
 
     def _on_net(self) -> None:
@@ -383,6 +398,8 @@ class TkApp:
         self._log_msg(f"音色已切换：{self.voice_var.get()}", "info")
 
     def send(self, _event=None) -> None:
+        if self._closing:
+            return
         text = self.entry_var.get().strip()
         if not text:
             return
@@ -413,20 +430,52 @@ class TkApp:
         self._speak(self._last_reply)
 
     def _speak(self, text: str) -> None:
-        voice = self.voice_var.get() or "mimo_default"
+        if self._closing:
+            return
+        self._stop_speaking()
+        generation = self._speech_generation
+        voice = self.voice_var.get() or VOICE_PRESETS[0]
         future = self.server.speak(text, voice=voice)
+        self._speech_future = future
 
         def done(fut) -> None:
             try:
                 path, error = fut.result(timeout=0.1)
             except Exception as exc:  # noqa: BLE001
                 path, error = None, f"{type(exc).__name__}: {str(exc)[:80]}"
-            if error:
-                self._queue_ui(self._log_msg, f"语音失败：{error}", "error")
-            elif path:
-                self._queue_ui(self._log_msg, f"语音已生成：{Path(path).name}", "ok")
+            self._queue_ui(self._render_audio, path, error, generation)
 
         future.add_done_callback(done)
+
+    def _on_auto_read(self) -> None:
+        if not self.read_var.get():
+            self._stop_speaking()
+
+    def _stop_speaking(self) -> None:
+        self._speech_generation += 1
+        if self._speech_future is not None:
+            self._speech_future.cancel()
+            self._speech_future = None
+        self._playback.stop()
+
+    def _render_audio(self, path, error, generation: int) -> None:
+        if self._closing or generation != self._speech_generation:
+            return
+        if error:
+            self._log_msg(f"语音失败：{error}", "error")
+        elif path:
+            try:
+                self._playback.play(
+                    path,
+                    on_started=lambda: self._queue_ui(self._audio_feedback, generation, f"正在朗读：{Path(path).name}", "ok"),
+                    on_error=lambda message: self._queue_ui(self._audio_feedback, generation, f"播放失败：{message}", "error"),
+                )
+            except Exception as exc:
+                self._log_msg(f"播放失败：{exc}", "error")
+
+    def _audio_feedback(self, generation: int, message: str, level: str) -> None:
+        if not self._closing and generation == self._speech_generation:
+            self._log_msg(message, level)
 
     # ---------- API 指示 ----------
     def _set_api_dot_color(self, color: str) -> None:
@@ -592,15 +641,42 @@ class TkApp:
         if self._closing:
             return
         self._closing = True
+        self._stop_speaking()
+        self._playback.stop(close=True)
         for after_id in self._after_ids:
             self.root.after_cancel(after_id)
         self._after_ids.clear()
-        try:
-            self.server.stop()
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("退出保存未完成", f"{exc}\n\n请保留现有数据与备份，检查问题后再启动。", parent=self.root)
-        finally:
+        self._disable_inputs(self.root)
+        self._close_started = time.monotonic()
+        self.server.request_stop()
+        self.root.title("苏晚 · 正在保存并退出")
+        self._poll_close()
+
+    def _disable_inputs(self, parent) -> None:
+        for widget in parent.winfo_children():
+            if isinstance(widget, (tk.Entry, ttk.Button, ttk.Combobox, ttk.Radiobutton, ttk.Checkbutton)):
+                widget.configure(state="disabled")
+            self._disable_inputs(widget)
+
+    def _poll_close(self) -> None:
+        state = self.server.shutdown_status()
+        if state["finished"] and self._playback.idle:
+            if state["error"] is not None:
+                messagebox.showerror("退出保存未完成", f"{state['error']}\n\n请保留现有数据与备份，检查问题后再启动。", parent=self.root)
+            if self._playback.stop_error:
+                messagebox.showerror("停止播放失败", self._playback.stop_error, parent=self.root)
             self.root.destroy()
+            return
+        if state["finished"]:
+            message = "数据收尾已完成，正在停止音频播放…"
+        elif state["runtime_stopped"]:
+            message = "数据收尾已完成，正在等待外部请求线程退出…" if state["error"] is None else "保存发生错误，正在等待线程退出后显示详情…"
+        else:
+            message = "正在取消请求并保存数据…"
+        if time.monotonic() - self._close_started >= 15:
+            message += " 窗口将继续等待，可以移动窗口。"
+        self.hint_lbl.configure(text=message)
+        self.root.after(100, self._poll_close)
 
     def run(self) -> None:
         self.root.mainloop()

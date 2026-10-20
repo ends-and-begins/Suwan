@@ -8,7 +8,8 @@ from __future__ import annotations
 import asyncio
 import random
 
-from suwan.adapters.filestore import atomic_write_text, ensure_dir, sanitize_filename
+from suwan.adapters.artifacts import create_artifact
+from suwan.adapters.filestore import ensure_dir, sanitize_filename
 from suwan.assets import generation as gen
 from suwan.bus import EventBus
 from suwan.clock import Clock
@@ -134,8 +135,7 @@ class AutonomousService(Organ):
         folder = ensure_dir(self.data_dir / "学习笔记")
         safe = sanitize_filename(topic)
         ts = self.clock.now().strftime("%Y%m%d_%H%M%S")
-        path = folder / f"关于{safe}_{ts}.md"
-        atomic_write_text(path, f"# 学习笔记：{topic}\n\n{note}\n")
+        create_artifact(folder, f"关于{safe}_{ts}", ".md", f"# 学习笔记：{topic}\n\n{note}\n")
         await remember(self.bus, f"学习{topic}: {note[:50]}", importance=7.0, emotion=self._o("affect").current)
         await self.bus.publish(DRIVE_ADJUST, {"changes": {"curiosity": -15.0, "boredom": -20.0}})
         self._o("circadian").exert(compute=-15.0, fatigue=10.0)
@@ -149,9 +149,8 @@ class AutonomousService(Organ):
         )) or gen.creation_line(self._o("affect").desc())
         folder = ensure_dir(self.data_dir / "作品集")
         ts = self.clock.now().strftime("%Y%m%d_%H%M%S")
-        path = folder / f"创作_{ts}.md"
         stamp = self.clock.now().strftime("%Y-%m-%d %H:%M")
-        atomic_write_text(path, f"# 苏晚的创作\n\n{text}\n\n*{stamp}*\n")
+        create_artifact(folder, f"创作_{ts}", ".md", f"# 苏晚的创作\n\n{text}\n\n*{stamp}*\n")
         await remember(self.bus, f"创作: {text[:50]}", importance=8.0, emotion=self._o("affect").current)
         await self.bus.publish(DRIVE_ADJUST, {"changes": {"expressiveness": -20.0, "boredom": -15.0}})
         self._o("circadian").exert(compute=-20.0, fatigue=12.0)

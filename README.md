@@ -1,8 +1,8 @@
 # 苏晚 v2 —— 系统工程级重构版
 
-> 状态：2026-10-16 第一轮本地可靠性验收通过，126 个测试与六项离线门禁通过，并完成真实 REPL/Tk 控件及备份恢复演练。真实 LLM、搜索、语音接口尚未验证。
+> 状态：2026-10-16 第一版严格审查修复已通过本地验收，173 个测试与六项离线门禁通过；六组集成演练包含真实 Tk 慢线程退出及自动播放/停止调用链。真实接口和声卡尚未验证。
 > 本项目承接旧版模块拆分代码，采用 **asyncio 事件总线 + 器官(organ) 架构**。
-> 本轮修复、验收范围及剩余限制见 [第一轮验收报告](docs/round1-report.md)；后续目标见 [阶段性迭代计划](docs/iteration-plan.md)。
+> 当前修复与限制见 [严格审查修复报告](docs/review-fix-report.md)；此前记录见 [第一轮验收报告](docs/round1-report.md)，后续目标见 [阶段性迭代计划](docs/iteration-plan.md)。
 
 ## 历史重构路线（详见 docs/milestones.md；下列勾选为历史记录）
 - M0 规划/基线盘点 ✅
@@ -24,6 +24,9 @@ python scripts/parity.py
 # 集成演练：10次重启、备份恢复、真实 REPL 进程和 Tk 控件（需可用桌面与 tkinter）
 python scripts/acceptance_round1.py --output acceptance-result.json
 
+# 审查修复集成演练：另覆盖真实同步工作线程退出、GUI自动播放和停止（假SDK/播放器）
+python scripts/acceptance_review_fixes.py --output review-fix-result.json
+
 # 交互 REPL（含 /tts <话> /voice <名> /api /net /doc /status /cfg）
 $env:PYTHONPATH="src"; python -m suwan.frontends.repl --home <数据目录>
 
@@ -35,9 +38,10 @@ python -m suwan.frontends.repl --smoke "你是谁？" --home <数据目录>
 pip install -e ".[dev]"
 ```
 > 保留旧版 `<home>/data` 到 `<home>/v2` 的导入入口，不修改旧文件；迁移前请备份。
-> 正常迁移样例已测，全面故障验收留阶段 1。当前没有旧数据也会写迁移标记，之后补放旧数据不会自动重导。
+> 迁移先严格校验，再持锁提交；目标落盘后写版本化标记，失败重试有收据去重。无旧源时不写标记。
+> 旧版/无效标记会显示恢复警告并保留原件，不自动重新导入；恢复方法见严格审查修复报告。
 > 数据默认根为 `D:/SuwanData`（`SUWAN_HOME` 可覆盖）。
-> 浏览器白名单：默认内置清单；可用 `SUWAN_BROWSER_CONFIG=<json>` 覆盖（单一来源）。
+> 浏览器白名单：默认内置清单；可用 `SUWAN_BROWSER_CONFIG=<json>` 覆盖。显式空列表拒绝全部，显式配置读错/格式错会拒绝启动。
 > EventBus 持久化/重放为保留能力，默认不启用（重放会对副作用订阅者重复分发）。
 > `.env` **权威来源=项目根 `.env`**（不受启动目录影响）；可用 `SUWAN_ENV_FILE=<路径>` 显式指定。
 > 离线工具自动设置 `SUWAN_SKIP_DOTENV=1`；程序构造隔离配置可使用 `Settings.from_env(env={}, load_env=False, home_dir=...)`。
@@ -59,11 +63,13 @@ pip install -e ".[dev]"
 | qwen | `DASHSRCOPE_API_KEY` | qwen-turbo | https://dashscope.aliyuncs.com/compatible-mode/v1 |
 | moonshot (Kimi) | `MOONSHOT_API_KEY` | kimi-k2-0711-preview | https://api.moonshot.cn/v1 |
 | glm (智谱) | `ZHIPU_API_KEY` | glm-4-flash | https://open.bigmodel.cn/api/paas/v4/ |
-| mimo (MiniMax) | `MINIMAX_API_KEY` | mimo-v2.5-pro | https://token-plan-cn.xiaomimimo.com/v1 |
+| mimo（小米 MiMo） | `MIMO_API_KEY` | mimo-v2.6-pro | https://api.xiaomimimo.com/v1 |
+| minimax（MiniMax） | `MINIMAX_API_KEY` + 明确确认 | MiniMax-M2.7 | https://api.minimax.cn/v1 |
 | ollama（本地, 免密钥） | — | llama3.1 | http://127.0.0.1:11434/v1 |
 
-切换模型：REPL `/model <名>`（`/cfg` 看当前）；tkinter 界面右上"模型"下拉。
-`MINIMAX_API_KEY` 同时供 TTS（`/tts`）使用。样例模板见 `.env`（已含全部占位）。
+切换供应商：REPL `/model <供应商标识>`（`/cfg` 看当前）；GUI“设置”页选择供应商和具体模型。
+TTS 独立使用小米 MiMo 通用 API 的 `MIMO_API_KEY`，生成 WAV；GUI 支持播放和停止。
+旧版 `MINIMAX_API_KEY` 有平台归属歧义，默认暂停调用；确认它属于 MiniMax 后另设 `SUWAN_MINIMAX_KEY_CONFIRMED=1`。MiMo Token Plan 凭据不能混用。详见 [供应商配置与历史迁移](docs/provider-configuration.md)。
 
 ## 基准决策
 | 项 | 决定 |

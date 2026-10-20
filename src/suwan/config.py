@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -31,7 +32,8 @@ ENDPOINT_ENV = {
     "qwen": ("DASHSRCOPE_API_KEY", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-turbo"),
     "moonshot": ("MOONSHOT_API_KEY", "https://api.moonshot.cn/v1", "kimi-k2-0711-preview"),
     "glm": ("ZHIPU_API_KEY", "https://open.bigmodel.cn/api/paas/v4/", "glm-4-flash"),
-    "mimo": ("MINIMAX_API_KEY", "https://token-plan-cn.xiaomimimo.com/v1", "mimo-v2.5-pro"),
+    "mimo": ("MIMO_API_KEY", "https://api.xiaomimimo.com/v1", "mimo-v2.6-pro"),
+    "minimax": ("MINIMAX_API_KEY", "https://api.minimax.cn/v1", "MiniMax-M2.7"),
     "ollama": ("OLLAMA_API_KEY", "http://127.0.0.1:11434/v1", "llama3.1"),
 }
 
@@ -46,7 +48,8 @@ PROVIDER_LABELS = {
     "qwen": "通义千问",
     "moonshot": "Kimi(Moonshot)",
     "glm": "智谱GLM",
-    "mimo": "MiniMax",
+    "mimo": "小米 MiMo",
+    "minimax": "MiniMax",
     "ollama": "Ollama(本地)",
 }
 
@@ -58,7 +61,8 @@ MODEL_CANDIDATES = {
     "qwen": ["qwen-turbo", "qwen-plus", "qwen-max"],
     "moonshot": ["kimi-k2-0711-preview", "moonshot-v1-8k", "moonshot-v1-32k"],
     "glm": ["glm-4-flash", "glm-4-plus", "glm-4-air"],
-    "mimo": ["mimo-v2.5-pro"],
+    "mimo": ["mimo-v2.6-pro", "mimo-v2.5-pro"],
+    "minimax": ["MiniMax-M2.7", "MiniMax-M2.5"],
     "ollama": ["llama3.1", "qwen2.5", "llama3"],
 }
 
@@ -132,6 +136,7 @@ class Settings:
     thresholds: Thresholds
     keyless_providers: frozenset = frozenset(KEYLESS_PROVIDERS)  # 无需密钥的本地供应商
     max_history_lines: int = 100
+    configuration_warnings: tuple[str, ...] = ()
 
     # ---------- 派生路径 ----------
     @property
@@ -189,10 +194,31 @@ class Settings:
         api_keys: dict[str, str] = {}
         base_urls: dict[str, str] = {}
         model_names: dict[str, str] = {}
+        configuration_warnings = []
         for provider, (env_name, base_url, default_model) in ENDPOINT_ENV.items():
             api_keys[provider] = e.get(env_name, "")
             base_urls[provider] = base_url
             model_names[provider] = e.get(f"MODEL_{provider.upper()}", default_model)
+        # Older releases mislabeled MiMo credentials as MINIMAX_API_KEY. Never
+        # guess which platform a historical secret belongs to or reroute it.
+        if api_keys["minimax"] and e.get("SUWAN_MINIMAX_KEY_CONFIRMED") != "1":
+            api_keys["minimax"] = ""
+            message = (
+                "MINIMAX_API_KEY 已暂停使用：旧版曾将此变量误用于小米 MiMo。"
+                "小米 MiMo 请改用通用 API 的 MIMO_API_KEY（不是 Token Plan 密钥）；"
+                "若确认该密钥属于 MiniMax，请另设 SUWAN_MINIMAX_KEY_CONFIRMED=1。"
+                "本程序不会自动迁移或向另一平台发送历史凭据。"
+            )
+            configuration_warnings.append(message)
+            warnings.warn(message, UserWarning, stacklevel=2)
+        if api_keys["mimo"].strip().startswith(("tp-", "ttp-")):
+            api_keys["mimo"] = ""
+            message = (
+                "MIMO_API_KEY 已暂停使用：当前聊天与语音实现使用小米 MiMo 通用 API，"
+                "不支持 Token Plan 的 tp-/ttp- 凭据。请在小米 MiMo 通用 API 平台创建独立密钥。"
+            )
+            configuration_warnings.append(message)
+            warnings.warn(message, UserWarning, stacklevel=2)
         return cls(
             home_dir=root,
             data_dir=data_dir,
@@ -204,4 +230,5 @@ class Settings:
             keyless_providers=frozenset(KEYLESS_PROVIDERS),
             intervals=Intervals(),
             thresholds=Thresholds(),
+            configuration_warnings=tuple(configuration_warnings),
         )

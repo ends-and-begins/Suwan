@@ -211,7 +211,7 @@ def gui_close_pending(base: Path) -> dict:
     app = TkApp(runtime)
     app.root.withdraw()
     errors = []
-    elapsed = []
+    closing_started = []
     started = time.monotonic()
 
     def close_when_entered():
@@ -222,9 +222,8 @@ def gui_close_pending(base: Path) -> dict:
                 return
             app.root.after(20, close_when_entered)
             return
-        closing_at = time.monotonic()
+        closing_started.append(time.monotonic())
         app.on_close()
-        elapsed.append(time.monotonic() - closing_at)
 
     def begin():
         app.entry_var.set("我叫小明")
@@ -235,12 +234,13 @@ def gui_close_pending(base: Path) -> dict:
         app.root.after(0, begin)
         app.run()
     assert not errors, errors
-    assert elapsed and elapsed[0] < 5, elapsed
+    elapsed = time.monotonic() - closing_started[0] if closing_started else None
+    assert elapsed is not None and elapsed < 5, elapsed
     assert not app.server._thread.is_alive()
     snapshot = json.loads((home / "v2" / "state.json").read_text(encoding="utf-8"))
     assert snapshot["organs"]["identity"]["user_name"] == "小明"
     return {"pending_reply_cancelled": True, "worker_exited": True, "name_saved": True,
-            "close_seconds": round(elapsed[0], 3)}
+            "close_seconds": round(elapsed, 3)}
 
 
 def main() -> int:
