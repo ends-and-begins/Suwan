@@ -24,6 +24,7 @@ from suwan.clock import Clock, RealClock
 from suwan.config import ENDPOINT_ENV, Settings
 from suwan.events import CLOCK_TICK, TTS_DONE, TTS_REQUEST
 from suwan.instance_lock import InstanceLock
+from suwan.interaction import InteractionContext, PERSONA_SUMMARY, INITIATIVE_KEY, RESPONSE_STYLE_KEY
 from suwan.organs.affect import AffectOrgan
 from suwan.organs.circadian import CircadianOrgan
 from suwan.organs.drive import DriveOrgan
@@ -76,6 +77,7 @@ class SuwanRuntime:
         self.migrate_legacy_data = migrate_legacy_data
         self._api_enabled = api_enabled
         self._network_enabled = network_enabled
+        self._model_config_generation = 0
         self.tts_voice = "mimo_default"
         self.tts_enabled = False
 
@@ -115,6 +117,9 @@ class SuwanRuntime:
             SchedulerOrgan(self.bus, self.clock, intervals=self.settings.intervals),
         ]
         self.organs = {o.name: o for o in organs}
+        self.organs["relation"].bind_memory(self.organs["memory"])
+        self.interaction = InteractionContext(self.organs, self.clock)
+        self.organs["circadian"].interaction = self.interaction
         store = StateStoreOrgan(self.bus, self.clock, organs=organs, file_path=self.settings.state_file, save_interval=60.0)
         self.store = store
         self._all_organs = organs + [store]
@@ -129,28 +134,36 @@ class SuwanRuntime:
             self.bus, self.clock, organs=self.organs, llm=self.llm,
             api_enabled=self._api_enabled, network_enabled=self._network_enabled,
             memory_manager=self.memory_manager,
+            interaction=self.interaction, persist_state=store.save,
         )
-        self.monologue_service = MonologueService(self.bus, self.clock, organs=self.organs, llm=self.llm, api_enabled=self._api_enabled, memory_manager=self.memory_manager)
+        self.monologue_service = MonologueService(self.bus, self.clock, organs=self.organs, llm=self.llm, api_enabled=self._api_enabled, memory_manager=self.memory_manager, interaction=self.interaction)
         self.autonomous_service = AutonomousService(
             self.bus, self.clock, organs=self.organs, data_dir=self.settings.data_dir,
             llm=self.llm, api_enabled=self._api_enabled, boredom_threshold=th.boredom_threshold,
             memory_manager=self.memory_manager,
+            interaction=self.interaction,
         )
         self.reflection_service = ReflectionService(
             self.bus, self.clock, organs=self.organs, data_dir=self.settings.data_dir,
             llm=self.llm, api_enabled=self._api_enabled,
             memory_manager=self.memory_manager,
+            interaction=self.interaction,
         )
         self.share_service = ShareWatcherService(
             self.bus, self.clock, organs=self.organs, share_dir=self.settings.share_dir,
             watch_interval=self.settings.intervals.share_watch,
+            interaction=self.interaction,
         )
         self.doc_service = DocService(
             self.bus, self.clock, organs=self.organs, output_dir=self.settings.output_dir,
             llm=self.llm, api_enabled=self._api_enabled,
             memory_manager=self.memory_manager,
+            interaction=self.interaction,
         )
-        self.search_service = SearchService(self.bus, self.clock, browser=self.browser)
+        self.search_service = SearchService(self.bus, self.clock, browser=self.browser,
+                                            context_epoch=self.context_epoch)
+        self.search_service.set_network_enabled(self._network_enabled)
+        self.chat_service.search_generation = lambda: self.search_service.request_generation
         # 搜索可用性由 SearchService 实际持有的浏览器能力决定（非写死）
         self.chat_service.search_available = bool(
             self.search_service.browser is not None and getattr(self.search_service.browser, "available", False)
@@ -184,6 +197,7 @@ class SuwanRuntime:
             try:
                 self.llm.set_active(True)
                 self.tts.set_active(True)
+                self.search_service.set_active(True)
                 for warning in getattr(self.settings, "configuration_warnings", ()):
                     self._log.warning("配置提示: %s", warning)
                 self._ensure_dirs()
@@ -215,6 +229,7 @@ class SuwanRuntime:
                         )
                         self._log.exception("旧数据迁移失败（不影响启动）")
                 self.memory_manager.initialise()
+                self._reconcile_interaction_state()
                 for service in self.services:
                     attempted.append(service)
                     await service.start()
@@ -237,6 +252,7 @@ class SuwanRuntime:
                     try:
                         await self.bus.stop()
                     finally:
+                        self.search_service.set_active(False)
                         for client in self._llm_clients:
                             client.set_active(False)
                         self.tts.set_active(False)
@@ -248,6 +264,7 @@ class SuwanRuntime:
             if not self._running:
                 return
             self._running = False
+            self.search_service.set_active(False)
             errors = []
             try:
                 pending_requests = [task for task in self._foreground_tasks if task is not asyncio.current_task()]
@@ -304,28 +321,32 @@ class SuwanRuntime:
     # ---------- 开关（运行时切换） ----------
     def _sync_flags(self) -> None:
         self.tts.set_api_enabled(self._api_enabled)
+        self.search_service.set_network_enabled(self._network_enabled)
         for service in self.services:
             if hasattr(service, "api_enabled"):
                 service.api_enabled = self._api_enabled
             if hasattr(service, "llm"):
                 service.llm = self.llm
-            if hasattr(service, "network_enabled"):
+            if service is not self.search_service and hasattr(service, "network_enabled"):
                 service.network_enabled = self._network_enabled
             if hasattr(service, "browser"):
                 service.browser = self.browser if self._network_enabled else None
 
     def set_api_enabled(self, value: bool) -> None:
         if self._api_enabled != bool(value):
+            self._model_config_generation += 1
             for client in self._llm_clients:
                 client.invalidate_pending()
         self._api_enabled = bool(value)
         self._sync_flags()
 
     def set_network_enabled(self, value: bool) -> None:
+        self.search_service.set_network_enabled(bool(value))
         self._network_enabled = bool(value)
         self._sync_flags()
 
     def set_llm_provider(self, provider: str) -> None:
+        self._model_config_generation += 1
         self.llm = LLMClient(self.settings, provider=provider, clock=self.clock)
         self._llm_clients.append(self.llm)
         self._sync_flags()
@@ -333,6 +354,8 @@ class SuwanRuntime:
     def set_llm_model(self, model: str) -> None:
         """切换当前供应商下的具体模型（实时生效，不必重启）。"""
         if self.llm is not None and model:
+            if self.llm.model != model:
+                self._model_config_generation += 1
             self.llm.model = model
 
     # ---------- TTS（端到端入口） ----------
@@ -374,14 +397,26 @@ class SuwanRuntime:
         return self._network_enabled
 
     # ---------- 门面 ----------
+    def _reconcile_interaction_state(self) -> None:
+        """以当前持久来源清理派生影响；恢复旧快照也不能复活已遗忘来源。"""
+        self.organs["relation"].reconcile()
+        valid = {row["source_id"]: (-1 if row["kind"] == "misunderstood" else 1)
+                 for row in self.organs["relation"].state().get("events", [])
+                 if row["kind"] in {"positive", "misunderstood", "repair"}}
+        self.organs["affect"].modifiers[:] = [m for m in self.organs["affect"].modifiers
+            if not m["source"].startswith("interaction:")
+            or (m["source"][12:] in valid and m["value"] * valid[m["source"][12:]] > 0)]
+
     def _memory_changed(self, *, clear_context=True) -> None:
         """管理操作执行于运行时循环内；撤销包含旧上下文的工作。"""
+        self._reconcile_interaction_state()
         if self._reply_context.get() is not None:
             # 本轮自己更正/遗忘的确认可以使用提交后的代数；其他任务的
             # 旧答复仍保留各自捕获的代数，不会被这次修改重新授权。
             self._reply_context.set(self.context_epoch())
         if not clear_context:
             return
+        self.search_service.invalidate_pending()
         for client in self._llm_clients:
             client.invalidate_pending()
         self.tts.invalidate_pending()
@@ -396,6 +431,26 @@ class SuwanRuntime:
         if not self._running:
             raise RuntimeError("运行时未启动")
         return self.memory_manager.execute(command)
+
+    async def interaction_view(self) -> dict:
+        if not self._running:
+            raise RuntimeError("运行时未启动")
+        self.organs["relation"].reconcile()
+        contact = self.organs["memory"].get_fact("preference.contact_time")
+        return {"ok": True, "personality": {"summary": PERSONA_SUMMARY},
+                "preferences": {"response_style": self.interaction.response_style,
+                                "initiative": self.interaction.initiative,
+                                "contact_time": contact.fact_value if contact else ""},
+                "relation": self.organs["relation"].state(), "affect": self.organs["affect"].state(),
+                "_context_epoch": self.context_epoch()}
+
+    async def set_interaction_preference(self, key: str, value: str) -> dict:
+        if not self._running:
+            raise RuntimeError("运行时未启动")
+        if key not in {RESPONSE_STYLE_KEY, INITIATIVE_KEY}:
+            return {**await self.interaction_view(), "ok": False, "text": "未知的交流偏好键。"}
+        result = self.memory_manager.execute(f"/memory set {key}={value}")
+        return {**await self.interaction_view(), **result}
 
     async def ask(self, text: str) -> str:
         """发一句话给苏晚并返回回复（本地/LLM）。"""

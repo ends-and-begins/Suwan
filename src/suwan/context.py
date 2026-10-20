@@ -8,6 +8,9 @@ MAX_SYSTEM_CHARS = 2000
 MAX_PROMPT_CHARS = 12000
 MAX_CHAT_MEMORY_CHARS = 2000
 MAX_BACKGROUND_MEMORY_CHARS = 6000
+# 仅新生产者在完整捕获实际模型上下文来源后写入此标记；历史生成
+# 记录保留管理入口，但不能据残缺派生链重新进入模型或短期上下文。
+TRACKED_GENERATION_REF = "suwan:context-sources:v1"
 
 
 def bound_messages(system: str, prompt: str) -> tuple[str, str]:

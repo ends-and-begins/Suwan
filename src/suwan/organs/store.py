@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
+import os
+import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +18,7 @@ from suwan.bus import EventBus
 from suwan.clock import Clock
 from suwan.events import CLOCK_TICK
 from suwan.organs.base import Organ
+from suwan.organs.relation import RelationOrgan
 
 
 class StateStoreOrgan(Organ):
@@ -80,6 +84,7 @@ class StateStoreOrgan(Organ):
                     if self._write_error is not None:
                         raise self._write_error
                     return 0
+                data = self._upgrade_relation_snapshot(data)
                 restored = 0
                 for name, payload in data["organs"].items():
                     organ = self.tracked.get(name)
@@ -108,6 +113,42 @@ class StateStoreOrgan(Organ):
                 raise
             self._write_error = None
             return restored
+
+    def _upgrade_relation_snapshot(self, data: dict) -> dict:
+        """旧关系数值与迁移边界在同一次原子替换中提交。
+
+        启动阶段 memory 已载入，服务和时钟尚未启动。写失败时不恢复关系
+        器官、不改原快照；下次可对同一原件重试，而不会重新界定已运行的新来源。
+        """
+        relation = self.tracked.get("relation")
+        previous = data["organs"].get("relation")
+        if not isinstance(relation, RelationOrgan) or previous is None or "version" in previous:
+            return data
+        migrated = relation.migrate_legacy_state(previous)
+        if migrated is previous:  # 未绑定 memory 的旧嵌入用法维持兼容。
+            return data
+        organs = dict(data["organs"])
+        organs["relation"] = migrated
+        candidate = dict(data, organs=organs)
+        self._validate_snapshot(candidate)
+        original = self.file.read_bytes()
+        digest = hashlib.sha256(original).hexdigest()
+        backup = self.file.with_name(f"{self.file.name}.v2-relation-{digest}.backup")
+        if backup.exists():
+            if backup.read_bytes() != original:
+                raise DataFileError(backup, "关系迁移备份与原件不一致")
+        else:
+            fd, temporary = tempfile.mkstemp(prefix=".relation-v2-", dir=self.file.parent)
+            try:
+                with os.fdopen(fd, "wb") as output:
+                    output.write(original)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary, backup)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+        atomic_write_json(self.file, candidate)
+        return candidate
 
     def _read_snapshot(self) -> dict | None:
         absent = object()
@@ -156,7 +197,12 @@ class StateStoreOrgan(Organ):
             for field in numeric_fields:
                 if not number(payload.get(field)):
                     invalid(f"organs.{name}.{field}")
-            if name == "identity":
+            if name == "relation":
+                try:
+                    RelationOrgan.validate_state(payload)
+                except (TypeError, ValueError, KeyError) as exc:
+                    raise DataFileError(self.file, f"关系状态字段非法（{type(exc).__name__}）") from exc
+            elif name == "identity":
                 if "user_name" not in payload or (
                     payload["user_name"] is not None and not isinstance(payload["user_name"], str)
                 ):

@@ -17,6 +17,8 @@ from suwan.bus import EventBus
 from suwan.clock import Clock
 from suwan.context import memory_context
 from suwan.events import CHAT_REPLY, DRIVE_ADJUST, SEARCH_REQUESTED, SEARCH_RESULT, SENSOR_RECORDED, SENSOR_USER_MESSAGE, USER_ACTIVE, event_timestamp
+from suwan.interaction import parse_preference_command, InteractionContext
+from suwan.organs.relation import classify_feedback
 from suwan.organs.base import Organ
 from suwan.rpc import RpcTimeoutError, register_user_name, remember, request
 from suwan.services.llm_request import llm_chat
@@ -43,6 +45,9 @@ class ChatService(Organ):
         network_enabled: bool = False,
         search_available: bool = False,
         memory_manager=None,
+        interaction=None,
+        persist_state=None,
+        search_generation=None,
     ) -> None:
         super().__init__(bus, clock, logger_name="suwan.services.chat")
         self.organs = organs
@@ -51,6 +56,9 @@ class ChatService(Organ):
         self.network_enabled = network_enabled
         self.search_available = search_available
         self.memory_manager = memory_manager
+        self.interaction = interaction or InteractionContext(organs, clock)
+        self.persist_state = persist_state
+        self.search_generation = search_generation
         self.last_via = "local"
         self._chat_lock = asyncio.Lock()
 
@@ -108,6 +116,10 @@ class ChatService(Organ):
 
     @staticmethod
     def _memory_command(text: str) -> str | None:
+        preference = parse_preference_command(text)
+        if preference:
+            key, value = preference
+            return f"/memory set {key}={value}"
         if text == "/memory" or text.startswith("/memory "):
             return text
         aliases = {
@@ -152,6 +164,9 @@ class ChatService(Organ):
             return "记忆设置已变更，之前的回复已取消。"
 
         memory = self._o("memory")
+        feedback = classify_feedback(user_text)
+        if feedback is not None:
+            return self._record_feedback(user_text, feedback)
         current = {key: item.fact_value for key in FACT_LABELS if (item := memory.get_fact(key)) is not None}
         statement = parse_fact_statement(user_text, current_values=current)
         if statement:
@@ -203,8 +218,34 @@ class ChatService(Organ):
             return "记忆设置已变更，之前的回复已取消。"
         return reply
 
+    def _record_feedback(self, text: str, kind: str) -> str:
+        memory = self._o("memory")
+        try:
+            source = memory.add(text, kind="event", source="user", topic="interaction.feedback",
+                                receipt="feedback:" + str(uuid.uuid4()), occurred_at=self.clock.now(), persist=True)
+        except (OSError, ValueError, TypeError):
+            return "这次反馈没能保存，关系记录没有更新，请稍后重试。"
+        if source is None:
+            return "我明白这次反馈；当前已暂停长期记录，没有新增关系记录。"
+        relation = self.organs.get("relation")
+        if relation is not None:
+            relation.reconcile()
+            if any(row["source_id"] == source.id for row in relation.state().get("events", [])):
+                self._o("affect").add_impact("interaction:" + source.id, -1 if kind == "misunderstood" else 1, 1)
+        warning = ""
+        if self.persist_state is not None:
+            try:
+                self.persist_state()
+            except (OSError, ValueError):
+                warning = "反馈已保存；会话快照暂未保存，重启会从来源重新计算关系。"
+        reply = {"positive": "谢谢你的反馈，我会继续把事情解释清楚。",
+                 "misunderstood": "我记下了这次理解有误。你可以指出具体哪一处，我会核对，不会把猜测当事实。",
+                 "repair": "谢谢你确认，这次解释已经对齐。"}[kind]
+        return reply + ("\n" + warning if warning else "")
+
     async def _try_search_reply(self, user_text: str) -> str | None:
         epoch = self._memory_epoch()
+        search_generation = self.search_generation() if self.search_generation is not None else None
         force_keywords = ["热点", "新闻", "发生了什么", "最新", "热搜", "今日", "查一下", "搜一下", "搜索", "帮我看看", "找一下"]
         low = user_text.strip().lower()
         if not any(kw in low for kw in force_keywords):
@@ -215,24 +256,33 @@ class ChatService(Organ):
                 query = query.split(prefix, 1)[-1].strip()
                 break
         try:
-            data = await request(self.bus, SEARCH_REQUESTED, SEARCH_RESULT, {"query": query}, timeout=15.0)
+            payload = {"query": query, "expected_epoch": epoch, "deadline": event_timestamp() + 15.0}
+            if self.search_generation is not None:
+                payload["generation"] = search_generation
+            data = await request(self.bus, SEARCH_REQUESTED, SEARCH_RESULT, payload, timeout=15.0)
         except RpcTimeoutError:
             self._log.warning("搜索应答超时: %s", query)
             return f"我试着查了“{query}”，但连接出了点问题，没能拿到结果。"
         if epoch != self._memory_epoch():
             return "记忆设置已变更，之前的回复已取消。"
+        if self.search_generation is not None and search_generation != self.search_generation():
+            return "联网设置已变更，之前的搜索已取消。"
         raw = data.get("text") or ""
         if not data.get("ok"):
             return f"我试着查了“{query}”，但没拿到有效结果，换个关键词或稍后再试？"
         if self.llm is not None and self.llm.available and self.api_enabled:
             try:
                 summarized = await llm_chat(
-                    self.llm, "你是苏晚，一个正在探索世界的信息助手。",
-                    f"搜索“{query}”的结果如下：\n{raw[:800]}\n请用自己的话告诉用户搜到了什么。", 400,
+                    self.llm, self.interaction.system("根据提供的搜索结果回答，不猜测未提供的信息"),
+                    self.interaction.prompt(f"搜索“{query}”的结果如下：\n{raw[:800]}\n请用自己的话告诉用户搜到了什么。"), 400,
                     timeout=LLM_TIMEOUT_SECONDS)
             except Exception as exc:  # noqa: BLE001
                 self._log.warning("搜索摘要降级: %s", exc)
                 summarized = None
+            if epoch != self._memory_epoch():
+                return "记忆设置已变更，之前的回复已取消。"
+            if self.search_generation is not None and search_generation != self.search_generation():
+                return "联网设置已变更，之前的搜索已取消。"
             if summarized:
                 return summarized
         return f"我搜索了“{query}”，结果如下：\n{raw[:300]}..."
@@ -264,7 +314,7 @@ class ChatService(Organ):
         recalled = [hit.item for hit in memory.search(user_text, limit=3)]
         # 单条旧记忆/外部总线输入也可能很长，不能只限制新入口。
         mem_str = memory_context(recalled, query=user_text, budget=MAX_MEMORY_CONTEXT_LEN)
-        system = (
+        system = self.interaction.system("回应当前用户，先回答问题，不用关系数值要求回应。") + (
             f"你是苏晚，一个用代码创作的数字生命。{user_identity} "
             "请根据你的当前状态、记忆和用户的话进行回应。推动对话。"
             "绝对不要以'听着呢'、'嗯'、'在呢'作为回复的开头或全部内容。"
@@ -279,8 +329,14 @@ class ChatService(Organ):
             content = self._bounded_input(str(line.get("text", "")))
             history_lines.append(f"[{stamp}] {speaker}: {content}")
         history = "\n".join(history_lines)[-MAX_HISTORY_CONTEXT_LEN:] or "无。"
-        prompt = f"状态：{state_desc}\n相关记忆：{mem_str}\n最近对话历史：\n{history}\n用户说：“{self._bounded_input(user_text)}”\n苏晚："
-        return system[:MAX_LLM_SYSTEM_LEN], prompt[:MAX_LLM_PROMPT_LEN]
+        # 先为本轮输入留出空间，再分配状态、来源和历史；整体前截断会吞掉问题结尾。
+        suffix = f"\n用户说：“{self._bounded_input(user_text)}”\n苏晚："
+        prefix = f"{self.interaction.state_text()}\n状态：{state_desc}\n相关记忆：{mem_str}\n最近对话历史：\n"
+        context_budget = MAX_LLM_PROMPT_LEN - len(suffix)
+        prefix = prefix[:context_budget]
+        history_budget = context_budget - len(prefix)
+        history = history[-history_budget:] if history_budget else ""
+        return system[:MAX_LLM_SYSTEM_LEN], prefix + history + suffix
 
     def _local_reply(self, user_text: str) -> str:
         affect = self._o("affect")
@@ -292,7 +348,26 @@ class ChatService(Organ):
             affect_desc=affect.desc,
             activity=lambda: circadian.current_activity,
             energy=lambda: circadian.energy,
-            recall=lambda kw, limit: [LocalRecall(hit.item.content, hit.item.id, hit.item.kind, hit.item.source)
-                                      for hit in memory.search(kw, limit=limit)],
+            recall=self._local_recalls,
+            response_style=self.interaction.response_style,
         )
-        return bank.reply(user_text)
+        reply = bank.reply(user_text)
+        if self._o("circadian").energy < 30 and not user_text.strip().startswith(("你是谁", "我叫什么")):
+            reply = "我有点累，先简短回应。" + reply
+        elif self._o("affect").current < 25 and "我记得一点：" in reply:
+            reply = "我现在有些低落，但会认真核对记录。" + reply
+        return reply
+
+    def _local_recalls(self, query: str, limit: int) -> list[LocalRecall]:
+        """上次同一句提问不是该问题的答案；为有内容的来源保留候选。"""
+        rows = []
+        question = query.rstrip().endswith(("?", "？"))
+        for hit in self._o("memory").search(query, limit=max(3, limit + 1)):
+            item = hit.item
+            if (question and item.kind == "event" and item.source == "user" and item.topic == "dialogue"
+                    and item.content.strip().casefold() == query.strip().casefold()):
+                continue
+            rows.append(LocalRecall(item.content, item.id, item.kind, item.source))
+            if len(rows) >= limit:
+                break
+        return rows

@@ -35,6 +35,7 @@ class CircadianOrgan(Organ):
         self.is_sleeping = False
         self.sleep_start: float | None = None
         self.current_activity = "发呆"
+        self.interaction = None  # 运行时绑定共用策略；独立器官保持原兼容入口。
 
     # ---------- 生命周期 ----------
     async def _on_start(self) -> None:
@@ -53,7 +54,9 @@ class CircadianOrgan(Organ):
             if self.energy >= self.wake_energy_threshold:
                 self.is_sleeping = False
                 self.sleep_start = None
-                await self.bus.publish(NOTIFY_TOAST, {"text": "我睡醒了，精力恢复了。"})
+                text = "我睡醒了，精力恢复了。"
+                payload = self.interaction.notification_data(text) if self.interaction else {"text": text}
+                await self.bus.publish(NOTIFY_TOAST, payload)
                 await self.bus.publish(LIFE_AWAKE, {})
         else:
             self.energy = max(0.0, self.energy - 0.008 * dt)
@@ -62,7 +65,9 @@ class CircadianOrgan(Organ):
             if self.energy < self.sleep_energy_threshold:
                 self.is_sleeping = True
                 self.sleep_start = self.clock.monotonic()
-                await self.bus.publish(NOTIFY_TOAST, {"text": "我有点累了，先睡一会儿。"})
+                text = "我有点累了，先睡一会儿。"
+                payload = self.interaction.notification_data(text) if self.interaction else {"text": text}
+                await self.bus.publish(NOTIFY_TOAST, payload)
                 await self.bus.publish(LIFE_SLEEP, {})
 
         after = self._state_values()

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import queue
 import threading
 from concurrent.futures import Future
@@ -32,7 +33,44 @@ class TkBridge:
         self._reset_lock = threading.Lock()
         self.context_epoch = None
         self.accepts_event = None
+        self.notification_current = None
+        self.delivery_clock = None
+        self._delivery_lock = threading.Lock()
+        self._last_delivery_mono: float | None = None
         self._subs: list[Any] = []
+
+    def allows_notification(self, kind: str, data: dict) -> bool:
+        """Check again at each queue boundary; a preference may change while queued."""
+        if kind not in {"inner", "narrative", "toast"} or not data.get("proactive"):
+            return True
+        if data.get("show_proactive") is False:
+            return False
+        return self.notification_current is None or bool(self.notification_current(data))
+
+    def commit_notification(self, kind: str, data: dict) -> bool:
+        """仅在Tk即将显示时提交一次；队列复核不得消耗可见消息冷却。"""
+        with self._delivery_lock:
+            if not self.allows_notification(kind, data):
+                return False
+            if kind not in {"inner", "narrative", "toast"} or not data.get("proactive"):
+                return True
+            interval = data.get("delivery_interval", 0.0)
+            if type(interval) not in (int, float) or not math.isfinite(interval) or interval < 0:
+                return False
+            if self.delivery_clock is None:
+                return interval == 0
+            now = self.delivery_clock()
+            if not math.isfinite(now):
+                return False
+            if interval:
+                issued = data.get("issued_at")
+                if (type(issued) not in (int, float) or not math.isfinite(issued)
+                        or issued > now or now - issued >= interval):
+                    return False  # 丢弃积压的过期主动消息，避免恢复界面时集中轰炸。
+                if self._last_delivery_mono is not None and now - self._last_delivery_mono < interval:
+                    return False
+            self._last_delivery_mono = now
+            return True
 
     async def start(self, bus) -> None:
         for topic, kind in _FORWARD.items():
@@ -46,6 +84,8 @@ class TkBridge:
     def _make_handler(self, kind: str):
         async def handler(event) -> None:  # noqa: ANN001
             if kind != "memory_reset" and self.accepts_event is not None and not self.accepts_event(event):
+                return
+            if not self.allows_notification(kind, event.data):
                 return
             item = {"kind": kind, "topic": event.topic, "data": dict(event.data)}
             if self.context_epoch is not None:
@@ -70,7 +110,9 @@ class TkBridge:
                 self._reset = None
         while True:
             try:
-                out.append(self.inbox.get_nowait())
+                item = self.inbox.get_nowait()
+                if self.allows_notification(item["kind"], item["data"]):
+                    out.append(item)
             except queue.Empty:
                 break
         return out
@@ -84,6 +126,8 @@ class RuntimeThread:
         self.bridge = bridge or TkBridge()
         self.bridge.context_epoch = self.context_epoch
         self.bridge.accepts_event = lambda event: self.runtime.organs["sensory"].accepts(event)
+        self.bridge.notification_current = self.notification_current
+        self.bridge.delivery_clock = self.runtime.clock.monotonic
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ready = threading.Event()
         self._stop = threading.Event()
@@ -178,6 +222,18 @@ class RuntimeThread:
             result = await self.runtime.memory_command(command)
             return {**result, "_context_epoch": self.context_epoch()}
         return self._submit(execute())
+
+    def interaction_view(self) -> Future:
+        return self._submit(self.runtime.interaction_view())
+
+    def set_interaction_preference(self, key: str, value: str) -> Future:
+        return self._submit(self.runtime.set_interaction_preference(key, value))
+
+    def notification_current(self, data: dict) -> bool:
+        interaction = getattr(self.runtime, "interaction", None)
+        if interaction is None:
+            return True
+        return interaction.notification_current(data)
 
     def set_tts_voice(self, voice: str) -> None:
         self.runtime.set_tts_voice(voice)

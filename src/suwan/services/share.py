@@ -20,11 +20,12 @@ from suwan.rpc import remember
 class ShareWatcherService(Organ):
     name = "share"
 
-    def __init__(self, bus: EventBus, clock: Clock, *, organs: dict, share_dir, watch_interval: float = 30.0) -> None:
+    def __init__(self, bus: EventBus, clock: Clock, *, organs: dict, share_dir, watch_interval: float = 30.0, interaction=None) -> None:
         super().__init__(bus, clock, logger_name="suwan.services.share")
         self.organs = organs
         self.share_dir = Path(share_dir)
         self.watch_interval = watch_interval
+        self.interaction = interaction
         self._acc = 0.0
         self._scan_lock = asyncio.Lock()
 
@@ -96,6 +97,13 @@ class ShareWatcherService(Organ):
             count += 1
             if not already_saved:
                 await self.bus.publish(SENSOR_SHARE_FILE, {"name": f.name, "path": str(archive), "content": text[:300], "receipt": receipt})
+                if generation != memory.privacy_generation:
+                    continue
                 await self.bus.publish(DRIVE_ADJUST, {"changes": {"boredom": -30.0}})
-                await self.bus.publish(NOTIFY_TOAST, {"text": f"我收到了你分享的'{f.name}'，已保存原文件，谢谢你！"})
+                if generation != memory.privacy_generation:
+                    continue
+                text = f"我收到了你分享的'{f.name}'，已保存原文件，谢谢你！"
+                payload = (self.interaction.notification_data(text, source_generation=generation)
+                           if self.interaction is not None else {"text": text})
+                await self.bus.publish(NOTIFY_TOAST, payload)
         return count

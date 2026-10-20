@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from pathlib import Path
+from typing import Callable
 from urllib.parse import quote, urljoin, urlparse
 
 try:
@@ -32,7 +34,7 @@ DEFAULT_WHITELIST = [
     "www.baidu.com",
 ]
 
-ERROR_PREFIXES = ("[访问失败", "[访问超时", "[连接失败", "[HTTP错误", "[浏览器不可用", "[不在白名单", "[未找到", "[重定向失败")
+ERROR_PREFIXES = ("[访问失败", "[访问超时", "[连接失败", "[HTTP错误", "[浏览器不可用", "[不在白名单", "[未找到", "[重定向失败", "[搜索已取消")
 
 
 def is_browser_error(text: str) -> bool:
@@ -50,6 +52,7 @@ class BrowserConfigurationError(ValueError):
 
 class SafeBrowser:
     def __init__(self, whitelist: list[str] | None = None) -> None:
+        self._request_context = threading.local()
         self.available = _HAS_DEPS
         values = whitelist if whitelist is not None else DEFAULT_WHITELIST
         if not isinstance(values, list):
@@ -92,17 +95,47 @@ class SafeBrowser:
             return False
         return any(domain == a.lower().rstrip(".") or domain.endswith("." + a.lower().rstrip(".")) for a in self.whitelist)
 
-    def _fetch(self, url: str, *, timeout: float = 8.0) -> str:
+    def _check_authorized(self, send_allowed: Callable[[], bool] | None) -> None:
+        inherited = getattr(self._request_context, "send_allowed", None)
+        if ((inherited is not None and not inherited())
+                or (send_allowed is not None and not send_allowed())):
+            raise BrowserAccessError("[搜索已取消]")
+
+    def search_authorized(self, query: str, *, send_allowed: Callable[[], bool]) -> str:
+        """Keep the legacy search(query) call shape while guarding all sends.
+
+        A thread-local scope also protects calls made by an overridden search
+        through this adapter's browse/_fetch methods, without sharing request
+        authorization across concurrently running worker threads.
+        """
+        previous = getattr(self._request_context, "send_allowed", None)
+        self._request_context.send_allowed = send_allowed
+        try:
+            self._check_authorized(None)
+            result = self.search(query)
+            self._check_authorized(None)
+            return result
+        except BrowserAccessError as exc:
+            return str(exc)
+        finally:
+            self._request_context.send_allowed = previous
+
+    def _fetch(self, url: str, *, timeout: float = 8.0, send_allowed: Callable[[], bool] | None = None) -> str:
         """手动跟随重定向；每个目标都先校验，并共用一次访问期限。"""
         deadline = time.monotonic() + timeout
         for hop in range(6):
+            self._check_authorized(send_allowed)
             if not self.is_allowed(url):
                 raise BrowserAccessError("[不在白名单]")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise requests.exceptions.Timeout()  # type: ignore[union-attr]
+            # Already sent requests cannot be withdrawn. Each redirect and
+            # fallback needs fresh authorization before its own HTTP call.
+            self._check_authorized(send_allowed)
             response = self.session.get(url, timeout=remaining, allow_redirects=False)  # type: ignore[union-attr]
             try:
+                self._check_authorized(send_allowed)
                 if response.status_code in {301, 302, 303, 307, 308}:
                     location = response.headers.get("Location")
                     if not location or hop == 5:
@@ -130,36 +163,41 @@ class SafeBrowser:
             return f"[HTTP错误 {getattr(response, 'status_code', '?')}]"
         return f"[访问失败: {exc}]"
 
-    def browse(self, url: str) -> str:
+    def browse(self, url: str, *, send_allowed: Callable[[], bool] | None = None) -> str:
         if not self.available:
             return "[浏览器不可用]"
         if not self.is_allowed(url):
             return "[不在白名单]"
         try:
-            soup = BeautifulSoup(self._fetch(url), "html.parser")
+            self._check_authorized(send_allowed)
+            soup = BeautifulSoup(self._fetch(url, send_allowed=send_allowed), "html.parser")
             for tag in soup(["script", "style"]):
                 tag.decompose()
             text = " ".join((line.strip() for line in soup.get_text().splitlines() if line.strip()))
+            self._check_authorized(send_allowed)
             return text[:400]
         except Exception as exc:  # noqa: BLE001
             return self._failure(exc)
 
-    def search(self, query: str) -> str:
+    def search(self, query: str, *, send_allowed: Callable[[], bool] | None = None) -> str:
         if not self.available:
             return "[浏览器不可用]"
         safe_q = quote(query, safe="")
-        result = self.browse(f"https://baike.baidu.com/item/{safe_q}")
+        result = self.browse(f"https://baike.baidu.com/item/{safe_q}", send_allowed=send_allowed)
         if not is_browser_error(result):
             return result
         search_url = f"https://www.baidu.com/s?wd={safe_q}"
         if self.is_allowed(search_url):
             try:
-                soup = BeautifulSoup(self._fetch(search_url), "html.parser")
+                self._check_authorized(send_allowed)
+                soup = BeautifulSoup(self._fetch(search_url, send_allowed=send_allowed), "html.parser")
                 abstracts = [d.get_text().strip() for d in soup.find_all("div", class_="c-abstract")]
                 if abstracts:
+                    self._check_authorized(send_allowed)
                     return "；".join(abstracts[:3])
                 spans = [s.get_text().strip() for s in soup.find_all("span", class_="content-right_8Zs40")]
                 if spans:
+                    self._check_authorized(send_allowed)
                     return "；".join(spans[:3])
             except Exception as exc:  # noqa: BLE001
                 return self._failure(exc)

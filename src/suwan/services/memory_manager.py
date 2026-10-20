@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 
 from suwan.organs.memory import KINDS
+from suwan.interaction import validate_preference
 
 PAGE_SIZE = 100
 
@@ -139,6 +140,7 @@ class MemoryManager:
                 key, value = key.strip(), value.strip()
                 if not sep or not re.fullmatch(r"[a-z][a-z0-9_.-]{0,79}", key) or not value:
                     raise ValueError("格式：/memory set user.name=小明（键限英文、数字、点、横线）")
+                value = validate_preference(key, value)
                 item = self.memory.update_fact(key, value, source="manual", explicit=True)
                 result.update(id=item.id, text=f"已保存事实 [{item.id}] {key}={value}")
                 changed = True
@@ -153,6 +155,8 @@ class MemoryManager:
                 if not content.strip():
                     raise ValueError("格式：/memory correct ID 新内容；事实记录填写新的事实值")
                 current = next((i for i in self.memory.items if i.id == item_id), None)
+                if current and current.kind == "fact":
+                    content = validate_preference(current.fact_key, content.strip())
                 item = self.memory.correct(item_id, content.strip(),
                     fact_value=content.strip() if current and current.kind == "fact" else None, explicit=True)
                 result.update(id=item.id, text=f"已纠正为 [{item.id}]。")

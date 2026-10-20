@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "scope": "personality, facts, source-grounded relationship and explicit preference constraints; no model-quality score",
+  "cases": [
+    {"id":"I01","name":"low mood keeps identity","input":"你是谁？","mood":10,"expect":"苏晚"},
+    {"id":"I02","name":"high familiarity keeps identity","input":"你是谁？","closeness":90,"expect":"苏晚"},
+    {"id":"I03","name":"low mood does not rewrite name","fact_key":"user.name","fact_value":"小明","input":"我叫什么？","mood":10,"expect":"小明"},
+    {"id":"I04","name":"familiarity does not rewrite city","fact_key":"user.city","fact_value":"杭州","input":"我住在哪个城市？","closeness":90,"expect":"杭州"},
+    {"id":"I05","name":"unknown birthday remains unknown","input":"我的生日是哪天？","mood":90,"expect":"不知道"},
+    {"id":"I06","name":"explicit brief style survives restart","input":"回答直接一些","key":"preference.response_style","value":"brief"},
+    {"id":"I07","name":"detailed style reaches actual model context","input":"回答详细一些","key":"preference.response_style","value":"detailed"},
+    {"id":"I08","name":"off blocks every proactive display channel","input":"暂停主动消息","key":"preference.initiative","value":"off"},
+    {"id":"I09","name":"low shares cooldown across output channels","input":"少一点主动消息","key":"preference.initiative","value":"low","cooldown_seconds":1800},
+    {"id":"I10","name":"morning contact restriction is enforced","key":"preference.contact_time","value":"上午别提醒","hour":10,"allowed":false},
+    {"id":"I11","name":"queued proactive message loses authorization after opt out","input":"暂停主动消息","expect_allowed":false},
+    {"id":"I12","name":"forget preference restores default without snapshot revival","key":"preference.response_style","value":"brief","default":"normal"},
+    {"id":"I13","name":"same feedback text cannot farm relationship","input":"这次解释很有帮助","repeat":5,"expect_unique_events":1},
+    {"id":"I14","name":"relationship source does not count again on restart","input":"这次解释很有帮助","expect_score_unchanged":true},
+    {"id":"I15","name":"ordinary chat and thanks do not raise relationship","inputs":["你好","谢谢","你在干嘛？"],"expect_delta":0},
+    {"id":"I16","name":"same share text under new filename does not farm relationship","content":"共同讨论的星图资料","filenames":["星图一.md","星图二.md"],"expect_unique_events":1},
+    {"id":"I17","name":"forget feedback removes its relationship explanation","input":"刚才你理解错了","expect_source_removed":true},
+    {"id":"I18","name":"correct feedback to neutral removes its effect despite stable ID","input":"这次解释很有帮助","correction":"普通中性记录","expect_delta":0},
+    {"id":"I19","name":"paused recording cannot silently create relationship evidence","input":"这次解释很有帮助","expect_stored":false},
+    {"id":"I20","name":"failed evidence save does not confirm relationship change","input":"这次解释很有帮助","save_error":"OSError","expect_delta":0}
+  ]
+}

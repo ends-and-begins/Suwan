@@ -19,6 +19,7 @@ from pathlib import Path
 from suwan.adapters.filestore import DataFileError, atomic_write_text, read_json_checked
 from suwan.bus import EventBus
 from suwan.clock import Clock
+from suwan.context import TRACKED_GENERATION_REF
 from suwan.events import MEMORY_ADD_REQUEST, MEMORY_ADDED, MEMORY_CLEANED, MEMORY_COMPACTED, MEMORY_MAINTENANCE
 from suwan.organs.base import Organ
 
@@ -66,6 +67,26 @@ class MemoryOrgan(Organ):
         self._durable_receipts: set[str] = set()
         self._loaded = False
         self._legacy_bytes: bytes | None = None
+        # 只读投影的失效令牌；不是磁盘格式，也不把未落盘来源当作已确认来源。
+        # 正文版本独立于元数据/收据提交，避免无关变更重复散列大分享正文。
+        self._revision = 0
+        self._content_versions: dict[str, int] = {}
+
+    @property
+    def revision(self) -> int:
+        """当前公开写入口的单调修订；一次成功落盘也会改变它。"""
+        self._ensure_writable()
+        return self._revision
+
+    def content_version(self, item_id: str) -> int:
+        """正文内容的运行时版本，仅供只读派生缓存使用。"""
+        self._ensure_writable()
+        return self._content_versions.get(item_id, 0)
+
+    def _touch(self, content_ids=()) -> None:
+        self._revision += 1
+        for identifier in content_ids:
+            self._content_versions[identifier] = self._revision
 
     async def _on_start(self) -> None:
         await asyncio.to_thread(self._load)
@@ -270,7 +291,7 @@ class MemoryOrgan(Organ):
     def add(self, content: str, importance: float = 5.0, emotion: float = 50.0, *, receipt: str | None = None,
             kind: str = "event", source: str = "system", source_ref: str | None = None,
             occurred_at: datetime | None = None, topic: str = "", derived_from: tuple[str, ...] = (),
-            explicit: bool = False) -> MemoryItem | None:
+            explicit: bool = False, persist: bool = False) -> MemoryItem | None:
         self._ensure_writable()
         if not self.recording_enabled and not explicit:
             return None
@@ -289,9 +310,11 @@ class MemoryOrgan(Organ):
         def mutation():
             self.items.append(item)
             return item
-        if explicit:
-            return self._transaction(mutation)
+        if explicit or persist:
+            # 持久来源可以原子确认而不绕过暂停，也不撤销普通新输入。
+            return self._transaction(mutation, privacy_change=explicit, content_ids=(item.id,))
         mutation()
+        self._touch((item.id,))
         self._dirty = True
         if len(self.items) % self._save_every == 0:
             self.force_save()
@@ -319,25 +342,29 @@ class MemoryOrgan(Organ):
         self.items = result
         if count:
             self._dirty = True
+            self._touch(item.id for item in normalized if item.id in ids and item.id not in self._content_versions)
         if self._dirty:
             self.force_save()
         return count
 
-    def _transaction(self, mutation, *, privacy_change: bool = True):
+    def _transaction(self, mutation, *, privacy_change: bool = True, content_ids=()):
         """管理动作只在原子写成功后确认；写失败恢复全部内存状态。"""
         self._ensure_writable()
         previous = copy.deepcopy((self.items, self.tombstones, self.retired_receipts, self.recording_enabled,
-                                  self.identity_migrated, self._dirty, self._durable_receipts, self.privacy_generation))
+                                  self.identity_migrated, self._dirty, self._durable_receipts, self.privacy_generation,
+                                  self._revision, self._content_versions))
         try:
             result = mutation()
             self._dirty = True
+            self._touch(content_ids)
             self.force_save()
             if privacy_change:
                 self.privacy_generation += 1
             return result
         except BaseException:
             (self.items, self.tombstones, self.retired_receipts, self.recording_enabled,
-             self.identity_migrated, self._dirty, self._durable_receipts, self.privacy_generation) = previous
+             self.identity_migrated, self._dirty, self._durable_receipts, self.privacy_generation,
+             self._revision, self._content_versions) = previous
             raise
 
     def get_fact(self, key: str) -> MemoryItem | None:
@@ -372,7 +399,7 @@ class MemoryOrgan(Organ):
             if previous is not None:
                 self._delete_ids(self._descendants({previous.id}) - {previous.id})
             return item
-        return self._transaction(mutation, privacy_change=previous is not None or explicit)
+        return self._transaction(mutation, privacy_change=previous is not None or explicit, content_ids=(item.id,))
 
     def correct(self, item_id: str, content: str, fact_value: str | None = None, *, explicit: bool = True) -> MemoryItem:
         self._ensure_writable()
@@ -396,7 +423,7 @@ class MemoryOrgan(Organ):
             self._delete_ids(self._descendants({item_id}) - {item_id})
             self.items = [item if m.id == item_id else m for m in self.items]
             return item
-        return self._transaction(mutation)
+        return self._transaction(mutation, content_ids=(item.id,))
 
     def _descendants(self, identifiers: set[str]) -> set[str]:
         identifiers = set(identifiers)
@@ -411,6 +438,8 @@ class MemoryOrgan(Organ):
         self.items = [m for m in self.items if m.id not in identifiers]
         self.tombstones.update(m.id for m in removed)
         self.retired_receipts.update(m.receipt for m in removed if m.receipt is not None)
+        for item in removed:
+            self._content_versions.pop(item.id, None)
         return [m.id for m in removed]
 
     def delete(self, item_id: str, cascade: bool = True) -> list[str]:
@@ -537,6 +566,7 @@ class MemoryOrgan(Organ):
         self._dirty = False
         self._durable_receipts = {m.receipt for m in self.items if m.receipt is not None} | self.retired_receipts
         self._legacy_bytes = None
+        self._touch()
 
     def _load(self, *, validate_only: bool = False) -> None:
         self._loaded = True
@@ -604,6 +634,8 @@ class MemoryOrgan(Organ):
             self._durable_receipts = receipts | retired
             self._dirty = False
             self._read_error = None
+            self._touch()
+            self._content_versions = {item.id: self._revision for item in self.items}
 
     def _decay_factor(self, item: MemoryItem) -> float:
         base = item.created if item.created is not None else self.clock.now()
@@ -622,15 +654,30 @@ class MemoryOrgan(Organ):
     def _active(self) -> list[MemoryItem]:
         return [m for m in self.items if m.superseded_by is None]
 
-    def recall_random(self, limit: int = 3) -> list[MemoryItem]:
-        candidates = [m for m in self._active() if random.random() < self._decay_factor(m)]
+    @staticmethod
+    def is_context_safe(item: MemoryItem) -> bool:
+        """后台传播资格标记；来源有效性仍须用 sources_valid/代数单独复核。"""
+        return item.kind != "generated" or item.source_ref == TRACKED_GENERATION_REF
+
+    def _context_active(self) -> list[MemoryItem]:
+        """旧自动产物保留供显式管理；缺少可靠来源标记时不自动再传播。"""
+        self._ensure_writable()
+        return [m for m in self._active() if self.is_context_safe(m)]
+
+    def recall_random(self, limit: int = 3, *, context_only: bool = False) -> list[MemoryItem]:
+        records = self._context_active() if context_only else self._active()
+        candidates = [m for m in records if random.random() < self._decay_factor(m)]
         return random.sample(candidates, min(max(0, limit), len(candidates)))
 
     def get_recent(self, n: int = 20) -> list[MemoryItem]:
         return self._active()[-max(0, n):] if n > 0 else []
 
-    def get_random_fragments(self, n: int = 5) -> list[MemoryItem]:
-        candidates = self._active()
+    def get_context_recent(self, n: int = 20) -> list[MemoryItem]:
+        """后台上下文专用近期记录；不替旧产物猜测或伪造派生来源。"""
+        return self._context_active()[-max(0, n):] if n > 0 else []
+
+    def get_random_fragments(self, n: int = 5, *, context_only: bool = False) -> list[MemoryItem]:
+        candidates = self._context_active() if context_only else self._active()
         return random.sample(candidates, min(max(0, n), len(candidates)))
 
     def get_high_importance_memory(self, min_importance: float = 7.0) -> MemoryItem | None:

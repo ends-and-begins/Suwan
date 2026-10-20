@@ -12,7 +12,7 @@
 
 ## 修改前备份与原基线
 
-- 完整备份：`../backups/suwan-refactor_20261016-001005/suwan_project 重构版`。
+- 完整备份：`<workspace>\backups\suwan-refactor_20261016-001005\suwan_project 重构版`。
 - 463 文件，1,397,819 字节，逐文件 SHA256 对比为零差异。备份包含当时的 `.git`、配置与已有文档，不输出密钥内容。
 - 清单：备份父目录的 `manifest.sha256.json`；摘要：`backup-info.json`。
 - 将完整备份恢复到新的空临时目录，463 文件逐项校验一致。恢复目录只用于核对，未覆盖当前版本。
@@ -105,7 +105,7 @@
 
 ## 证据位置与下一步
 
-本机证据目录：`../research/iteration1_20261016`。
+本机证据目录：`<workspace>\research\iteration1_20261016`。
 
 - `baseline_report.md`、`baseline.log`、`baseline_result.json`：改动前实际基线。
 - `integrated_gate.log`：修复后门禁完整输出。

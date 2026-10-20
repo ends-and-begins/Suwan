@@ -132,12 +132,14 @@ class LocalReplyBank:
         activity: Callable[[], str],
         energy: Callable[[], float],
         recall: Callable[[str, int], Iterable[str | LocalRecall]],
+        response_style: str = "normal",
     ) -> None:
         self._user_name = user_name
         self._affect_desc = affect_desc
         self._activity = activity
         self._energy = energy
         self._recall = recall
+        self._response_style = response_style if response_style in {"normal", "brief", "detailed"} else "normal"
 
     def reply(self, user_text: str) -> str:
         text = (user_text or "").strip()
@@ -148,10 +150,16 @@ class LocalReplyBank:
             name = self._user_name()
             return f"你是{name}呀，我们聊过天的。" if name else "你是那个正在和我说话的人，虽然我还不知道你的名字。"
         if re.search(r"在干嘛|在做什么|做什么呢|忙什么", t):
+            if self._response_style == "brief":
+                return f"我正{self._activity()}。"
+            if self._response_style == "detailed":
+                return f"我正{self._activity()}，当前精力{self._energy():.0f}%。"
             return f"我正{self._activity()}。你呢，你在做什么？"
         if re.search(r"你好|嗨|hi|hello|晚安|早安", t):
             return random.choice(_GREETINGS)
         if re.search(r"心情|情绪|感觉|还好吗", t):
+            if self._response_style == "brief":
+                return f"我现在{self._affect_desc()}。"
             return f"我现在{self._affect_desc()}，谢谢关心。"
         if re.search(r"(我叫什么|我的名字|你还记得我叫什么吗)", t):
             name = self._user_name()
@@ -168,9 +176,23 @@ class LocalReplyBank:
             body = hit.content if isinstance(hit, LocalRecall) else str(hit)
             reference = (f"（记录：{hit.record_id}；{hit.kind}/{hit.source}）"
                          if isinstance(hit, LocalRecall) and hit.record_id else "")
-            return f"我记得一点：{excerpt(body, 180, query=t)}{reference}。你想再详细聊聊这个吗？"
+            limit = {"brief": 120, "normal": 180, "detailed": 360}[self._response_style]
+            reply = f"我记得一点：{excerpt(body, limit, query=t)}{reference}。"
+            if self._response_style == "normal":
+                return reply + "你想再详细聊聊这个吗？"
+            if self._response_style == "detailed":
+                return reply + "这条内容来自已有记录；如果其中有误，可以在记忆页查看来源并纠正。"
+            return reply
         if len(text) > 30:
-            return "你说得挺长的，我现在没开 API，等我缓一缓再认真回复你。可以先简单告诉我一句吗？"
+            if self._response_style == "brief":
+                return "这段内容超出本地回答能力，可以先聚焦一个问题。"
+            return "这段内容超出当前本地回答能力。可以先聚焦一个问题，我再根据已有记录核对。"
         if self._energy() < 30:
+            if self._response_style == "brief":
+                return "我现在精力不足，需要休息一下。"
             return random.choice(_LOW_ENERGY)
+        if self._response_style == "brief":
+            return "这个我目前不知道。"
+        if self._response_style == "detailed":
+            return "这个我目前不知道，现有记录也没有提供足够依据。可以补充具体背景，我再核对。"
         return random.choice(_GENERIC)

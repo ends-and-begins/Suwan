@@ -1,8 +1,8 @@
-# 苏晚 v2 —— 系统工程级重构版
+# 苏晚 v3 —— 人格、交流偏好与有来源的关系
 
-> 状态：2026-10-17 第二版严格审查的10项问题已补修：267 个测试、六项离线门禁及实际 Tk/REPL 演练通过；新增遗忘后请求撤销、界面回调、迁移恢复和实际回答回归。固定20个改述查询 Top-3 为20/20、Top-1为14/20。真实接口、声卡和长期运行尚未验证。
+> 状态：2026-10-17 第三版8项严格审查问题已补修：411测试、六项离线门禁及冻结20个互动场景通过；补齐生成来源与历史生成隔离、搜索发送前撤销、旧关系迁移去重、状态读取缓存、低频实际交付和界面回调保护。固定记忆检索 Top-3 为20/20、Top-1为14/20。真实接口、声卡、人工自然度和长期运行尚未验证。
 > 本项目承接旧版模块拆分代码，采用 **asyncio 事件总线 + 器官(organ) 架构**。
-> 当前实现与限制见 [第二版补修报告](docs/round2-fix-report.md)、[记忆使用与升级说明](docs/memory-v2.md)；第二版初次验收见 [第二版验收报告](docs/round2-report.md)，此前记录见 [第一版严格审查修复报告](docs/review-fix-report.md)和 [第一轮验收报告](docs/round1-report.md)，后续目标见 [阶段性迭代计划](docs/iteration-plan.md)。
+> 当前实现与限制见 [第三版补修报告](docs/round3-fix-report.md)、[第三版报告](docs/round3-report.md)、[人格与交流使用说明](docs/personality-v3.md)、[第三版设计](docs/round3-design.md)。记忆沿用 [记忆使用与升级说明](docs/memory-v2.md)；此前验证见 [第二版补修报告](docs/round2-fix-report.md)、[第二版验收报告](docs/round2-report.md)、[第一版严格审查修复报告](docs/review-fix-report.md)和 [第一轮验收报告](docs/round1-report.md)，后续目标见 [阶段性迭代计划](docs/iteration-plan.md)。
 
 ## 历史重构路线（详见 docs/milestones.md；下列勾选为历史记录）
 - M0 规划/基线盘点 ✅
@@ -30,6 +30,9 @@ python scripts/acceptance_review_fixes.py --output review-fix-result.json
 # 第二版固定30场景（检索与存储），以及实际记忆页/REPL演练
 python scripts/acceptance_round2_retrieval.py --output memory-result.json
 python scripts/acceptance_round2_ui.py --output memory-ui-result.json
+
+# 第三版冻结20个互动约束场景（本地运行时与假模型提示词）
+python scripts/acceptance_round3.py --output interaction-result.json
 
 # 交互 REPL（含 /tts <话> /voice <名> /api /net /doc /status /cfg）
 $env:PYTHONPATH="src"; python -m suwan.frontends.repl --home <数据目录>

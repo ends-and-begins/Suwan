@@ -1,4 +1,4 @@
-"""苏晚 v2 tkinter 前端（设置页 + 二级模型 + 日志过滤版）。
+"""苏晚 tkinter 前端（记忆管理、交流偏好与关系解释）。
 
 布局（grid）：
   row0 标题栏（极简：品牌 + 当前供应商/模型）
@@ -69,6 +69,10 @@ class TkApp:
         self._memory_page = self._memory_pages = 1
         self._memory_mode = "list"
         self._memory_search_text = ""
+        self._interaction_generation = 0
+        self._interaction_pending = False
+        self._interaction_mutating = False
+        self._api_probe_generation = 0
         self._log_entries: list[tuple[str, str]] = []  # (level, text)
         self._toggles: list = []  # (canvas, oval, var, on_color, on_toggle)
 
@@ -82,7 +86,7 @@ class TkApp:
         self._pump()
         self._sync_settings_from_runtime()
         self._refresh_api_indicator()
-        self._log_msg("苏晚 v2 已启动 · API/联网/模型/音色等设置在“设置”页", "info")
+        self._log_msg("苏晚 v3 已启动 · 交流偏好、API、模型与声音可在“设置”页调整", "info")
         for warning in getattr(runtime.settings, "configuration_warnings", ()):
             self._log_msg(warning, "warn")
         for warning in getattr(runtime, "startup_warnings", ()):
@@ -170,6 +174,13 @@ class TkApp:
         canvas.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
         self.status_text = tk.StringVar(value="（读取中…）")
         tk.Label(canvas, textvariable=self.status_text, justify="left", anchor="nw", font=("Cascadia Mono", 10), fg=FG, bg=PANEL).pack(fill=tk.BOTH, expand=True)
+        self.personality_text = tk.StringVar(value="人格说明：正在读取…")
+        tk.Label(canvas, textvariable=self.personality_text, justify="left", anchor="w", wraplength=880,
+                 font=("Microsoft YaHei UI", 9), fg=ACCENT, bg=PANEL).pack(fill=tk.X, pady=(8, 6))
+        self._label(canvas, "关系变化（来源可在“记忆”页按 ID 查看）", color=SUB, bg=PANEL).pack(anchor="w")
+        self.relation_details = self._scrolled(canvas)
+        self.relation_details.configure(height=6, state="disabled")
+        self.relation_details.pack(fill=tk.X, pady=(4, 0))
         self._label(canvas, "状态板为只读视图，每 2s 刷新", color="#5f6670", size=8).pack(anchor="w", pady=(8, 0))
 
     def _build_memory(self) -> None:
@@ -398,6 +409,122 @@ class TkApp:
         self._label(self._tab_settings,
                     "提示：.env 的 MODEL_<供应商>（如 MODEL_OPENAI=gpt-4o）会作为该供应商的默认模型；切换供应商/模型即时生效。",
                     color="#5f6670", size=9).pack(anchor="w", padx=14, pady=(4, 0))
+        preferences = tk.LabelFrame(self._tab_settings, text="交流偏好", bg=PANEL, fg=ACCENT,
+                                    font=("Microsoft YaHei UI", 9, "bold"), padx=14, pady=10)
+        preferences.pack(fill=tk.X, padx=12, pady=(16, 6))
+        row = tk.Frame(preferences, bg=PANEL)
+        row.pack(fill=tk.X, pady=4)
+        self._response_styles = {"自然": "normal", "直接": "brief", "详细": "detailed"}
+        self._initiative_levels = {"正常": "normal", "少": "low", "停": "off"}
+        self.response_style_var = tk.StringVar(value="自然")
+        self.initiative_var = tk.StringVar(value="正常")
+        self._label(row, "回答风格", color=SUB, bg=PANEL).pack(side=tk.LEFT)
+        self.response_style_cb = ttk.Combobox(row, textvariable=self.response_style_var,
+                                             values=list(self._response_styles), state="readonly", width=12)
+        self.response_style_cb.pack(side=tk.LEFT, padx=(8, 24))
+        self.response_style_cb.bind("<<ComboboxSelected>>", lambda _event: self._set_interaction_preference("preference.response_style"))
+        self._label(row, "主动消息", color=SUB, bg=PANEL).pack(side=tk.LEFT)
+        self.initiative_cb = ttk.Combobox(row, textvariable=self.initiative_var,
+                                        values=list(self._initiative_levels), state="readonly", width=12)
+        self.initiative_cb.pack(side=tk.LEFT, padx=8)
+        self._initiative_controls = (self.response_style_cb, self.initiative_cb)
+        self.initiative_cb.bind("<<ComboboxSelected>>", lambda _event: self._set_interaction_preference("preference.initiative"))
+        self.interaction_state = tk.StringVar(value="正在读取交流偏好…")
+        tk.Label(preferences, textvariable=self.interaction_state, justify="left", anchor="w", wraplength=850,
+                 bg=PANEL, fg=ACCENT, font=("Microsoft YaHei UI", 9)).pack(fill=tk.X, pady=(8, 4))
+        self._label(preferences, "选择后立即保存，重启后保持。停止主动消息时，你发来的消息仍会正常回应。",
+                    color=SUB, bg=PANEL, size=8).pack(anchor="w")
+
+    def _set_interaction_preference(self, key: str) -> None:
+        if key == "preference.response_style":
+            value = self._response_styles[self.response_style_var.get()]
+        else:
+            value = self._initiative_levels[self.initiative_var.get()]
+        self._request_interaction(key, value)
+
+    def _request_interaction(self, key: str | None = None, value: str | None = None) -> None:
+        if self._closing or not hasattr(self, "interaction_state"):
+            return
+        if self._interaction_pending and (key is None or self._interaction_mutating):
+            return
+        self._interaction_generation += 1
+        generation = self._interaction_generation
+        self._interaction_pending = True
+        self._interaction_mutating = key is not None
+        if key is not None:
+            self.interaction_state.set("正在保存交流偏好…")
+            for control in self._initiative_controls:
+                control.configure(state="disabled")
+        try:
+            future = (self.server.set_interaction_preference(key, value) if key is not None
+                      else self.server.interaction_view())
+        except (RuntimeError, AttributeError) as exc:
+            self._interaction_pending = False
+            self._interaction_mutating = False
+            self.interaction_state.set(f"交流偏好读取失败：{type(exc).__name__}")
+            for control in self._initiative_controls:
+                control.configure(state="readonly")
+            return
+
+        def done(fut):
+            try:
+                result = fut.result()
+            except Exception as exc:
+                result = {"ok": False, "text": f"交流偏好操作失败：{type(exc).__name__}"}
+            self._queue_ui(self._render_interaction, result, generation, key is not None)
+        future.add_done_callback(done)
+
+    def _render_interaction(self, result: dict, generation: int, changed: bool = False) -> None:
+        if self._closing or generation != self._interaction_generation:
+            return
+        self._interaction_pending = False
+        self._interaction_mutating = False
+        for control in self._initiative_controls:
+            control.configure(state="readonly")
+        epoch = result.get("_context_epoch")
+        if epoch is not None and not self.server.context_current(epoch):
+            self._request_interaction()
+            return
+        if "preferences" not in result:
+            self.interaction_state.set(result.get("text", "交流偏好读取失败。"))
+            if changed:
+                self._request_interaction()
+            return
+        if epoch is None:
+            self.interaction_state.set("交流状态缺少来源版本，已忽略。")
+            return
+        preferences = result["preferences"]
+        response_style = preferences.get("response_style", "normal")
+        initiative = preferences.get("initiative", "normal")
+        self.response_style_var.set(next((label for label, value in self._response_styles.items() if value == response_style), "自然"))
+        self.initiative_var.set(next((label for label, value in self._initiative_levels.items() if value == initiative), "正常"))
+        message = result.get("text") or "交流偏好已同步。"
+        if result.get("warning") and str(result["warning"]) not in message:
+            message += "\n" + str(result["warning"])
+        self.interaction_state.set(message)
+        self.personality_text.set("人格说明：" + str(result.get("personality", {}).get("summary", "暂无说明。")))
+        events = result.get("relation", {}).get("events", [])
+        lines = []
+        for event in events[-5:]:
+            lines.append(f"{event.get('reason', event.get('kind', '互动'))} · 亲密 {event.get('closeness_delta', 0):+.2f} / 信任 {event.get('trust_delta', 0):+.2f}\n"
+                         f"来源 ID：{event.get('source_id', '无')} · {str(event.get('occurred_at', ''))[:19]}")
+        self.relation_details.configure(state="normal")
+        self.relation_details.delete("1.0", tk.END)
+        self.relation_details.insert(tk.END, "\n".join(lines) if lines else "尚无有来源的关系变化记录。")
+        self.relation_details.configure(state="disabled")
+
+    def _clear_interaction_view(self) -> None:
+        if not hasattr(self, "interaction_state"):
+            return
+        self.response_style_var.set("")
+        self.initiative_var.set("")
+        self.interaction_state.set("记忆或偏好已变更，正在读取…")
+        self.status_text.set("状态已变更，正在刷新…")
+        self.personality_text.set("人格说明：正在读取…")
+        self.relation_details.configure(state="normal")
+        self.relation_details.delete("1.0", tk.END)
+        self.relation_details.configure(state="disabled")
+        self._request_interaction()
 
     def _toggle_api(self, _event=None) -> None:
         if self._closing:
@@ -751,17 +878,39 @@ class TkApp:
         self.mode_lbl.configure(text=f"{PROVIDER_LABELS.get(provider, provider)} / {model}")
 
     def _test_api(self) -> None:
+        if self._closing:
+            return
+        self._api_probe_generation += 1
+        context = self._api_probe_context()
         self.api_state_lbl.configure(text="● 测试中…", fg=WARN)
         self._set_api_dot_color(WARN)
         future = self.server.api_check()
-        future.add_done_callback(self._on_api_check_done)
+        future.add_done_callback(lambda done: self._on_api_check_done(done, context))
 
-    def _on_api_check_done(self, future) -> None:
+    def _api_probe_context(self) -> tuple:
+        runtime, llm = self.server.runtime, self.server.runtime.llm
+        return (self._api_probe_generation, runtime._model_config_generation,
+                id(llm), runtime.api_enabled, llm.provider, llm.model, llm.request_generation)
+
+    def _on_api_check_done(self, future, context=None) -> None:
         try:
             ok, msg = future.result(timeout=0.1)
         except Exception as exc:  # noqa: BLE001
             ok, msg = False, f"{type(exc).__name__}: {str(exc)[:80]}"
-        self._queue_ui(self._render_api_result, ok, msg)
+        if context is None:  # 独立兼容入口；生产探测始终携带配置与请求来源。
+            self._queue_ui(self._render_api_result, ok, msg)
+        else:
+            self._queue_ui(self._render_api_completion, ok, msg, context)
+
+    def _render_api_completion(self, ok: bool, msg: str, context: tuple) -> None:
+        if self._closing:
+            return
+        current = self._api_probe_context()
+        if context != current:
+            if context[0] == current[0]:
+                self._refresh_api_indicator()  # 当前探测已撤销，不无限停留在“测试中”。
+            return
+        self._render_api_result(ok, msg)
 
     def _render_api_result(self, ok: bool, msg: str) -> None:
         self._log_msg(msg, "ok" if ok else "error")
@@ -794,6 +943,8 @@ class TkApp:
         if self._closing:
             return
         items = self.server.bridge.drain()
+        allows_notification = getattr(self.server.bridge, "allows_notification", None)
+        commit_notification = getattr(self.server.bridge, "commit_notification", None)
         # Check the runtime directly as well: a reset notification may arrive late.
         self._sync_ui_context()
         while True:
@@ -808,6 +959,10 @@ class TkApp:
             if kind == "memory_reset":
                 self._sync_ui_context()
             elif not self.server.context_current(item.get("epoch")):
+                continue
+            elif callable(allows_notification) and not allows_notification(kind, data):
+                continue
+            elif callable(commit_notification) and not commit_notification(kind, data):
                 continue
             elif kind == "doc":
                 self._log_msg(f"文档已生成：{text}", "ok")
@@ -826,6 +981,7 @@ class TkApp:
         self._ui_context_epoch = epoch
         self._last_reply, self._last_reply_epoch = "", None
         self._stop_speaking()
+        self._clear_interaction_view()
         self.chat_area.configure(state="normal")
         self.chat_area.delete("1.0", tk.END)
         self.chat_area.configure(state="disabled")
@@ -839,6 +995,7 @@ class TkApp:
     # ---------- 轮询视图 ----------
     def _schedule_views(self) -> None:
         self._refresh_status()
+        self._request_interaction()
         self._refresh_files()
         self._after(2000, self._schedule_views)
 
