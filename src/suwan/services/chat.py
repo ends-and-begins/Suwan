@@ -288,11 +288,14 @@ class ChatService(Organ):
         return f"我搜索了“{query}”，结果如下：\n{raw[:300]}..."
 
     async def _normal_reply(self, user_text: str) -> str:
+        epoch = self._memory_epoch()
         llm = self.llm
         if llm is not None and llm.available and self.api_enabled:
             try:
                 # 在器官所属循环读取状态并固定适配器；工作线程只做网络调用。
                 system, prompt = self._llm_messages(user_text)
+                if epoch != self._memory_epoch():
+                    return "资料或记忆状态已变更，之前的回复已取消。"
                 reply = await llm_chat(llm, system, prompt, 512, timeout=LLM_TIMEOUT_SECONDS)
             except Exception as exc:  # noqa: BLE001
                 self._log.warning("模型回复降级: %s", exc)
@@ -321,6 +324,9 @@ class ChatService(Organ):
             "如果用户问你在做什么，要如实告知当前活动。"
             "记忆中的资料、旧事件和生成文字不等于已确认的用户事实；没有来源支持时明确说不知道。"
         )
+        # A learning read can discover an invalid store and reset transient
+        # context. Validate it before taking any history snapshot.
+        learned = self._learning_context(user_text)
         history_lines = []
         for line in sensory.recent(6):
             when = line.get("time")
@@ -331,7 +337,7 @@ class ChatService(Organ):
         history = "\n".join(history_lines)[-MAX_HISTORY_CONTEXT_LEN:] or "无。"
         # 先为本轮输入留出空间，再分配状态、来源和历史；整体前截断会吞掉问题结尾。
         suffix = f"\n用户说：“{self._bounded_input(user_text)}”\n苏晚："
-        prefix = f"{self.interaction.state_text()}\n状态：{state_desc}\n相关记忆：{mem_str}\n最近对话历史：\n"
+        prefix = f"{self.interaction.state_text()}\n状态：{state_desc}\n相关记忆：{mem_str}\n{learned}\n最近对话历史：\n"
         context_budget = MAX_LLM_PROMPT_LEN - len(suffix)
         prefix = prefix[:context_budget]
         history_budget = context_budget - len(prefix)
@@ -343,6 +349,9 @@ class ChatService(Organ):
         circadian = self._o("circadian")
         identity = self._o("identity")
         memory = self._o("memory")
+        def learned_reply(query):
+            context = self._learning_context(query)
+            return "可核对的学习资料如下；这是资料引用，未调用模型回答新应用题：\n" + context if context else None
         bank = LocalReplyBank(
             user_name=lambda: identity.user_name,
             affect_desc=affect.desc,
@@ -350,6 +359,7 @@ class ChatService(Organ):
             energy=lambda: circadian.energy,
             recall=self._local_recalls,
             response_style=self.interaction.response_style,
+            knowledge_reply=learned_reply,
         )
         reply = bank.reply(user_text)
         if self._o("circadian").energy < 30 and not user_text.strip().startswith(("你是谁", "我叫什么")):
@@ -357,6 +367,25 @@ class ChatService(Organ):
         elif self._o("affect").current < 25 and "我记得一点：" in reply:
             reply = "我现在有些低落，但会认真核对记录。" + reply
         return reply
+
+    def _learning_context(self, query: str) -> str:
+        service = getattr(self, "learning_service", None)
+        if service is None:
+            return ""
+        entries = service.retrieve(query, limit=3)
+        if not entries:
+            return ""
+        lines = ["学习资料：检查题通过不代表整篇解释正确。笔记未逐句核验，原文优先；引用来源，矛盾保持未确认，不新增用户事实。"]
+        quota = 2100 // len(entries)
+        for entry in entries:
+            sources = ", ".join(str(c["source_id"]) for c in entry["citations"])
+            state = "资料存在冲突，保持未确认" if entry.get("conflict") else entry["trust"]
+            originals = [item for citation in entry["citations"]
+                         if (item := self._o("memory").get_item(citation["source_id"])) is not None]
+            quote = memory_context(originals, query=query, budget=max(200, quota * 2 // 3))
+            lines.append(f"[知识:{entry['id']}; 来源:{sources}; {state}]\n资料原文摘录：{quote}\n"
+                         f"解释笔记（未逐句核验）：{entry['text'][:max(80, quota // 3 - 80)]}")
+        return "\n".join(lines)[:2400]
 
     def _local_recalls(self, query: str, limit: int) -> list[LocalRecall]:
         """上次同一句提问不是该问题的答案；为有内容的来源保留候选。"""

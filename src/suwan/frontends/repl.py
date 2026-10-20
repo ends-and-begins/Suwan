@@ -40,7 +40,7 @@ async def amain(argv: list[str] | None = None) -> int:
             reply = await runtime.ask(args.smoke)
             print(f"苏晚：{reply}")
             return 0
-        print("—— 苏晚 v4 已苏醒。命令：/quit /status /activities /pause /resume /continue <ID> /discard <ID> /like <ID> /dislike <ID> /cfg /memory help /api on|off /net on|off /model <名> /voice <名> /tts <话> /doc <主题>")
+        print("—— 苏晚 v5 已苏醒。命令：/quit /status /learn list|load <JSON路径>|step ID|run ID|cancel ID|revise ID 理由|find 查询 /activities /pause /resume /continue <ID> /discard <ID> /like <ID> /dislike <ID> /cfg /memory help /api on|off /net on|off /model <名> /voice <名> /tts <话> /doc <主题>")
         while True:
             line = await asyncio.to_thread(input, "你> ")
             line = line.strip()
@@ -55,6 +55,10 @@ async def amain(argv: list[str] | None = None) -> int:
             if line == "/cfg":
                 flags = runtime.status()["flags"]
                 print(f"API={flags['api']} 联网={flags['network']} 模型={flags['llm_provider']}（可用：{', '.join(ENDPOINT_ENV)}）")
+                continue
+            if line == "/learn" or line.startswith("/learn "):
+                result = await runtime.learning_command(line)
+                print(result.get("text", "学习操作完成。" if result.get("ok") else "学习操作未完成。"))
                 continue
             if line == "/activities":
                 view = await runtime.activity_view()

@@ -76,6 +76,7 @@ class TkApp:
         self._activity_pending = False
         self._activity_mutating = False
         self._activity_rows: dict[str, dict] = {}
+        self._learning_generation = 0
         self._works_generation = 0
         self._api_probe_generation = 0
         self._log_entries: list[tuple[str, str]] = []  # (level, text)
@@ -91,7 +92,7 @@ class TkApp:
         self._pump()
         self._sync_settings_from_runtime()
         self._refresh_api_indicator()
-        self._log_msg("苏晚 v4 已启动 · 状态板可查看活动、暂停后台任务与核对调用预算", "info")
+        self._log_msg("苏晚 v5 已启动 · /learn 可管理有来源的学习任务；状态板可查看学习、活动与调用预算", "info")
         for warning in getattr(runtime.settings, "configuration_warnings", ()):
             self._log_msg(warning, "warn")
         for warning in getattr(runtime, "startup_warnings", ()):
@@ -223,6 +224,8 @@ class TkApp:
         self.activity_dislike_button.pack(side=tk.LEFT)
         self.activity_discard_button = ttk.Button(row, text="取消未完成", command=lambda: self._activity_action("discard"))
         self.activity_discard_button.pack(side=tk.LEFT, padx=4)
+        self.learning_view_button = ttk.Button(row, text="查看学习", command=self._request_learning)
+        self.learning_view_button.pack(side=tk.LEFT, padx=4)
         self._activity_controls = [self.activity_pause_button, self.activity_resume_button, self.activity_continue_button,
                                    self.activity_like_button, self.activity_dislike_button, self.activity_discard_button]
 
@@ -231,6 +234,35 @@ class TkApp:
         self.activity_detail_area.delete("1.0", tk.END)
         self.activity_detail_area.insert(tk.END, self.activity_detail.get())
         self.activity_detail_area.configure(state="disabled")
+
+    def _request_learning(self, command: str | None = None) -> None:
+        if self._closing:
+            return
+        self._learning_generation += 1
+        generation = self._learning_generation
+        epoch = self.server.context_epoch()
+        try:
+            future = self.server.learning_command(command or "/learn list")
+        except Exception as exc:
+            self._log_msg(f"学习操作失败：{type(exc).__name__}", "error")
+            return
+        def done(fut):
+            try:
+                result = fut.result()
+            except Exception as exc:
+                result = {"ok": False, "text": f"学习操作失败：{type(exc).__name__}", "_context_epoch": epoch}
+            self._queue_ui(self._render_learning, result, generation)
+        future.add_done_callback(done)
+
+    def _render_learning(self, result: dict, generation: int) -> None:
+        if self._closing or generation != self._learning_generation:
+            return
+        epoch = result.get("_context_epoch")
+        if epoch is None or not self.server.context_current(epoch):
+            return
+        self._sync_ui_context()
+        text = str(result.get("text", "学习操作未完成。"))
+        self._show_chat("苏晚", text)
 
     def _activity_selected(self, _event=None) -> None:
         selected = self.activity_tree.selection()
@@ -890,6 +922,9 @@ class TkApp:
 
     def _route_command(self, text: str) -> bool:
         command, _, argument = text.partition(" ")
+        if command == "/learn":
+            self._request_learning(text)
+            return True
         if command in {"/api", "/net"}:
             value = argument.strip().lower()
             if value not in {"on", "off", "1", "0", "true", "false"}:
@@ -1154,6 +1189,7 @@ class TkApp:
         self._stop_speaking()
         self._clear_interaction_view()
         self._clear_activity_view()
+        self._learning_generation += 1
         self._clear_works_view()
         self.chat_area.configure(state="normal")
         self.chat_area.delete("1.0", tk.END)

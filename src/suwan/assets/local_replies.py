@@ -133,6 +133,7 @@ class LocalReplyBank:
         energy: Callable[[], float],
         recall: Callable[[str, int], Iterable[str | LocalRecall]],
         response_style: str = "normal",
+        knowledge_reply: Callable[[str], str | None] | None = None,
     ) -> None:
         self._user_name = user_name
         self._affect_desc = affect_desc
@@ -140,6 +141,7 @@ class LocalReplyBank:
         self._energy = energy
         self._recall = recall
         self._response_style = response_style if response_style in {"normal", "brief", "detailed"} else "normal"
+        self._knowledge_reply = knowledge_reply
 
     def reply(self, user_text: str) -> str:
         text = (user_text or "").strip()
@@ -170,6 +172,10 @@ class LocalReplyBank:
         if name_given:
             # 名字注册与记忆写入由调用方统一负责（避免双写），这里只回话
             return f"{name_given}，我记住了，以后就这么叫你。"
+        if self._knowledge_reply is not None:
+            learned = self._knowledge_reply(text)
+            if learned:
+                return learned
         recalled = list(self._recall(t, 1))
         if recalled:
             hit = recalled[0]

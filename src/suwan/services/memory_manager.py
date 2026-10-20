@@ -26,11 +26,15 @@ class MemoryManager:
         fact = self.memory.get_fact("user.name")
         self.identity.register_name(fact.fact_value if fact else None)
 
+    def reset_context(self) -> None:
+        """Revoke transient derivatives without changing durable source facts."""
+        self.epoch += 1
+        self.sensory.clear()
+        self.identity.clear_monologues()
+
     def changed(self, *, clear_context=True) -> str | None:
         if clear_context:
-            self.epoch += 1
-            self.sensory.clear()
-            self.identity.clear_monologues()
+            self.reset_context()
         self.project_identity()
         if self.on_change:
             self.on_change(clear_context=clear_context)

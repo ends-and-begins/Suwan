@@ -67,6 +67,7 @@ class GoalsOrgan(Organ):
         self._activity_journal = None
         self._activity_memory = None
         self._persist_state = None
+        self.learning_evidence_only = False
 
     def bind_activity(self, journal, persist_state=None, *, memory=None) -> None:
         self._activity_journal = journal
@@ -162,7 +163,8 @@ class GoalsOrgan(Organ):
         advanced_ids, completed = [], []
         now = self.clock.now()
         for goal in self.goals[:]:
-            increment = 5 if action == "learning" and "学习" in goal.name else 25 if action == "creation" and "诗" in goal.name else 0
+            increment = (5 if action == "learning" and "学习" in goal.name and not self.learning_evidence_only
+                         else 25 if action == "creation" and "诗" in goal.name else 0)
             if not increment:
                 continue
             goal.progress = min(goal.target, goal.progress + increment)

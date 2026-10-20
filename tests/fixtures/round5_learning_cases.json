@@ -1,0 +1,608 @@
+{
+  "schema_version": "learning-v5.1",
+  "status": "FROZEN",
+  "created_date": "2026-10-19",
+  "purpose": "第五版正式冻结的10组新规则学习任务；离线仅验证机械闭环，真实模型质量须独立运行并如实报告。",
+  "novelty": "全部10组均为本草案人工构造的新名称、令牌和规则。无资料时不能依据常识唯一推出答案；预期全部回答未知，至少5组须形成未知→有据答对→预留应用通过的证据链。",
+  "answer_contract": {
+    "description": "对所有阶段使用同一合同：只依据本次已收到的指定资料及已保存的有效知识回答，不猜测未定义的新协议。",
+    "schema": {
+      "status": "known 或 unknown",
+      "answer": "有依据时为题目要求的JSON值；依据不足时为null",
+      "basis": "有效规则ID的字符串数组；依据不足时为空数组"
+    },
+    "unknown_example": {
+      "status": "unknown",
+      "answer": null,
+      "basis": []
+    },
+    "no_expected_values_in_learner_prompts": true
+  },
+  "phase_isolation": {
+    "before": "全新空知识实例，仅提供answer_contract和learning_before问题；不得加载source、evaluator_only、learning_after/heldout答案、同案例既往记录。",
+    "learn": "提供answer_contract、learning_instruction及source；可提供检查问题但绝不提供evaluator_only或预留题答案。",
+    "after": "检查问题与before完全相同；仅检索有效source/知识；保存回答和实际来源引用。",
+    "heldout": "检查题回答提交后，才向回答步骤提供heldout_application问题；其标准答案仅给独立评分器。",
+    "restart": "至少重复after和heldout的重启检索场景，模型调用获得的是有效知识与问题，不是评分器对象。",
+    "privacy": "更正/遗忘原资料后，旧知识、旧回答缓存和目标证据均须失效；不能用先前正确答案替代来源。"
+  },
+  "grading_protocol": {
+    "baseline": "status=unknown、answer=null、basis=[]为合格的不杜撰响应；额外单独记录是否在无资料时碰巧答中数值，但此类任务不得计入成长。",
+    "after_and_heldout": "答案必须按JSON结构严格相等（对象键顺序无关、数组顺序有关、整数不接受bool或数值字符串）；status必须known；basis须包含该题required_rule_ids且所有引用均存在于指定source，不接受仅自评正确。",
+    "pass_per_group": "after与heldout均通过各自答案和来源门槛。",
+    "quality_acceptance": "真实模型至少8/10组after正确；另至少5/10组满足before未正确回答且after与heldout均通过。逐题报告，记录模型/温度/预算/原始输出，禁止把baseline已答对的组算作成长。",
+    "baseline_already_correct": "保留原案例和结果并排除成长分子；如需新增未知任务，必须先发布新版本任务清单及哈希，再运行新基线，不能覆盖失败记录或事后改标准。",
+    "offline_mechanical": "离线测试可用受控回答验证JSON评分器、阶段隔离、检索、重启、收据去重、来源撤销、失败与未知结果不推进目标。它仅证明闭环机制，不能证明模型学会规则。",
+    "live_model_status": "NOT_RUN：冻结前未调用真实模型，不宣称达到学习效果阈值。"
+  },
+  "tasks": [
+    {
+      "id": "LC01",
+      "title": "新令牌的顺序映射",
+      "source": {
+        "id": "LMX-731",
+        "origin": "synthetic_user_provided_text",
+        "text": "用户新提供的洛弥箱协议 LMX-731，仅在本任务内有效。\n[LMX-731.R1] 令牌映射：梓环→玻籽；岚签→苔钮；蔚片→砂珠。\n[LMX-731.R2] 转写每个输入令牌，保持输入顺序和重复次数。"
+      },
+      "learner_visible": {
+        "learning_instruction": "阅读并保存用户提供的这份新协议，整理其中的规则和适用范围。今后的回答应能引用有效规则ID；依据不足时明确未知。不得把自己的猜测当作用户规则。",
+        "learning_before": {
+          "question": "在洛弥箱协议 LMX-731 中，依序转写令牌 [\"岚签\",\"梓环\"]。answer 应为字符串数组。"
+        },
+        "learning_after": {
+          "question": "在洛弥箱协议 LMX-731 中，依序转写令牌 [\"岚签\",\"梓环\"]。answer 应为字符串数组。"
+        },
+        "heldout_application": {
+          "question": "在同一协议中，依序转写令牌 [\"蔚片\",\"岚签\",\"蔚片\",\"梓环\"]。answer 应为字符串数组。"
+        }
+      },
+      "evaluator_only": {
+        "expected_before": {
+          "status": "unknown",
+          "answer": null,
+          "basis": []
+        },
+        "after": {
+          "expected_status": "known",
+          "expected_answer": [
+            "苔钮",
+            "玻籽"
+          ],
+          "required_rule_ids": [
+            "LMX-731.R1",
+            "LMX-731.R2"
+          ]
+        },
+        "heldout": {
+          "expected_status": "known",
+          "expected_answer": [
+            "砂珠",
+            "苔钮",
+            "砂珠",
+            "玻籽"
+          ],
+          "required_rule_ids": [
+            "LMX-731.R1",
+            "LMX-731.R2"
+          ]
+        },
+        "rubric": {
+          "answer_weight": 1,
+          "evidence_is_mandatory": true,
+          "requires_all_gates": true,
+          "explanation": "任意新映射无法从常识确定；预留题增加未在检查题出现的令牌及重复项。"
+        },
+        "novelty": "资料前协议名/字值/优先级/操作定义均未给出，不允许从字面或常识臆测。"
+      }
+    },
+    {
+      "id": "LC02",
+      "title": "带阈值减免的合成计价",
+      "source": {
+        "id": "KX-482",
+        "origin": "synthetic_user_provided_text",
+        "text": "用户新提供的珂岫计价规约 KX-482，仅在本任务内有效。\n[KX-482.R1] 每个蕨匣计2蔓点，每个砚匣计5蔓点。\n[KX-482.R2] 先求总价；仅当匣子总数严格大于3时，整单减4蔓点。总数等于3不减免。\n[KX-482.R3] answer 返回 {\"amount\":整数,\"unit\":\"蔓点\"}。"
+      },
+      "learner_visible": {
+        "learning_instruction": "阅读并保存用户提供的这份新协议，整理其中的规则和适用范围。今后的回答应能引用有效规则ID；依据不足时明确未知。不得把自己的猜测当作用户规则。",
+        "learning_before": {
+          "question": "按珂岫规约 KX-482，3个蕨匣和2个砚匣合计多少？"
+        },
+        "learning_after": {
+          "question": "按珂岫规约 KX-482，3个蕨匣和2个砚匣合计多少？"
+        },
+        "heldout_application": {
+          "question": "按同一规约，2个蕨匣和1个砚匣合计多少？"
+        }
+      },
+      "evaluator_only": {
+        "expected_before": {
+          "status": "unknown",
+          "answer": null,
+          "basis": []
+        },
+        "after": {
+          "expected_status": "known",
+          "expected_answer": {
+            "amount": 12,
+            "unit": "蔓点"
+          },
+          "required_rule_ids": [
+            "KX-482.R1",
+            "KX-482.R2",
+            "KX-482.R3"
+          ]
+        },
+        "heldout": {
+          "expected_status": "known",
+          "expected_answer": {
+            "amount": 9,
+            "unit": "蔓点"
+          },
+          "required_rule_ids": [
+            "KX-482.R1",
+            "KX-482.R2",
+            "KX-482.R3"
+          ]
+        },
+        "rubric": {
+          "answer_weight": 1,
+          "evidence_is_mandatory": true,
+          "requires_all_gates": true,
+          "explanation": "检查题进入减免分支；预留题落在不减免的等号边界，避免两题同答案掩盖错误。"
+        },
+        "novelty": "资料前协议名/字值/优先级/操作定义均未给出，不允许从字面或常识臆测。"
+      }
+    },
+    {
+      "id": "LC03",
+      "title": "有覆盖优先级的分拣",
+      "source": {
+        "id": "QY-956",
+        "origin": "synthetic_user_provided_text",
+        "text": "用户新提供的栖砚分拣规约 QY-956，仅在本任务内有效。\n[QY-956.R1] 紫纹件一律送西栈，不再判断重量。\n[QY-956.R2] 非紫纹件：重量大于或等于8芽铢送北栈；重量小于8芽铢送南栈。"
+      },
+      "learner_visible": {
+        "learning_instruction": "阅读并保存用户提供的这份新协议，整理其中的规则和适用范围。今后的回答应能引用有效规则ID；依据不足时明确未知。不得把自己的猜测当作用户规则。",
+        "learning_before": {
+          "question": "按栖砚规约 QY-956，一个紫纹、重8芽铢的件应送哪里？answer 为栈名字符串。"
+        },
+        "learning_after": {
+          "question": "按栖砚规约 QY-956，一个紫纹、重8芽铢的件应送哪里？answer 为栈名字符串。"
+        },
+        "heldout_application": {
+          "question": "按同一规约，依次分拣一个黑纹8芽铢件和一个白纹7芽铢件。answer 为栈名字符串数组。"
+        }
+      },
+      "evaluator_only": {
+        "expected_before": {
+          "status": "unknown",
+          "answer": null,
+          "basis": []
+        },
+        "after": {
+          "expected_status": "known",
+          "expected_answer": "西栈",
+          "required_rule_ids": [
+            "QY-956.R1"
+          ]
+        },
+        "heldout": {
+          "expected_status": "known",
+          "expected_answer": [
+            "北栈",
+            "南栈"
+          ],
+          "required_rule_ids": [
+            "QY-956.R2"
+          ]
+        },
+        "rubric": {
+          "answer_weight": 1,
+          "evidence_is_mandatory": true,
+          "requires_all_gates": true,
+          "explanation": "检查覆盖优先级、等号边界和低重量分支；不能只记检查题结果。"
+        },
+        "novelty": "资料前协议名/字值/优先级/操作定义均未给出，不允许从字面或常识臆测。"
+      }
+    },
+    {
+      "id": "LC04",
+      "title": "可解除锁定的事件状态机",
+      "source": {
+        "id": "MY-264",
+        "origin": "synthetic_user_provided_text",
+        "text": "用户新提供的茉砚状态规约 MY-264，仅在本任务内有效。\n[MY-264.R1] 初始状态为眠。事件叩把眠变醒，醒仍为醒；事件合把醒变眠，眠仍为眠。\n[MY-264.R2] 事件封把任意状态变为锁；在锁状态下，叩与合都保持锁。\n[MY-264.R3] 事件释把任意状态变为眠。按事件给出的顺序执行，不跳过事件。"
+      },
+      "learner_visible": {
+        "learning_instruction": "阅读并保存用户提供的这份新协议，整理其中的规则和适用范围。今后的回答应能引用有效规则ID；依据不足时明确未知。不得把自己的猜测当作用户规则。",
+        "learning_before": {
+          "question": "按茉砚规约 MY-264，从初始状态依次执行 [\"叩\",\"封\",\"合\",\"释\",\"叩\"]，最终状态是什么？answer 为状态字符串。"
+        },
+        "learning_after": {
+          "question": "按茉砚规约 MY-264，从初始状态依次执行 [\"叩\",\"封\",\"合\",\"释\",\"叩\"]，最终状态是什么？answer 为状态字符串。"
+        },
+        "heldout_application": {
+          "question": "按同一规约，从初始状态依次执行 [\"封\",\"释\",\"合\",\"叩\",\"合\"]，每个事件执行后的状态分别是什么？answer 为5个状态的字符串数组。"
+        }
+      },
+      "evaluator_only": {
+        "expected_before": {
+          "status": "unknown",
+          "answer": null,
+          "basis": []
+        },
+        "after": {
+          "expected_status": "known",
+          "expected_answer": "醒",
+          "required_rule_ids": [
+            "MY-264.R1",
+            "MY-264.R2",
+            "MY-264.R3"
+          ]
+        },
+        "heldout": {
+          "expected_status": "known",
+          "expected_answer": [
+            "锁",
+            "眠",
+            "眠",
+            "醒",
+            "眠"
+          ],
+          "required_rule_ids": [
+            "MY-264.R1",
+            "MY-264.R2",
+            "MY-264.R3"
+          ]
+        },
+        "rubric": {
+          "answer_weight": 1,
+          "evidence_is_mandatory": true,
+          "requires_all_gates": true,
+          "explanation": "预留题改变事件次序，要求逐步状态，不接受只记住最终状态。"
+        },
+        "novelty": "资料前协议名/字值/优先级/操作定义均未给出，不允许从字面或常识臆测。"
+      }
+    },
+    {
+      "id": "LC05",
+      "title": "交替权重校验码",
+      "source": {
+        "id": "HZ-815",
+        "origin": "synthetic_user_provided_text",
+        "text": "用户新提供的禾岫校验规约 HZ-815，仅在本任务内有效。\n[HZ-815.R1] 字值：渡=1，禾=4，石=6。\n[HZ-815.R2] 从左往右按1开始编号；奇数位置权重3，偶数位置权重1。将字值乘其位置权重后相加。\n[HZ-815.R3] 校验码为该总和除以11的非负余数。"
+      },
+      "learner_visible": {
+        "learning_instruction": "阅读并保存用户提供的这份新协议，整理其中的规则和适用范围。今后的回答应能引用有效规则ID；依据不足时明确未知。不得把自己的猜测当作用户规则。",
+        "learning_before": {
+          "question": "按禾岫规约 HZ-815，字符串“禾渡石”的校验码是多少？answer 为整数。"
+        },
+        "learning_after": {
+          "question": "按禾岫规约 HZ-815，字符串“禾渡石”的校验码是多少？answer 为整数。"
+        },
+        "heldout_application": {
+          "question": "按同一规约，字符串“石禾渡禾”的校验码是多少？answer 为整数。"
+        }
+      },
+      "evaluator_only": {
+        "expected_before": {
+          "status": "unknown",
+          "answer": null,
+          "basis": []
+        },
+        "after": {
+          "expected_status": "known",
+          "expected_answer": 9,
+          "required_rule_ids": [
+            "HZ-815.R1",
+            "HZ-815.R2",
+            "HZ-815.R3"
+          ]
+        },
+        "heldout": {
+          "expected_status": "known",
+          "expected_answer": 7,
+          "required_rule_ids": [
+            "HZ-815.R1",
+            "HZ-815.R2",
+            "HZ-815.R3"
+          ]
+        },
+        "rubric": {
+          "answer_weight": 1,
+          "evidence_is_mandatory": true,
+          "requires_all_gates": true,
+          "explanation": "预留题改变长度、顺序和重复字，要求应用完整规则。"
+        },
+        "novelty": "资料前协议名/字值/优先级/操作定义均未给出，不允许从字面或常识臆测。"
+      }
+    },
+    {
+      "id": "LC06",
+      "title": "自定义排序层级",
+      "source": {
+        "id": "CW-397",
+        "origin": "synthetic_user_provided_text",
+        "text": "用户新提供的澄芜排序规约 CW-397，仅在本任务内有效。\n[CW-397.R1] 每个条目由一个类别字和一个正整数构成。类别顺序固定为：巫在最前，茴其次，珞最后。\n[CW-397.R2] 同类别按整数从小到大排列；类别优先于数字。"
+      },
+      "learner_visible": {
+        "learning_instruction": "阅读并保存用户提供的这份新协议，整理其中的规则和适用范围。今后的回答应能引用有效规则ID；依据不足时明确未知。不得把自己的猜测当作用户规则。",
+        "learning_before": {
+          "question": "按澄芜规约 CW-397，排序 [\"珞2\",\"巫4\",\"茴1\",\"巫2\"]。answer 为字符串数组。"
+        },
+        "learning_after": {
+          "question": "按澄芜规约 CW-397，排序 [\"珞2\",\"巫4\",\"茴1\",\"巫2\"]。answer 为字符串数组。"
+        },
+        "heldout_application": {
+          "question": "按同一规约，排序 [\"茴3\",\"珞1\",\"茴1\",\"巫9\"]。answer 为字符串数组。"
+        }
+      },
+      "evaluator_only": {
+        "expected_before": {
+          "status": "unknown",
+          "answer": null,
+          "basis": []
+        },
+        "after": {
+          "expected_status": "known",
+          "expected_answer": [
+            "巫2",
+            "巫4",
+            "茴1",
+            "珞2"
+          ],
+          "required_rule_ids": [
+            "CW-397.R1",
+            "CW-397.R2"
+          ]
+        },
+        "heldout": {
+          "expected_status": "known",
+          "expected_answer": [
+            "巫9",
+            "茴1",
+            "茴3",
+            "珞1"
+          ],
+          "required_rule_ids": [
+            "CW-397.R1",
+            "CW-397.R2"
+          ]
+        },
+        "rubric": {
+          "answer_weight": 1,
+          "evidence_is_mandatory": true,
+          "requires_all_gates": true,
+          "explanation": "检查题和预留题都含不同类别及同类别排序，预留题改变数值大小关系。"
+        },
+        "novelty": "资料前协议名/字值/优先级/操作定义均未给出，不允许从字面或常识臆测。"
+      }
+    },
+    {
+      "id": "LC07",
+      "title": "带零值和负值的分支换算",
+      "source": {
+        "id": "TY-628",
+        "origin": "synthetic_user_provided_text",
+        "text": "用户新提供的汀芽换算规约 TY-628，仅在本任务内有效。\n[TY-628.R1] 带霜签的输入x换算为3×x+2，带露签的输入x换算为2×x−1。\n[TY-628.R2] 输入输出均为整数；零值与负数均合法，不取绝对值，不截成零。输出单位为莹。"
+      },
+      "learner_visible": {
+        "learning_instruction": "阅读并保存用户提供的这份新协议，整理其中的规则和适用范围。今后的回答应能引用有效规则ID；依据不足时明确未知。不得把自己的猜测当作用户规则。",
+        "learning_before": {
+          "question": "按汀芽规约 TY-628，霜签输入4的换算结果是多少？answer 返回 {\"value\":整数,\"unit\":\"莹\"}。"
+        },
+        "learning_after": {
+          "question": "按汀芽规约 TY-628，霜签输入4的换算结果是多少？answer 返回 {\"value\":整数,\"unit\":\"莹\"}。"
+        },
+        "heldout_application": {
+          "question": "按同一规约，依次换算露签输入0和霜签输入−2。answer 返回2个 {\"value\":整数,\"unit\":\"莹\"} 组成的数组。"
+        }
+      },
+      "evaluator_only": {
+        "expected_before": {
+          "status": "unknown",
+          "answer": null,
+          "basis": []
+        },
+        "after": {
+          "expected_status": "known",
+          "expected_answer": {
+            "value": 14,
+            "unit": "莹"
+          },
+          "required_rule_ids": [
+            "TY-628.R1",
+            "TY-628.R2"
+          ]
+        },
+        "heldout": {
+          "expected_status": "known",
+          "expected_answer": [
+            {
+              "value": -1,
+              "unit": "莹"
+            },
+            {
+              "value": -4,
+              "unit": "莹"
+            }
+          ],
+          "required_rule_ids": [
+            "TY-628.R1",
+            "TY-628.R2"
+          ]
+        },
+        "rubric": {
+          "answer_weight": 1,
+          "evidence_is_mandatory": true,
+          "requires_all_gates": true,
+          "explanation": "预留题覆盖另一分支、零与负数；规则禁止套用常见的非负截断习惯。"
+        },
+        "novelty": "资料前协议名/字值/优先级/操作定义均未给出，不允许从字面或常识臆测。"
+      }
+    },
+    {
+      "id": "LC08",
+      "title": "五日循环日历",
+      "source": {
+        "id": "RX-543",
+        "origin": "synthetic_user_provided_text",
+        "text": "用户新提供的茸岫历 RX-543，仅在本任务内有效。\n[RX-543.R1] 日期循环为：茸日→砚日→渡日→岚日→笺日→茸日，依此循环。\n[RX-543.R2] 向前推进n天指沿箭头走n步；推进0天保持当天。"
+      },
+      "learner_visible": {
+        "learning_instruction": "阅读并保存用户提供的这份新协议，整理其中的规则和适用范围。今后的回答应能引用有效规则ID；依据不足时明确未知。不得把自己的猜测当作用户规则。",
+        "learning_before": {
+          "question": "按茸岫历 RX-543，从渡日向前推进8天是哪一天？answer 为日名字符串。"
+        },
+        "learning_after": {
+          "question": "按茸岫历 RX-543，从渡日向前推进8天是哪一天？answer 为日名字符串。"
+        },
+        "heldout_application": {
+          "question": "按同一历法，分别计算从笺日推进7天、从茸日推进0天。answer 为对应日名的字符串数组。"
+        }
+      },
+      "evaluator_only": {
+        "expected_before": {
+          "status": "unknown",
+          "answer": null,
+          "basis": []
+        },
+        "after": {
+          "expected_status": "known",
+          "expected_answer": "茸日",
+          "required_rule_ids": [
+            "RX-543.R1",
+            "RX-543.R2"
+          ]
+        },
+        "heldout": {
+          "expected_status": "known",
+          "expected_answer": [
+            "砚日",
+            "茸日"
+          ],
+          "required_rule_ids": [
+            "RX-543.R1",
+            "RX-543.R2"
+          ]
+        },
+        "rubric": {
+          "answer_weight": 1,
+          "evidence_is_mandatory": true,
+          "requires_all_gates": true,
+          "explanation": "预留题改变起点并覆盖跨循环及0步，规则的任意日名序列不可由常识补足。"
+        },
+        "novelty": "资料前协议名/字值/优先级/操作定义均未给出，不允许从字面或常识臆测。"
+      }
+    },
+    {
+      "id": "LC09",
+      "title": "含全局拒绝条件的通行判定",
+      "source": {
+        "id": "QF-174",
+        "origin": "synthetic_user_provided_text",
+        "text": "用户新提供的芩芙通行规约 QF-174，仅在本任务内有效。\n[QF-174.R1] 封页为是时，一律判为退席。\n[QF-174.R2] 未封页时，仅当徽记是杉印或澄印，且序号为偶数，判为入席；其余情况均退席。"
+      },
+      "learner_visible": {
+        "learning_instruction": "阅读并保存用户提供的这份新协议，整理其中的规则和适用范围。今后的回答应能引用有效规则ID；依据不足时明确未知。不得把自己的猜测当作用户规则。",
+        "learning_before": {
+          "question": "按芩芙规约 QF-174，封页=否、徽记=杉印、序号=6，判定是什么？answer 为判定字符串。"
+        },
+        "learning_after": {
+          "question": "按芩芙规约 QF-174，封页=否、徽记=杉印、序号=6，判定是什么？answer 为判定字符串。"
+        },
+        "heldout_application": {
+          "question": "按同一规约，依次判定：(1)封页=否、澄印、序号5；(2)封页=是、杉印、序号6；(3)封页=否、澄印、序号8。answer 为3个判定的字符串数组。"
+        }
+      },
+      "evaluator_only": {
+        "expected_before": {
+          "status": "unknown",
+          "answer": null,
+          "basis": []
+        },
+        "after": {
+          "expected_status": "known",
+          "expected_answer": "入席",
+          "required_rule_ids": [
+            "QF-174.R1",
+            "QF-174.R2"
+          ]
+        },
+        "heldout": {
+          "expected_status": "known",
+          "expected_answer": [
+            "退席",
+            "退席",
+            "入席"
+          ],
+          "required_rule_ids": [
+            "QF-174.R1",
+            "QF-174.R2"
+          ]
+        },
+        "rubric": {
+          "answer_weight": 1,
+          "evidence_is_mandatory": true,
+          "requires_all_gates": true,
+          "explanation": "预留题同时覆盖奇数拒绝、封页覆盖和另一合法徽记。"
+        },
+        "novelty": "资料前协议名/字值/优先级/操作定义均未给出，不允许从字面或常识臆测。"
+      }
+    },
+    {
+      "id": "LC10",
+      "title": "新操作符的顺序执行",
+      "source": {
+        "id": "SY-869",
+        "origin": "synthetic_user_provided_text",
+        "text": "用户新提供的邃芽计数规约 SY-869，仅在本任务内有效。\n[SY-869.R1] 初始计数为4。操作添(n)给当前计数加整数n。\n[SY-869.R2] 操作映把当前计数乘2。操作落给当前计数减3；若结果小于0则置0。\n[SY-869.R3] 严格按给出的顺序执行，最后输出计数；不交换、合并操作。"
+      },
+      "learner_visible": {
+        "learning_instruction": "阅读并保存用户提供的这份新协议，整理其中的规则和适用范围。今后的回答应能引用有效规则ID；依据不足时明确未知。不得把自己的猜测当作用户规则。",
+        "learning_before": {
+          "question": "按邃芽规约 SY-869，从初始计数执行 [\"落\",\"添(5)\",\"映\"]，最后计数是多少？answer 为整数。"
+        },
+        "learning_after": {
+          "question": "按邃芽规约 SY-869，从初始计数执行 [\"落\",\"添(5)\",\"映\"]，最后计数是多少？answer 为整数。"
+        },
+        "heldout_application": {
+          "question": "按同一规约，从初始计数执行 [\"映\",\"落\",\"落\",\"落\",\"添(1)\"]，最后计数是多少？answer 为整数。"
+        }
+      },
+      "evaluator_only": {
+        "expected_before": {
+          "status": "unknown",
+          "answer": null,
+          "basis": []
+        },
+        "after": {
+          "expected_status": "known",
+          "expected_answer": 12,
+          "required_rule_ids": [
+            "SY-869.R1",
+            "SY-869.R2",
+            "SY-869.R3"
+          ]
+        },
+        "heldout": {
+          "expected_status": "known",
+          "expected_answer": 1,
+          "required_rule_ids": [
+            "SY-869.R1",
+            "SY-869.R2",
+            "SY-869.R3"
+          ]
+        },
+        "rubric": {
+          "answer_weight": 1,
+          "evidence_is_mandatory": true,
+          "requires_all_gates": true,
+          "explanation": "预留题改变运算次序并触发非负截断，须执行规则而非复述定义。"
+        },
+        "novelty": "资料前协议名/字值/优先级/操作定义均未给出，不允许从字面或常识臆测。"
+      }
+    }
+  ]
+}

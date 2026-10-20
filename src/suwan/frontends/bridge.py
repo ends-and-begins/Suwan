@@ -261,6 +261,13 @@ class RuntimeThread:
     def activity_command(self, action: str, activity_id: str | None = None) -> Future:
         return self._submit(self.runtime.activity_command(action, activity_id))
 
+    def learning_view(self) -> Future:
+        """Read learning evidence on the runtime owner loop."""
+        return self._submit(self.runtime.learning_view())
+
+    def learning_command(self, command: str) -> Future:
+        return self._submit(self.runtime.learning_command(command))
+
     def notification_current(self, data: dict) -> bool:
         interaction = getattr(self.runtime, "interaction", None)
         if interaction is None:

@@ -9,7 +9,7 @@ from suwan.calls import CallDenied
 from suwan.context import bound_messages
 
 
-def llm_chat(llm, system: str, prompt: str, max_tokens: int | None = None, *, timeout: float = LLM_TIMEOUT_SECONDS, priority: int = 0, source: str = "chat", call_key: str | None = None, raise_on_denied: bool = False):
+def llm_chat(llm, system: str, prompt: str, max_tokens: int | None = None, *, timeout: float = LLM_TIMEOUT_SECONDS, priority: int = 0, source: str = "chat", call_key: str | None = None, raise_on_denied: bool = False, cancelled: threading.Event | None = None):
     """立即捕获来源代数，返回可 await 的有界请求。
 
     故意使用普通 def：创建请求和捕获代数不能延迟到 coroutine 真正执行时。
@@ -18,7 +18,7 @@ def llm_chat(llm, system: str, prompt: str, max_tokens: int | None = None, *, ti
     """
     generation = getattr(llm, "request_generation", None)
     system, prompt = bound_messages(system, prompt)
-    cancelled = threading.Event()
+    cancelled = cancelled if cancelled is not None else threading.Event()
     manager = getattr(llm, "call_manager", None)
 
     def send():
@@ -39,10 +39,21 @@ def llm_chat(llm, system: str, prompt: str, max_tokens: int | None = None, *, ti
             if future is not None:
                 wrapped = asyncio.wrap_future(future)
                 wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
-                pending = asyncio.shield(wrapped)
+                async def outcome():
+                    # A cancelled shield in Python 3.14 logs late inner
+                    # exceptions even when another callback consumes them.
+                    # Transport the eventual failure as data so the detached
+                    # queue waiter always terminates with a normal result.
+                    try:
+                        return await wrapped, None
+                    except BaseException as exc:
+                        return None, exc
+                pending = asyncio.shield(asyncio.create_task(outcome()))
+                result, error = await asyncio.wait_for(pending, timeout=timeout)
+                if error is not None:
+                    raise error
             else:
-                pending = asyncio.to_thread(send)
-            result = await asyncio.wait_for(pending, timeout=timeout)
+                result = await asyncio.wait_for(asyncio.to_thread(send), timeout=timeout)
             if generation is not None and generation != llm.request_generation:
                 return None
             return result

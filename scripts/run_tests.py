@@ -69,7 +69,11 @@ def _worker() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--timeout-seconds", type=int, default=300,
+                        help="完整门禁进程总时限（30..1800秒，默认300）；不改变单项测试时限")
     args = parser.parse_args()
+    if not 30 <= args.timeout_seconds <= 1800:
+        parser.error("--timeout-seconds 必须在30..1800之间")
     if args.worker:
         return _worker()
     with tempfile.TemporaryDirectory(prefix="suwan-gate-") as temporary:
@@ -79,11 +83,11 @@ def main() -> int:
         try:
             proc = subprocess.run(
                 [sys.executable, "-B", "-X", "utf8", str(workspace / "scripts" / "run_tests.py"), "--worker"],
-                cwd=workspace, env=isolated_environment(pathlib.Path(temporary) / "home"), timeout=180,
+                cwd=workspace, env=isolated_environment(pathlib.Path(temporary) / "home"), timeout=args.timeout_seconds,
             )
             return proc.returncode
         except subprocess.TimeoutExpired:
-            print("[GATE] FAIL: 门禁进程超过 180 秒", flush=True)
+            print(f"[GATE] FAIL: 门禁进程超过 {args.timeout_seconds} 秒", flush=True)
             return 124
 
 

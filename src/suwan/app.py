@@ -9,13 +9,15 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from contextvars import ContextVar
+import json
 import logging
 import os
 from pathlib import Path
 
 from suwan.adapters.browser import SafeBrowser
-from suwan.adapters.filestore import ensure_dir
+from suwan.adapters.filestore import ensure_dir, read_json_checked
 from suwan.adapters.llm import LLM_TIMEOUT_SECONDS, LLMClient
 from suwan.adapters.migrator import commit as commit_legacy, prepare as prepare_legacy
 from suwan.adapters.tts import TTSClient
@@ -43,6 +45,7 @@ from suwan.services.doc import DocService
 from suwan.services.monologue import MonologueService
 from suwan.services.memory_manager import MemoryManager
 from suwan.services.llm_request import llm_chat
+from suwan.services.learning import LearningService
 from suwan.services.reflection import ReflectionService
 from suwan.services.search import SearchService
 from suwan.services.share import ShareWatcherService
@@ -75,6 +78,8 @@ class SuwanRuntime:
         self._ticker_task: asyncio.Task | None = None
         self._foreground_tasks: set[asyncio.Task] = set()
         self._reply_context: ContextVar[tuple[int, int] | None] = ContextVar("suwan_reply_context", default=None)
+        self._learning_goal_projection: list[dict] = []
+        self._learning_change_active = False
         self.startup_warnings: list[str] = []
         self.migrate_legacy_data = migrate_legacy_data
         self._api_enabled = api_enabled
@@ -179,10 +184,17 @@ class SuwanRuntime:
             self.search_service.browser is not None and getattr(self.search_service.browser, "available", False)
         )
         self.tts_service = TtsService(self.bus, self.clock, tts_client=self.tts, save_dir=self.settings.audio_dir)
+        self.learning_service = LearningService(
+            self.bus, self.clock, memory=self.organs["memory"], data_dir=self.settings.data_dir,
+            llm=self.llm, api_enabled=self._api_enabled, memory_manager=self.memory_manager,
+        )
+        self.learning_service.on_change = self._learning_changed
+        self.chat_service.learning_service = self.learning_service
+        self.organs["goals"].learning_evidence_only = True
         self.services = [
             self.chat_service, self.monologue_service, self.autonomous_service,
             self.reflection_service, self.share_service, self.doc_service,
-            self.search_service, self.tts_service,
+            self.search_service, self.tts_service, self.learning_service,
         ]
 
     # ---------- 目录 ----------
@@ -254,6 +266,7 @@ class SuwanRuntime:
                     attempted.append(service)
                     await service.start()
                 self._sync_flags()
+                self._refresh_learning_goals()
                 self._running = True
                 self._ticker_task = asyncio.create_task(self._tick_loop(), name="suwan.ticker")
             except BaseException:
@@ -438,24 +451,67 @@ class SuwanRuntime:
     def _memory_changed(self, *, clear_context=True) -> None:
         """管理操作执行于运行时循环内；撤销包含旧上下文的工作。"""
         self._reconcile_interaction_state()
-        if self._reply_context.get() is not None:
-            # 本轮自己更正/遗忘的确认可以使用提交后的代数；其他任务的
-            # 旧答复仍保留各自捕获的代数，不会被这次修改重新授权。
-            self._reply_context.set(self.context_epoch())
+        acknowledge_change = self._reply_context.get() is not None
         if not clear_context:
             self._invalidate_activity_sources()
+            self._invalidate_learning_sources()
+            if acknowledge_change:
+                self._reply_context.set(self.context_epoch())
             return
+        self._cancel_context_work()
+        self._invalidate_activity_sources()
+        self._invalidate_learning_sources()
+        if acknowledge_change:
+            # Source withdrawal can synchronously reset the learning context
+            # too. Authorize only this explicit management acknowledgement,
+            # after all derived revocations have settled.
+            self._reply_context.set(self.context_epoch())
+
+    def _cancel_context_work(self) -> None:
+        """Revoke pending work and visible callbacks after a context reset."""
         self.search_service.invalidate_pending()
         for client in self._llm_clients:
             client.invalidate_pending()
         self.tts.invalidate_pending()
-        current = asyncio.current_task()
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
         for task in tuple(self._foreground_tasks):
             if task is not current:
                 task.cancel()
-        if clear_context and self._running:
+        if self._running:
             asyncio.create_task(self.bus.publish("memory.context_reset", {"epoch": self.memory_manager.epoch}))
-        self._invalidate_activity_sources()
+
+    def _learning_changed(self, reason: str) -> None:
+        """Publish revocation immediately, including detection during chat reads."""
+        self._learning_goal_projection = []
+        if self._learning_change_active:
+            return
+        self._learning_change_active = True
+        try:
+            self.memory_manager.reset_context()
+            self._cancel_context_work()
+        finally:
+            self._learning_change_active = False
+
+    def _invalidate_learning_sources(self) -> None:
+        try:
+            self.learning_service.invalidate_sources()
+            self._refresh_learning_goals()
+        except (OSError, ValueError, TypeError) as exc:
+            # The service hides and blocks its data before attempting cleanup.
+            self._learning_goal_projection = []
+            self._log.warning("学习来源清理尚未完成（%s），暂停使用旧学习内容。", type(exc).__name__)
+
+    def _refresh_learning_goals(self) -> None:
+        self._learning_goal_projection = [
+            {"id": row["id"], "name": "资料检查与应用：" + row["title"],
+             "progress": row["progress"], "target": row["total"],
+             "complete": row["progress"] == row["total"], "status": row["status"],
+             "kind": "learning_evidence"}
+            for row in self.learning_service.goals()
+        ]
 
     def _invalidate_activity_sources(self) -> None:
         try:
@@ -553,12 +609,19 @@ class SuwanRuntime:
 
     def status(self) -> dict:
         """状态快照（等价旧 get_status_snapshot 的展示数据）。"""
+        goals = self.organs["goals"].state()
+        for goal in goals["goals"]:
+            if "学习" in goal["name"]:
+                goal["name"] += "（历史活动计数）"
+        # This projection is published on the owner loop; Tk's synchronous
+        # status reader must not reconcile or mutate a learning store.
+        goals["goals"].extend(deepcopy(self._learning_goal_projection))
         return {
             "vitals": self.organs["circadian"].state(),
             "affect": self.organs["affect"].state(),
             "drive": self.organs["drive"].state(),
             "relation": self.organs["relation"].state(),
-            "goals": self.organs["goals"].state(),
+            "goals": goals,
             "identity": self.organs["identity"].state(),
             "memory": self.organs["memory"].state(),
             "flags": {"api": self._api_enabled, "network": self._network_enabled, "llm_provider": self.llm.provider},
@@ -573,6 +636,106 @@ class SuwanRuntime:
         return {"ok": True, **view, "activities": [*view.get("activities", []), *rows],
                 "budget": self.call_manager.snapshot(), "proactive": self.notification_ledger.snapshot(),
                 "_context_epoch": self.context_epoch()}
+
+    async def learning_view(self) -> dict:
+        if not self._running:
+            raise RuntimeError("运行时未启动")
+        view = self.learning_service.view()
+        self._refresh_learning_goals()
+        return {"ok": not bool(view.get("readonly")), **view, "_context_epoch": self.context_epoch()}
+
+    async def learning_command(self, command: str) -> dict:
+        """Explicit study commands; loading a task never sends a model request."""
+        if not self._running:
+            raise RuntimeError("运行时未启动")
+        body = str(command).strip()
+        if body == "/learn":
+            body = "help"
+        elif body.startswith("/learn "):
+            body = body[7:].strip()
+        action, _, argument = body.partition(" ")
+        argument = argument.strip()
+        task = asyncio.current_task()
+        self._foreground_tasks.add(task)
+        result = {}
+        try:
+            with self.call_manager.foreground():
+                if action in {"", "help"}:
+                    result = {"ok": True, "text": "/learn list | load JSON路径 | step ID | run ID | show ID | find 词语 | cancel ID | revise ID 修改理由；load仅登记，run最多推进四步。"}
+                elif action == "list":
+                    rows = self.learning_service.view()["tasks"]
+                    result = {"ok": True, "text": "\n\n".join(self._learning_task_text(row) for row in rows) or "尚未登记学习任务。先用 /learn load JSON路径 登记，load不会调用模型。"}
+                elif action == "load":
+                    path = Path(argument.strip('"'))
+                    if not argument or not path.is_file() or path.stat().st_size > 262144:
+                        raise ValueError("任务文件不存在或超过256KB")
+                    spec = read_json_checked(path)
+                    row = await self.learning_service.create(spec)
+                    result = {"ok": True, "task": row, "text": f"已登记学习任务 {row['id']}；尚未调用模型。"}
+                elif action in {"step", "run", "cancel", "show"}:
+                    if not argument or len(argument.split()) != 1:
+                        raise ValueError("请提供一个学习任务ID")
+                    if action == "cancel":
+                        row = await self.learning_service.cancel(argument)
+                    elif action == "show":
+                        row = next((row for row in self.learning_service.view()["tasks"] if row["id"] == argument), None)
+                        if row is None:
+                            raise ValueError("学习任务不存在")
+                    else:
+                        row = None
+                        for _ in range(4 if action == "run" else 1):
+                            row = await self.learning_service.advance(argument)
+                            if row["status"] in {"paused", "unknown", "withdrawn", "cancelled", "completed", "needs_review", "failed"}:
+                                break
+                    result = {"ok": action in {"cancel", "show"} or row["status"] not in {"unknown", "withdrawn", "cancelled", "failed"},
+                              "task": row, "text": self._learning_task_text(row, details=action == "show")}
+                elif action == "revise":
+                    identifier, _, reason = argument.partition(" ")
+                    if not identifier or not reason.strip():
+                        raise ValueError("用法：/learn revise ID 修改理由")
+                    row = await self.learning_service.revise(identifier, reason.strip())
+                    result = {"ok": row["status"] not in {"unknown", "withdrawn", "cancelled", "failed"}, "task": row,
+                              "text": f"修订状态：{row['status']} / {row['stage']}。新版须重新检查，已见应用题的复测不计首次留出改善。" + (" " + row.get("error", "") if row.get("error") else "")}
+                elif action == "find":
+                    if not argument:
+                        raise ValueError("请提供查询词")
+                    entries = self.learning_service.retrieve(argument)
+                    result = {"ok": True, "matches": entries, "text": "\n".join(
+                        f"[{row['id']}] {row['title']}（{'存在冲突，保持未确认' if row.get('conflict') else '检查题已核对；解释笔记未逐句核验'}）\n{row['text']}\n来源：" +
+                        "; ".join(f"{citation['source_id']} / {', '.join(citation['rule_ids'])}" for citation in row['citations'])
+                        for row in entries) or "没有当前有效的学习资料。"}
+                else:
+                    raise ValueError("未知学习命令；使用 /learn help")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            result = {"ok": False, "text": f"学习操作未完成（{type(exc).__name__}）：{str(exc)[:160]}"}
+        finally:
+            self._foreground_tasks.discard(task)
+        view = await self.learning_view()
+        if view.get("readonly"):
+            result = {**result, "ok": False, "text": result.get("text", "") + "\n学习记录已暂停使用：" + str(view.get("error", "请检查存储并从有效备份恢复。"))}
+        return {**view, **result}
+
+    @staticmethod
+    def _learning_task_text(row: dict, *, details: bool = False) -> str:
+        statuses = {"active": "待继续", "paused": "已暂停", "unknown": "结果未知，禁止自动重发",
+                    "completed": "检查与应用已通过", "needs_review": "需要核对", "cancelled": "已取消", "withdrawn": "来源已撤销"}
+        stages = {"baseline": "学习前测试", "notes": "阅读与笔记", "check": "资料检查", "application": "预留应用", "done": "已结束"}
+        progress = row.get("progress", {})
+        text = (f"{row['title']} [{row['id']}]\n{statuses.get(row['status'], row['status'])} / "
+                f"{stages.get(row['stage'], row['stage'])}；有效里程碑 {progress.get('completed', 0)}/{progress.get('total', 2)}；版本 {row.get('revision', 1)}")
+        if row.get("error"):
+            text += "\n说明：" + str(row["error"])
+        if details:
+            text += "\n资料来源：" + str(row.get("source_id", ""))
+            if row.get("notes"):
+                text += "\n笔记（模型解释，不代表现实事实已核实）：\n" + row["notes"][:3000]
+            for key, label in (("baseline", "学习前"), ("check", "检查"), ("application", "应用")):
+                value = row.get(key)
+                if value is not None:
+                    text += f"\n{label}：" + json.dumps(value, ensure_ascii=False)[:1800]
+            if row.get("versions"):
+                text += "\n版本：" + json.dumps(row["versions"], ensure_ascii=False)[:1200]
+        return text
 
     async def activity_command(self, action: str, id: str | None = None) -> dict:
         if not self._running:
