@@ -1,8 +1,8 @@
-# 苏晚 v6 —— 今日回顾与桌面控制
+# 苏晚 v7 候选版 —— 恢复验收与本地交付
 
-> 状态：2026-10-20 第六版4项严格审查补修完成。原729项测试保留、新增31项，最终760项测试及六项离线门禁通过，无跳过；原8项冻结桌面任务全部复验通过，详见 [第六版补修报告](docs/round6-fix-report.md)。今日概览、来源回顾、持久设置、等待取消、应用音量与逻辑导出继续保留，修复了失效学习结果传播、设置同步阻塞、草稿覆盖及旧作品漏计。真实接口、声卡、人工易用性和长期运行尚未验证；第五版真实模型8/10正确、至少5组有效改善仍待实测。固定记忆检索仍为 Top-3 20/20、Top-1 14/20。
+> 状态：2026-10-20，第七版最终测试前的5项审查问题已补修。803项测试、六项离线门禁及10项冻结交付任务全部通过，无跳过；新增9项回归，原测试方法保留。观测现在检查核心与真实时钟推进，通知/设置故障会失败；启动、解包和实际实例锁恢复验收已补强。原24小时观测已中断，尚未完成，7天人工使用为PENDING。详见 [第七版补修报告](docs/round7-fix-report.md)、[第七版执行记录](docs/round7-report.md)、[候选包使用说明](docs/release-user-guide.md)及 [第七版设计](docs/round7-design.md)。第七版对应原计划阶段6，仍是候选版，包内项目版本为0.1.0；当前依赖环境验证不代表全新Windows安装通过。真实接口、声卡、人工易用性，以及第五版真实模型8/10正确、至少5组有效改善仍待实测。固定记忆检索仍为 Top-3 20/20、Top-1 14/20。
 > 本项目承接旧版模块拆分代码，采用 **asyncio 事件总线 + 器官(organ) 架构**。
-> 当前操作与设计见 [第六版桌面说明](docs/desktop-v6.md)及 [第六版设计](docs/round6-design.md)。学习基础见 [第五版补修报告](docs/round5-fix-report.md)、[第五版验收报告](docs/round5-report.md)、[学习使用说明](docs/learning-v5.md)和 [第五版设计](docs/round5-design.md)。第四版基础见 [严格审查补修报告](docs/round4-fix-report.md)、[第四版验收报告](docs/round4-report.md)及 [活动、预算与恢复说明](docs/activities-v4.md)。人格与记忆沿用 [人格与交流说明](docs/personality-v3.md)、[记忆使用与升级说明](docs/memory-v2.md)。历史验证见 [第三版补修报告](docs/round3-fix-report.md)、[第三版报告](docs/round3-report.md)、[第二版补修报告](docs/round2-fix-report.md)、[第二版验收报告](docs/round2-report.md)、[第一版严格审查修复报告](docs/review-fix-report.md)和 [第一轮验收报告](docs/round1-report.md)，后续目标见 [阶段性迭代计划](docs/iteration-plan.md)。
+> 桌面操作与设计见 [第六版桌面说明](docs/desktop-v6.md)、[第六版补修报告](docs/round6-fix-report.md)及 [第六版设计](docs/round6-design.md)。学习基础见 [第五版补修报告](docs/round5-fix-report.md)、[第五版验收报告](docs/round5-report.md)、[学习使用说明](docs/learning-v5.md)和 [第五版设计](docs/round5-design.md)。第四版基础见 [严格审查补修报告](docs/round4-fix-report.md)、[第四版验收报告](docs/round4-report.md)及 [活动、预算与恢复说明](docs/activities-v4.md)。人格与记忆沿用 [人格与交流说明](docs/personality-v3.md)、[记忆使用与升级说明](docs/memory-v2.md)。历史验证见 [第三版补修报告](docs/round3-fix-report.md)、[第三版报告](docs/round3-report.md)、[第二版补修报告](docs/round2-fix-report.md)、[第二版验收报告](docs/round2-report.md)、[第一版严格审查修复报告](docs/review-fix-report.md)和 [第一轮验收报告](docs/round1-report.md)，后续目标见 [阶段性迭代计划](docs/iteration-plan.md)。
 
 ## 历史重构路线（详见 docs/milestones.md；下列勾选为历史记录）
 - M0 规划/基线盘点 ✅
@@ -45,6 +45,12 @@ python scripts/acceptance_round5.py --output learning-result.json
 
 # 第六版：8项冻结桌面任务，真实Tk控件、临时数据、假SDK
 python scripts/acceptance_round6.py --output desktop-result.json
+
+# 第七版：10项冻结交付任务；需提供已校验旧版src以验收升级/回退，缺失失败
+python scripts/acceptance_round7.py --legacy-source "<第六版源码备份的src目录>" --output delivery-result.json
+
+# 构建白名单源码候选包（目标文件必须不存在，父目录须已存在）
+python scripts/release_round7.py --output "<新候选ZIP路径>"
 
 # 交互 REPL（含 /tts <话> /voice <名> /api /net /doc /status /cfg）
 $env:PYTHONPATH="src"; python -m suwan.frontends.repl --home <数据目录>

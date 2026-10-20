@@ -1,0 +1,216 @@
+{
+  "format": "suwan-seven-day-observation",
+  "version": 1,
+  "status": "PENDING",
+  "required_days": 7,
+  "scope": "由用户逐日填写实际使用记录；空模板与自动化测试不构成七天验收",
+  "real_provider_quality": "NOT_RUN",
+  "real_audio_device": "NOT_RUN",
+  "human_usability": "PENDING",
+  "days": [
+    {
+      "day": 1,
+      "actual_date": null,
+      "status": "PENDING",
+      "sessions": [],
+      "runtime_minutes": null,
+      "tasks_completed": [],
+      "memory": {
+        "correct_count": null,
+        "missed_count": null,
+        "wrong_count": null,
+        "correction_checks": [],
+        "forget_checks": []
+      },
+      "initiative": {
+        "quiet_respected": null,
+        "budget_respected": null,
+        "interruptions": []
+      },
+      "learning_reuse": [],
+      "failures": [],
+      "manual_restart_required": null,
+      "external_calls": {
+        "known_calls": null,
+        "unknown_calls": null
+      },
+      "evidence_paths": [],
+      "notes": ""
+    },
+    {
+      "day": 2,
+      "actual_date": null,
+      "status": "PENDING",
+      "sessions": [],
+      "runtime_minutes": null,
+      "tasks_completed": [],
+      "memory": {
+        "correct_count": null,
+        "missed_count": null,
+        "wrong_count": null,
+        "correction_checks": [],
+        "forget_checks": []
+      },
+      "initiative": {
+        "quiet_respected": null,
+        "budget_respected": null,
+        "interruptions": []
+      },
+      "learning_reuse": [],
+      "failures": [],
+      "manual_restart_required": null,
+      "external_calls": {
+        "known_calls": null,
+        "unknown_calls": null
+      },
+      "evidence_paths": [],
+      "notes": ""
+    },
+    {
+      "day": 3,
+      "actual_date": null,
+      "status": "PENDING",
+      "sessions": [],
+      "runtime_minutes": null,
+      "tasks_completed": [],
+      "memory": {
+        "correct_count": null,
+        "missed_count": null,
+        "wrong_count": null,
+        "correction_checks": [],
+        "forget_checks": []
+      },
+      "initiative": {
+        "quiet_respected": null,
+        "budget_respected": null,
+        "interruptions": []
+      },
+      "learning_reuse": [],
+      "failures": [],
+      "manual_restart_required": null,
+      "external_calls": {
+        "known_calls": null,
+        "unknown_calls": null
+      },
+      "evidence_paths": [],
+      "notes": ""
+    },
+    {
+      "day": 4,
+      "actual_date": null,
+      "status": "PENDING",
+      "sessions": [],
+      "runtime_minutes": null,
+      "tasks_completed": [],
+      "memory": {
+        "correct_count": null,
+        "missed_count": null,
+        "wrong_count": null,
+        "correction_checks": [],
+        "forget_checks": []
+      },
+      "initiative": {
+        "quiet_respected": null,
+        "budget_respected": null,
+        "interruptions": []
+      },
+      "learning_reuse": [],
+      "failures": [],
+      "manual_restart_required": null,
+      "external_calls": {
+        "known_calls": null,
+        "unknown_calls": null
+      },
+      "evidence_paths": [],
+      "notes": ""
+    },
+    {
+      "day": 5,
+      "actual_date": null,
+      "status": "PENDING",
+      "sessions": [],
+      "runtime_minutes": null,
+      "tasks_completed": [],
+      "memory": {
+        "correct_count": null,
+        "missed_count": null,
+        "wrong_count": null,
+        "correction_checks": [],
+        "forget_checks": []
+      },
+      "initiative": {
+        "quiet_respected": null,
+        "budget_respected": null,
+        "interruptions": []
+      },
+      "learning_reuse": [],
+      "failures": [],
+      "manual_restart_required": null,
+      "external_calls": {
+        "known_calls": null,
+        "unknown_calls": null
+      },
+      "evidence_paths": [],
+      "notes": ""
+    },
+    {
+      "day": 6,
+      "actual_date": null,
+      "status": "PENDING",
+      "sessions": [],
+      "runtime_minutes": null,
+      "tasks_completed": [],
+      "memory": {
+        "correct_count": null,
+        "missed_count": null,
+        "wrong_count": null,
+        "correction_checks": [],
+        "forget_checks": []
+      },
+      "initiative": {
+        "quiet_respected": null,
+        "budget_respected": null,
+        "interruptions": []
+      },
+      "learning_reuse": [],
+      "failures": [],
+      "manual_restart_required": null,
+      "external_calls": {
+        "known_calls": null,
+        "unknown_calls": null
+      },
+      "evidence_paths": [],
+      "notes": ""
+    },
+    {
+      "day": 7,
+      "actual_date": null,
+      "status": "PENDING",
+      "sessions": [],
+      "runtime_minutes": null,
+      "tasks_completed": [],
+      "memory": {
+        "correct_count": null,
+        "missed_count": null,
+        "wrong_count": null,
+        "correction_checks": [],
+        "forget_checks": []
+      },
+      "initiative": {
+        "quiet_respected": null,
+        "budget_respected": null,
+        "interruptions": []
+      },
+      "learning_reuse": [],
+      "failures": [],
+      "manual_restart_required": null,
+      "external_calls": {
+        "known_calls": null,
+        "unknown_calls": null
+      },
+      "evidence_paths": [],
+      "notes": ""
+    }
+  ]
+}
+

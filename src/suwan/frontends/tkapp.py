@@ -115,7 +115,7 @@ class TkApp:
         self._desktop_draft_revisions["model"] = 0
         self.model_var.trace_add("write", lambda *_args: self._desktop_draft_edited("model"))
         self._refresh_api_indicator()
-        self._log_msg("苏晚 v6 已启动 · 今日回顾可查询共同经历、活动和学习；设置集中管理声音、安静时段与调用预算", "info")
+        self._log_msg("苏晚 v7 候选版已启动 · 今日回顾可查询共同经历、活动和学习；设置集中管理声音、安静时段与调用预算", "info")
         for warning in getattr(runtime.settings, "configuration_warnings", ()):
             self._log_msg(warning, "warn")
         for warning in getattr(runtime, "startup_warnings", ()):

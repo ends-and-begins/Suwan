@@ -79,7 +79,7 @@ async def amain(argv: list[str] | None = None) -> int:
             reply = await runtime.ask(args.smoke)
             print(f"苏晚：{reply}")
             return 0
-        print("—— 苏晚 v6 已苏醒。命令：/quit /status /desk today|find 词语|settings|set 键 JSON值|export /learn list|load <JSON路径>|step ID|run ID|cancel ID|revise ID 理由|find 查询 /activities /pause /resume /continue <ID> /discard <ID> /like <ID> /dislike <ID> /cfg /memory help /api on|off /net on|off /model <名> /voice <名> /tts <话> /doc <主题>")
+        print("—— 苏晚 v7 候选版已苏醒。命令：/quit /status /desk today|find 词语|settings|set 键 JSON值|export /learn list|load <JSON路径>|step ID|run ID|cancel ID|revise ID 理由|find 查询 /activities /pause /resume /continue <ID> /discard <ID> /like <ID> /dislike <ID> /cfg /memory help /api on|off /net on|off /model <名> /voice <名> /tts <话> /doc <主题>")
         while True:
             line = await asyncio.to_thread(input, "你> ")
             line = line.strip()
