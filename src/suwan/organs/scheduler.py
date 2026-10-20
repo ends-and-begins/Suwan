@@ -22,7 +22,7 @@ from suwan.organs.base import Organ
 class SchedulerOrgan(Organ):
     name = "scheduler"
 
-    def __init__(self, bus: EventBus, clock: Clock, *, intervals: Intervals | None = None) -> None:
+    def __init__(self, bus: EventBus, clock: Clock, *, intervals: Intervals | None = None, calendar_mode: bool = False, calendar_hour: int = 21) -> None:
         super().__init__(bus, clock)
         intervals = intervals or Intervals()
         self._table = {
@@ -33,6 +33,11 @@ class SchedulerOrgan(Organ):
             MEMORY_MAINTENANCE: intervals.memory_cleanup,
         }
         self._acc = {topic: 0.0 for topic in self._table}
+        self.calendar_mode = calendar_mode
+        if type(calendar_hour) is not int or not 0 <= calendar_hour <= 23:
+            raise ValueError("日历生成小时必须在0到23之间")
+        self.calendar_hour = calendar_hour
+        self._calendar_sent: dict[str, str] = {}
 
     async def _on_start(self) -> None:
         self._subscribe(CLOCK_TICK, self._on_tick)
@@ -42,10 +47,21 @@ class SchedulerOrgan(Organ):
         if dt <= 0:
             return
         for topic, period in self._table.items():
+            if self.calendar_mode and topic in {DIARY_TRIGGER, STORY_TRIGGER}:
+                day = self.clock.now().date().isoformat()
+                if self.clock.now().hour >= self.calendar_hour and self._calendar_sent.get(topic) != day:
+                    # Only today's work is offered. Durable date claims live in
+                    # ReflectionService; missed offline days are never replayed.
+                    self._calendar_sent[topic] = day
+                    await self.bus.publish(topic, {"date": day, "calendar": True})
+                continue
             self._acc[topic] += dt
             if self._acc[topic] >= period:
                 self._acc[topic] = 0.0
                 await self.bus.publish(topic, {})
 
     def state(self) -> dict:
-        return {"due_in": {topic.split(".")[0]: round(period - acc, 1) for topic, acc in self._acc.items() for period in [self._table[topic]]}}
+        return {"due_in": {topic.split(".")[0]: round(period - acc, 1) for topic, acc in self._acc.items()
+                           if not self.calendar_mode or topic not in {DIARY_TRIGGER, STORY_TRIGGER}
+                           for period in [self._table[topic]]},
+                "calendar_mode": self.calendar_mode, "calendar_hour": self.calendar_hour, "calendar_dates": dict(self._calendar_sent)}

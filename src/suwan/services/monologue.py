@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import random
 
 from suwan.assets import generation as gen
@@ -23,13 +24,14 @@ from suwan.services.llm_request import llm_chat
 class MonologueService(Organ):
     name = "monologue"
 
-    def __init__(self, bus: EventBus, clock: Clock, *, organs: dict, llm=None, api_enabled: bool = False, memory_manager=None, interaction=None) -> None:
+    def __init__(self, bus: EventBus, clock: Clock, *, organs: dict, llm=None, api_enabled: bool = False, memory_manager=None, interaction=None, model_interval_seconds: float = 3600.0) -> None:
         super().__init__(bus, clock, logger_name="suwan.services.monologue")
         self.organs = organs
         self.llm = llm
         self.api_enabled = api_enabled
         self.memory_manager = memory_manager
         self.interaction = interaction
+        self.model_interval_seconds = max(0.0, float(model_interval_seconds))
 
     def _o(self, name: str):
         return self.organs[name]
@@ -66,6 +68,18 @@ class MonologueService(Organ):
 
         # 清醒 → 独白
         if self.llm is not None and self.llm.available and self.api_enabled:
+            manager = getattr(self.llm, "call_manager", None)
+            if manager is not None:
+                # The frequent local heartbeat must not spend a whole day's
+                # budget on thoughts before sustained activities can advance.
+                # Sent metadata survives restart; no prompt/result text is read.
+                recent_calls = [row for row in manager.snapshot()["records"]
+                                if row["source"] == "monologue" and row["state"] != "cancelled_unsent"]
+                if manager.user_busy:
+                    return "", "monologue"
+                if any((self.clock.now() - datetime.fromisoformat(row["created_at"])).total_seconds()
+                       < self.model_interval_seconds for row in recent_calls):
+                    return gen.creation_line(affect.desc()), "monologue"
             state = f"正在：{circadian.current_activity[:256]}。精力{circadian.energy:.0f}，疲劳{circadian.mental_fatigue:.0f}，情绪{affect.desc()}。"
             recent = memory.get_context_recent(3)
             mem = memory_context(recent, budget=MAX_BACKGROUND_MEMORY_CHARS)
@@ -76,7 +90,8 @@ class MonologueService(Organ):
                 system, prompt, source_ids = snapshot.system, snapshot.prompt, snapshot.source_ids
             else:
                 system, prompt = PERSONA_SUMMARY + task, f"{state}\n最近记忆：{mem}\n{task}"
-            mono = await llm_chat(self.llm, system, prompt, 100)
+            options = {"priority": 10, "source": "monologue"} if manager is not None else {}
+            mono = await llm_chat(self.llm, system, prompt, 100, **options)
             # 正式适配器撤销后可能返回 None；此时也不能让旧任务转入本地
             # 兜底并返回一个看似有效的新独白。
             if epoch != self._epoch() or not memory.sources_valid(source_ids):

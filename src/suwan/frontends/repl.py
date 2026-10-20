@@ -40,7 +40,7 @@ async def amain(argv: list[str] | None = None) -> int:
             reply = await runtime.ask(args.smoke)
             print(f"苏晚：{reply}")
             return 0
-        print("—— 苏晚 v2（本地模式）已苏醒。命令：/quit /status /cfg /memory help /api on|off /net on|off /model <名> /voice <名> /tts <话> /doc <主题>")
+        print("—— 苏晚 v4 已苏醒。命令：/quit /status /activities /pause /resume /continue <ID> /discard <ID> /like <ID> /dislike <ID> /cfg /memory help /api on|off /net on|off /model <名> /voice <名> /tts <话> /doc <主题>")
         while True:
             line = await asyncio.to_thread(input, "你> ")
             line = line.strip()
@@ -55,6 +55,31 @@ async def amain(argv: list[str] | None = None) -> int:
             if line == "/cfg":
                 flags = runtime.status()["flags"]
                 print(f"API={flags['api']} 联网={flags['network']} 模型={flags['llm_provider']}（可用：{', '.join(ENDPOINT_ENV)}）")
+                continue
+            if line == "/activities":
+                view = await runtime.activity_view()
+                print(f"后台活动：{'暂停' if view.get('paused') else '可运行'}")
+                print(f"调用预算：{view.get('budget', {})}")
+                for item in view.get("activities", []):
+                    print(f"{item.get('id')} | {item.get('action', '')} | {item.get('status', '')} / {item.get('phase', '')} | {item.get('reason', '')}")
+                    if item.get("error"):
+                        print(f"  说明：{item['error']}")
+                    if item.get("status") == "unknown":
+                        if item.get("action") in {"diary", "story"}:
+                            print("  请求可能已经发送，不自动重发。当日日历记录保留占位，此处仅查看。")
+                        else:
+                            print("  请求可能已经发送，不自动重发。/discard ID 可解除活动等待；已占用调用额度不会返还。")
+                if view.get("last_error"):
+                    print(f"活动提示：{view['last_error']}")
+                continue
+            if line in {"/pause", "/resume"}:
+                result = await runtime.activity_command(line[1:])
+                print(result.get("text", "操作完成。" if result.get("ok") else "操作未完成。"))
+                continue
+            if any(line.startswith(prefix + " ") for prefix in ("/continue", "/discard", "/like", "/dislike")):
+                command, activity_id = line.split(maxsplit=1)
+                result = await runtime.activity_command(command[1:], activity_id.strip())
+                print(result.get("text", "操作完成。" if result.get("ok") else "操作未完成。"))
                 continue
             if line.startswith("/model "):
                 name = line[7:].strip()

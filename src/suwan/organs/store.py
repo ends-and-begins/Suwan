@@ -19,6 +19,7 @@ from suwan.clock import Clock
 from suwan.events import CLOCK_TICK
 from suwan.organs.base import Organ
 from suwan.organs.relation import RelationOrgan
+from suwan.organs.goals import GoalsOrgan
 
 
 class StateStoreOrgan(Organ):
@@ -235,6 +236,10 @@ class StateStoreOrgan(Organ):
                     ):
                         invalid("affect.modifiers[]")
             elif name == "goals":
+                try:
+                    GoalsOrgan.validate_state(payload)
+                except (TypeError, ValueError, KeyError) as exc:
+                    raise DataFileError(self.file, f"目标状态字段非法（{type(exc).__name__}）") from exc
                 goals = payload.get("goals")
                 if not isinstance(goals, list):
                     invalid("goals.goals")

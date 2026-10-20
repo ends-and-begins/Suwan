@@ -58,7 +58,8 @@ class DocService(Organ):
         else:
             system = PERSONA_SUMMARY + task
             prompt = f"当前状态：精力{circadian.energy:.0f}%，情绪{affect.desc()}，正在{circadian.current_activity[:256]}。\n相关记忆：{mem_str}\n用户想详细了解：“{user_text}”\n请开始生成文档。"
-        result = await llm_chat(self.llm, system, prompt, 2048)
+        options = {"source": "document"} if getattr(self.llm, "call_manager", None) is not None else {}
+        result = await llm_chat(self.llm, system, prompt, 2048, **options)
         # 适配器可能在线程开始后才看到新代数；服务仍须验证取上下文时的代数。
         if not result or epoch != self._epoch() or not memory.sources_valid(source_ids):
             return None

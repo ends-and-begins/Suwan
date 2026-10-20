@@ -37,6 +37,8 @@ class TkBridge:
         self.delivery_clock = None
         self._delivery_lock = threading.Lock()
         self._last_delivery_mono: float | None = None
+        self._delivered_ids: set[str] = set()
+        self._delivered_day: str | None = None
         self._subs: list[Any] = []
 
     def allows_notification(self, kind: str, data: dict) -> bool:
@@ -54,11 +56,26 @@ class TkBridge:
                 return False
             if kind not in {"inner", "narrative", "toast"} or not data.get("proactive"):
                 return True
+            notification_id = data.get("notification_id")
+            if notification_id is not None and (not isinstance(notification_id, str) or not notification_id):
+                return False
+            day = data.get("notification_date")
+            if isinstance(day, str) and day != self._delivered_day:
+                # The shared policy already rejects deliveries from old days.
+                # Keep only the current day's bounded set of visible claims.
+                self._delivered_ids.clear()
+                self._delivered_day = day
+            if notification_id in self._delivered_ids:
+                return False
             interval = data.get("delivery_interval", 0.0)
             if type(interval) not in (int, float) or not math.isfinite(interval) or interval < 0:
                 return False
             if self.delivery_clock is None:
-                return interval == 0
+                if interval:
+                    return False
+                if notification_id is not None:
+                    self._delivered_ids.add(notification_id)
+                return True
             now = self.delivery_clock()
             if not math.isfinite(now):
                 return False
@@ -70,6 +87,8 @@ class TkBridge:
                 if self._last_delivery_mono is not None and now - self._last_delivery_mono < interval:
                     return False
             self._last_delivery_mono = now
+            if notification_id is not None:
+                self._delivered_ids.add(notification_id)
             return True
 
     async def start(self, bus) -> None:
@@ -179,6 +198,12 @@ class RuntimeThread:
                 self._shutdown_error = exc
             finally:
                 self._runtime_stopped.set()
+                # The generation worker is owned by CallManager rather than
+                # asyncio's default executor. Retain the responsive window
+                # until it has physically exited, as for other SDK workers.
+                manager = getattr(self.runtime, "call_manager", None)
+                if manager is not None:
+                    await asyncio.to_thread(manager.wait_closed)
 
     # ---------- 从 GUI 线程调用 ----------
     def _submit(self, coro) -> Future:
@@ -228,6 +253,13 @@ class RuntimeThread:
 
     def set_interaction_preference(self, key: str, value: str) -> Future:
         return self._submit(self.runtime.set_interaction_preference(key, value))
+
+    def activity_view(self) -> Future:
+        """Return a consistent, redacted snapshot on the runtime owner loop."""
+        return self._submit(self.runtime.activity_view())
+
+    def activity_command(self, action: str, activity_id: str | None = None) -> Future:
+        return self._submit(self.runtime.activity_command(action, activity_id))
 
     def notification_current(self, data: dict) -> bool:
         interaction = getattr(self.runtime, "interaction", None)

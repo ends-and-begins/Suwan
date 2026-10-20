@@ -38,9 +38,19 @@ class TtsService(Organ):
             await self.bus.publish(TTS_DONE, {"rid": rid, "file": None, "ok": False, "error": "文本为空"})
             return
         cancelled = threading.Event()
+        manager = getattr(self.tts_client, "call_manager", None)
+        def send():
+            return self.tts_client.synthesize(text, voice=voice, save_dir=self.save_dir, cancelled=cancelled, expected_generation=generation)
         try:
+            future = manager.schedule(send, priority=0, cancelled=cancelled) if manager is not None else None
+            if future is not None:
+                wrapped = asyncio.wrap_future(future)
+                wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+                pending = asyncio.shield(wrapped)
+            else:
+                pending = asyncio.to_thread(send)
             path, error = await asyncio.wait_for(
-                asyncio.to_thread(self.tts_client.synthesize, text, voice=voice, save_dir=self.save_dir, cancelled=cancelled, expected_generation=generation),
+                pending,
                 timeout=TTS_TIMEOUT_SECONDS,
             )
         except Exception as exc:  # noqa: BLE001

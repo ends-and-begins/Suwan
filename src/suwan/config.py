@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import os
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
+
+from suwan.calls import CallPolicy
+from suwan.notification_policy import ProactivePolicy
 
 try:  # python-dotenv 是运行依赖；缺失时优雅降级（仅环境变量可用）
     from dotenv import load_dotenv
@@ -137,6 +140,12 @@ class Settings:
     keyless_providers: frozenset = frozenset(KEYLESS_PROVIDERS)  # 无需密钥的本地供应商
     max_history_lines: int = 100
     configuration_warnings: tuple[str, ...] = ()
+    call_policy: CallPolicy = field(default_factory=CallPolicy)
+    proactive_policy: ProactivePolicy = field(default_factory=ProactivePolicy)
+
+    @property
+    def call_ledger_file(self) -> Path:
+        return self.data_dir / "call_ledger.json"
 
     # ---------- 派生路径 ----------
     @property
@@ -195,6 +204,25 @@ class Settings:
         base_urls: dict[str, str] = {}
         model_names: dict[str, str] = {}
         configuration_warnings = []
+        def integer(name, default):
+            raw = e.get(name, str(default))
+            try:
+                value = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} 须为整数") from exc
+            return value
+
+        call_policy = CallPolicy(
+            daily_calls=integer("SUWAN_DAILY_CALLS", 40),
+            daily_output_tokens=integer("SUWAN_DAILY_OUTPUT_TOKENS", 32768),
+            foreground_reserved_calls=integer("SUWAN_FOREGROUND_RESERVED_CALLS", 4),
+            foreground_reserved_output_tokens=integer("SUWAN_FOREGROUND_RESERVED_OUTPUT_TOKENS", 4096),
+        )
+        proactive_policy = ProactivePolicy(
+            daily_limit=integer("SUWAN_PROACTIVE_DAILY_LIMIT", 8),
+            quiet_start=integer("SUWAN_QUIET_START", 22),
+            quiet_end=integer("SUWAN_QUIET_END", 8),
+        )
         for provider, (env_name, base_url, default_model) in ENDPOINT_ENV.items():
             api_keys[provider] = e.get(env_name, "")
             base_urls[provider] = base_url
@@ -231,4 +259,6 @@ class Settings:
             intervals=Intervals(),
             thresholds=Thresholds(),
             configuration_warnings=tuple(configuration_warnings),
+            call_policy=call_policy,
+            proactive_policy=proactive_policy,
         )

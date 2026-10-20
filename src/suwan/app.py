@@ -21,9 +21,11 @@ from suwan.adapters.migrator import commit as commit_legacy, prepare as prepare_
 from suwan.adapters.tts import TTSClient
 from suwan.bus import EventBus
 from suwan.clock import Clock, RealClock
+from suwan.calls import CallManager
 from suwan.config import ENDPOINT_ENV, Settings
 from suwan.events import CLOCK_TICK, TTS_DONE, TTS_REQUEST
 from suwan.instance_lock import InstanceLock
+from suwan.notification_policy import NotificationLedger
 from suwan.interaction import InteractionContext, PERSONA_SUMMARY, INITIATIVE_KEY, RESPONSE_STYLE_KEY
 from suwan.organs.affect import AffectOrgan
 from suwan.organs.circadian import CircadianOrgan
@@ -80,6 +82,9 @@ class SuwanRuntime:
         self._model_config_generation = 0
         self.tts_voice = "mimo_default"
         self.tts_enabled = False
+        self.call_manager = CallManager(self.settings.call_ledger_file, policy=self.settings.call_policy, clock=self.clock)
+        self.notification_ledger = NotificationLedger(
+            self.settings.data_dir / "notification-v4.json", self.clock, self.settings.proactive_policy)
 
         # 适配器
         if llm_provider is None:
@@ -88,8 +93,10 @@ class SuwanRuntime:
 
         # 适配器
         self.llm = LLMClient(self.settings, provider=llm_provider, clock=self.clock)
+        self.llm.call_manager = self.call_manager
         self._llm_clients = [self.llm]
         self.tts = TTSClient(self.settings, clock=self.clock)
+        self.tts.call_manager = self.call_manager
         # 白名单：默认内置清单；可用环境变量 SUWAN_BROWSER_CONFIG 指向 JSON 覆盖（如实化配置源）
         cfg_path = os.getenv("SUWAN_BROWSER_CONFIG")
         self.browser = SafeBrowser.from_json(cfg_path) if cfg_path else SafeBrowser()
@@ -114,11 +121,12 @@ class SuwanRuntime:
             GoalsOrgan(self.bus, self.clock),
             SensoryBufferOrgan(self.bus, self.clock),
             MemoryOrgan(self.bus, self.clock, file_path=self.settings.memories_file),
-            SchedulerOrgan(self.bus, self.clock, intervals=self.settings.intervals),
+            SchedulerOrgan(self.bus, self.clock, intervals=self.settings.intervals, calendar_mode=True),
         ]
         self.organs = {o.name: o for o in organs}
         self.organs["relation"].bind_memory(self.organs["memory"])
         self.interaction = InteractionContext(self.organs, self.clock)
+        self.interaction.notification_ledger = self.notification_ledger
         self.organs["circadian"].interaction = self.interaction
         store = StateStoreOrgan(self.bus, self.clock, organs=organs, file_path=self.settings.state_file, save_interval=60.0)
         self.store = store
@@ -142,6 +150,8 @@ class SuwanRuntime:
             llm=self.llm, api_enabled=self._api_enabled, boredom_threshold=th.boredom_threshold,
             memory_manager=self.memory_manager,
             interaction=self.interaction,
+            persist_state=store.save, call_manager=self.call_manager,
+            paused=lambda: self.call_manager.user_busy,
         )
         self.reflection_service = ReflectionService(
             self.bus, self.clock, organs=self.organs, data_dir=self.settings.data_dir,
@@ -201,6 +211,15 @@ class SuwanRuntime:
                 for warning in getattr(self.settings, "configuration_warnings", ()):
                     self._log.warning("配置提示: %s", warning)
                 self._ensure_dirs()
+                if not self.call_manager.start():
+                    warning = "调用账本不可用：外部生成已暂停，本地聊天仍可使用。请保留原件并检查账本。"
+                    self.startup_warnings.append(warning)
+                    self._log.warning("%s", warning)
+                self.notification_ledger.start()
+                if self.notification_ledger.snapshot()["error"]:
+                    warning = "主动消息账本不可用：主动展示已暂停，请保留原件并检查账本。"
+                    self.startup_warnings.append(warning)
+                    self._log.warning("%s", warning)
                 await self.bus.start()
                 for organ in self._all_organs:
                     attempted.append(organ)
@@ -230,6 +249,7 @@ class SuwanRuntime:
                         self._log.exception("旧数据迁移失败（不影响启动）")
                 self.memory_manager.initialise()
                 self._reconcile_interaction_state()
+                await self.autonomous_service.initialise()
                 for service in self.services:
                     attempted.append(service)
                     await service.start()
@@ -256,6 +276,8 @@ class SuwanRuntime:
                         for client in self._llm_clients:
                             client.set_active(False)
                         self.tts.set_active(False)
+                        self.call_manager.close()
+                        self.notification_ledger.close()
                         self._instance_lock.release()
                 raise
 
@@ -302,6 +324,8 @@ class SuwanRuntime:
                     for client in self._llm_clients:
                         client.set_active(False)
                     self.tts.set_active(False)
+                    self.call_manager.close()
+                    self.notification_ledger.close()
                     self._instance_lock.release()
             if errors:
                 for error in errors:
@@ -347,7 +371,10 @@ class SuwanRuntime:
 
     def set_llm_provider(self, provider: str) -> None:
         self._model_config_generation += 1
+        for client in self._llm_clients:
+            client.invalidate_pending()
         self.llm = LLMClient(self.settings, provider=provider, clock=self.clock)
+        self.llm.call_manager = self.call_manager
         self._llm_clients.append(self.llm)
         self._sync_flags()
 
@@ -378,9 +405,10 @@ class SuwanRuntime:
         self._foreground_tasks.add(task)
         try:
             generation = self.tts.request_generation
-            data = await request(self.bus, TTS_REQUEST, TTS_DONE, {
-                "text": text, "voice": voice, "generation": generation,
-            }, timeout=60.0)
+            with self.call_manager.foreground():
+                data = await request(self.bus, TTS_REQUEST, TTS_DONE, {
+                    "text": text, "voice": voice, "generation": generation,
+                }, timeout=60.0)
         except RpcTimeoutError:
             return None, "语音合成超时"
         finally:
@@ -415,6 +443,7 @@ class SuwanRuntime:
             # 旧答复仍保留各自捕获的代数，不会被这次修改重新授权。
             self._reply_context.set(self.context_epoch())
         if not clear_context:
+            self._invalidate_activity_sources()
             return
         self.search_service.invalidate_pending()
         for client in self._llm_clients:
@@ -426,6 +455,14 @@ class SuwanRuntime:
                 task.cancel()
         if clear_context and self._running:
             asyncio.create_task(self.bus.publish("memory.context_reset", {"epoch": self.memory_manager.epoch}))
+        self._invalidate_activity_sources()
+
+    def _invalidate_activity_sources(self) -> None:
+        try:
+            self.autonomous_service.invalidate_sources()
+        except (OSError, ValueError, TypeError) as exc:
+            self.autonomous_service.last_error = f"活动来源清理未完成（{type(exc).__name__}），活动已停止展示和生成。"
+            self._log.warning("%s", self.autonomous_service.last_error)
 
     async def memory_command(self, command: str) -> dict:
         if not self._running:
@@ -459,7 +496,8 @@ class SuwanRuntime:
         task = asyncio.current_task()
         self._foreground_tasks.add(task)
         try:
-            return await self.chat_service.chat(text)
+            with self.call_manager.foreground():
+                return await self.chat_service.chat(text)
         finally:
             self._foreground_tasks.discard(task)
 
@@ -493,7 +531,9 @@ class SuwanRuntime:
         task = asyncio.current_task()
         self._foreground_tasks.add(task)
         try:
-            reply = await llm_chat(llm, "你是一个连通性测试助手。", "请只回复：OK", 8, timeout=LLM_TIMEOUT_SECONDS)
+            with self.call_manager.foreground():
+                reply = await llm_chat(llm, "你是一个连通性测试助手。", "请只回复：OK", 8,
+                                       timeout=LLM_TIMEOUT_SECONDS, source="api_probe")
         except Exception as exc:  # noqa: BLE001
             return False, f"连接失败：{type(exc).__name__}: {str(exc)[:80]}"
         finally:
@@ -523,3 +563,22 @@ class SuwanRuntime:
             "memory": self.organs["memory"].state(),
             "flags": {"api": self._api_enabled, "network": self._network_enabled, "llm_provider": self.llm.provider},
         }
+
+    async def activity_view(self) -> dict:
+        if not self._running:
+            raise RuntimeError("运行时未启动")
+        view = self.autonomous_service.view()
+        calendar = self.reflection_service.calendar.view()
+        rows = calendar.get("activities", []) if isinstance(calendar, dict) else calendar
+        return {"ok": True, **view, "activities": [*view.get("activities", []), *rows],
+                "budget": self.call_manager.snapshot(), "proactive": self.notification_ledger.snapshot(),
+                "_context_epoch": self.context_epoch()}
+
+    async def activity_command(self, action: str, id: str | None = None) -> dict:
+        if not self._running:
+            raise RuntimeError("运行时未启动")
+        if id and id.startswith("calendar:"):
+            return {**await self.activity_view(), "ok": False,
+                    "text": "日历记录在此处仅供查看；当日失败、暂停或未知占位不会自动重发，次日处理新日期。"}
+        result = await self.autonomous_service.command(action, id)
+        return {**await self.activity_view(), **result, "_context_epoch": self.context_epoch()}

@@ -72,6 +72,11 @@ class TkApp:
         self._interaction_generation = 0
         self._interaction_pending = False
         self._interaction_mutating = False
+        self._activity_generation = 0
+        self._activity_pending = False
+        self._activity_mutating = False
+        self._activity_rows: dict[str, dict] = {}
+        self._works_generation = 0
         self._api_probe_generation = 0
         self._log_entries: list[tuple[str, str]] = []  # (level, text)
         self._toggles: list = []  # (canvas, oval, var, on_color, on_toggle)
@@ -86,7 +91,7 @@ class TkApp:
         self._pump()
         self._sync_settings_from_runtime()
         self._refresh_api_indicator()
-        self._log_msg("苏晚 v3 已启动 · 交流偏好、API、模型与声音可在“设置”页调整", "info")
+        self._log_msg("苏晚 v4 已启动 · 状态板可查看活动、暂停后台任务与核对调用预算", "info")
         for warning in getattr(runtime.settings, "configuration_warnings", ()):
             self._log_msg(warning, "warn")
         for warning in getattr(runtime, "startup_warnings", ()):
@@ -173,15 +178,177 @@ class TkApp:
         canvas = tk.Frame(self._tab_status, bg=PANEL)
         canvas.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
         self.status_text = tk.StringVar(value="（读取中…）")
-        tk.Label(canvas, textvariable=self.status_text, justify="left", anchor="nw", font=("Cascadia Mono", 10), fg=FG, bg=PANEL).pack(fill=tk.BOTH, expand=True)
+        self.status_area = self._scrolled(canvas)
+        self.status_area.configure(height=1, state="disabled", font=("Cascadia Mono", 9))
+        self.status_area.pack(fill=tk.BOTH, expand=True)
         self.personality_text = tk.StringVar(value="人格说明：正在读取…")
         tk.Label(canvas, textvariable=self.personality_text, justify="left", anchor="w", wraplength=880,
-                 font=("Microsoft YaHei UI", 9), fg=ACCENT, bg=PANEL).pack(fill=tk.X, pady=(8, 6))
+                 font=("Microsoft YaHei UI", 8), fg=ACCENT, bg=PANEL).pack(fill=tk.X, pady=(6, 4))
         self._label(canvas, "关系变化（来源可在“记忆”页按 ID 查看）", color=SUB, bg=PANEL).pack(anchor="w")
         self.relation_details = self._scrolled(canvas)
-        self.relation_details.configure(height=6, state="disabled")
+        self.relation_details.configure(height=3, state="disabled")
         self.relation_details.pack(fill=tk.X, pady=(4, 0))
-        self._label(canvas, "状态板为只读视图，每 2s 刷新", color="#5f6670", size=8).pack(anchor="w", pady=(8, 0))
+        self._build_activity_surface(canvas)
+
+    def _build_activity_surface(self, parent) -> None:
+        frame = tk.LabelFrame(parent, text="活动与调用预算", bg=PANEL, fg=ACCENT,
+                              font=("Microsoft YaHei UI", 9))
+        frame.pack(fill=tk.X, pady=(8, 0))
+        self.activity_budget = tk.StringVar(value="正在读取调用账目…")
+        tk.Label(frame, textvariable=self.activity_budget, justify="left", anchor="w", wraplength=860,
+                 font=("Microsoft YaHei UI", 8), bg=PANEL, fg=SUB).pack(fill=tk.X, padx=6, pady=(3, 2))
+        self.activity_tree = ttk.Treeview(frame, columns=("action", "status", "phase"), show="headings", height=2)
+        for key, label, width in (("action", "活动", 160), ("status", "状态", 100), ("phase", "阶段", 230)):
+            self.activity_tree.heading(key, text=label)
+            self.activity_tree.column(key, width=width, stretch=True)
+        self.activity_tree.pack(fill=tk.X, padx=6)
+        self.activity_tree.bind("<<TreeviewSelect>>", self._activity_selected)
+        self.activity_detail = tk.StringVar(value="选择活动可查看原因与稳定 ID。")
+        self.activity_detail_area = self._scrolled(frame)
+        self.activity_detail_area.configure(height=3, font=("Microsoft YaHei UI", 8), pady=2, state="disabled")
+        self.activity_detail_area.pack(fill=tk.X, padx=6, pady=3)
+        self.activity_detail.trace_add("write", self._update_activity_detail)
+        self._update_activity_detail()
+        row = tk.Frame(frame, bg=PANEL)
+        row.pack(fill=tk.X, padx=6, pady=(0, 5))
+        self.activity_pause_button = ttk.Button(row, text="暂停活动", command=lambda: self._request_activities("pause"))
+        self.activity_pause_button.pack(side=tk.LEFT)
+        self.activity_resume_button = ttk.Button(row, text="恢复活动", command=lambda: self._request_activities("resume"))
+        self.activity_resume_button.pack(side=tk.LEFT, padx=4)
+        self.activity_continue_button = ttk.Button(row, text="继续所选", command=lambda: self._activity_action("continue"))
+        self.activity_continue_button.pack(side=tk.LEFT)
+        self.activity_like_button = ttk.Button(row, text="喜欢话题", command=lambda: self._activity_action("like"))
+        self.activity_like_button.pack(side=tk.LEFT, padx=4)
+        self.activity_dislike_button = ttk.Button(row, text="少聊话题", command=lambda: self._activity_action("dislike"))
+        self.activity_dislike_button.pack(side=tk.LEFT)
+        self.activity_discard_button = ttk.Button(row, text="取消未完成", command=lambda: self._activity_action("discard"))
+        self.activity_discard_button.pack(side=tk.LEFT, padx=4)
+        self._activity_controls = [self.activity_pause_button, self.activity_resume_button, self.activity_continue_button,
+                                   self.activity_like_button, self.activity_dislike_button, self.activity_discard_button]
+
+    def _update_activity_detail(self, *_args) -> None:
+        self.activity_detail_area.configure(state="normal")
+        self.activity_detail_area.delete("1.0", tk.END)
+        self.activity_detail_area.insert(tk.END, self.activity_detail.get())
+        self.activity_detail_area.configure(state="disabled")
+
+    def _activity_selected(self, _event=None) -> None:
+        selected = self.activity_tree.selection()
+        row = self._activity_rows.get(selected[0]) if selected else None
+        if row is None:
+            self.activity_detail.set("选择活动可查看原因与稳定 ID。")
+            return
+        reason = str(row.get("reason", "暂无原因"))[:140]
+        calendar_entry = row.get("action") in {"diary", "story"}
+        self.activity_detail.set(f"{reason}\nID：{row.get('id', '')}" +
+                                 (f" · {str(row['error'])[:80]}" if row.get("error") else "") +
+                                 ("\n请求可能已经发送，不自动重发。" +
+                                  ("当日日历记录保留占位，此处仅查看。" if calendar_entry else
+                                   "可取消解除活动等待；已占用调用额度不会返还。")
+                                  if row.get("status") == "unknown" else ""))
+
+    def _activity_action(self, action: str) -> None:
+        selected = self.activity_tree.selection()
+        if not selected:
+            self.activity_detail.set("请先选择一项活动。")
+            return
+        row = self._activity_rows.get(selected[0], {})
+        if row.get("action") in {"diary", "story"}:
+            self.activity_detail.set("日历记录在此处仅供查看；当天已占位，不自动补发。")
+            return
+        if action == "discard" and row.get("status") not in {"active", "paused", "failed", "unknown"}:
+            self.activity_detail.set("只能取消未完成活动，已完成成果保留。")
+            return
+        self._request_activities(action, selected[0])
+
+    def _request_activities(self, action: str | None = None, activity_id: str | None = None) -> None:
+        if self._closing or not hasattr(self, "activity_tree"):
+            return
+        if self._activity_pending and (action is None or self._activity_mutating):
+            return
+        self._activity_generation += 1
+        generation = self._activity_generation
+        self._activity_pending = True
+        self._activity_mutating = action is not None
+        if action is not None:
+            for control in self._activity_controls:
+                control.configure(state="disabled")
+        try:
+            future = (self.server.activity_command(action, activity_id) if action is not None else self.server.activity_view())
+        except (RuntimeError, AttributeError) as exc:
+            self._activity_pending = self._activity_mutating = False
+            self.activity_detail.set(f"活动操作失败：{type(exc).__name__}")
+            for control in self._activity_controls:
+                control.configure(state="normal")
+            return
+
+        def done(fut):
+            try:
+                result = fut.result()
+            except Exception as exc:
+                result = {"ok": False, "text": f"活动操作失败：{type(exc).__name__}"}
+            self._queue_ui(self._render_activities, result, generation, action is not None)
+        future.add_done_callback(done)
+
+    def _render_activities(self, result: dict, generation: int, changed: bool = False) -> None:
+        if self._closing or generation != self._activity_generation:
+            return
+        self._activity_pending = self._activity_mutating = False
+        for control in self._activity_controls:
+            control.configure(state="normal")
+        epoch = result.get("_context_epoch")
+        if epoch is not None and not self.server.context_current(epoch):
+            self._request_activities()
+            return
+        if epoch is None or "activities" not in result:
+            self.activity_detail.set(result.get("text", "活动视图缺少来源版本，已忽略。"))
+            if changed:
+                self._request_activities()
+            return
+        selected = self.activity_tree.selection()
+        rows = result.get("activities", [])
+        self._activity_rows = {str(row["id"]): dict(row) for row in rows if isinstance(row, dict) and row.get("id")}
+        self.activity_tree.delete(*self.activity_tree.get_children())
+        labels = {"learning": "学习", "creation": "创作", "social": "交流", "reminisce": "回忆", "idle": "休息", "diary": "日记", "story": "生活记录"}
+        statuses = {"active": "进行中", "paused": "已暂停", "unknown": "结果未知", "failed": "失败", "completed": "已完成", "cancelled": "已取消",
+                    "reserved": "已预留", "in_flight": "请求在途", "running": "整理中", "legacy_completed": "旧版已完成"}
+        phases = {"intention": "形成意图", "topic": "确定主题", "draft": "草稿已保存", "saved": "成果已保存", "feedback": "记录完成反馈", "done": "结束",
+                  "model": "模型整理", "local_fallback": "本地整理", "legacy": "旧版记录"}
+        for activity_id, row in self._activity_rows.items():
+            action = row.get("action", row.get("kind", "活动"))
+            status, phase = row.get("status", ""), row.get("phase", "")
+            self.activity_tree.insert("", "end", iid=activity_id, values=(labels.get(action, action), statuses.get(status, status), phases.get(phase, phase)))
+        if selected and selected[0] in self._activity_rows:
+            self.activity_tree.selection_set(selected[0])
+        self._activity_selected()
+        if result.get("text"):
+            self.activity_detail.set(str(result["text"])[:200])
+        self.activity_budget.set(self._budget_description(result.get("budget", {}), bool(result.get("paused")), result.get("proactive", {})))
+
+    @staticmethod
+    def _budget_description(budget: dict, paused: bool, proactive: dict | None = None) -> str:
+        def count(value):
+            return "未知" if value is None else str(value)
+        usage = budget.get("known_actual_usage", {})
+        description = (f"后台：{'暂停' if paused else '可运行'} · {budget.get('day', '')} · 调用分配 {count(budget.get('used_calls'))}/{count(budget.get('daily_calls'))} · "
+                       f"完成 {count(budget.get('completed_calls'))} / 预留 {count(budget.get('reserved_calls'))} / 在途 {count(budget.get('in_flight_calls'))} / 结果未知 {count(budget.get('today_unknown_calls'))}\n"
+                       f"文本输出分配 {count(budget.get('allocated_output_tokens'))}/{count(budget.get('daily_output_tokens'))}（预留 {count(budget.get('reserved_output_tokens'))}）；"
+                       f"已知实际输出 {count(usage.get('completion_tokens'))}，用量未知 {count(budget.get('actual_output_unknown_calls'))} 次；非总 token / 费用预算。")
+        if budget.get("ledger_error"):
+            description += "\n账本写保护：新调用已阻止。"
+        if proactive:
+            description += (f"\n主动消息已认领 {count(proactive.get('claimed'))}/{count(proactive.get('limit'))}；"
+                            f"安静时段 {count(proactive.get('quiet_start'))}:00—{count(proactive.get('quiet_end'))}:00。")
+        return description
+
+    def _clear_activity_view(self) -> None:
+        self._activity_generation += 1
+        self._activity_pending = self._activity_mutating = False
+        self._activity_rows.clear()
+        self.activity_tree.delete(*self.activity_tree.get_children())
+        self.activity_detail.set("来源已变更，正在刷新活动。")
+        self.activity_budget.set("正在重新读取调用账目…")
+        self._request_activities()
 
     def _build_memory(self) -> None:
         head = tk.Frame(self._tab_memory, bg=PANEL)
@@ -520,6 +687,10 @@ class TkApp:
         self.initiative_var.set("")
         self.interaction_state.set("记忆或偏好已变更，正在读取…")
         self.status_text.set("状态已变更，正在刷新…")
+        self.status_area.configure(state="normal")
+        self.status_area.delete("1.0", tk.END)
+        self.status_area.insert(tk.END, self.status_text.get())
+        self.status_area.configure(state="disabled")
         self.personality_text.set("人格说明：正在读取…")
         self.relation_details.configure(state="normal")
         self.relation_details.delete("1.0", tk.END)
@@ -982,6 +1153,8 @@ class TkApp:
         self._last_reply, self._last_reply_epoch = "", None
         self._stop_speaking()
         self._clear_interaction_view()
+        self._clear_activity_view()
+        self._clear_works_view()
         self.chat_area.configure(state="normal")
         self.chat_area.delete("1.0", tk.END)
         self.chat_area.configure(state="disabled")
@@ -996,6 +1169,7 @@ class TkApp:
     def _schedule_views(self) -> None:
         self._refresh_status()
         self._request_interaction()
+        self._request_activities()
         self._refresh_files()
         self._after(2000, self._schedule_views)
 
@@ -1017,23 +1191,39 @@ class TkApp:
             for g in status["goals"]["goals"]:
                 line += f"  • {g['name']}（{g['progress']:.0f}/{g['target']:.0f}）\n"
             self.status_text.set(line)
+            self.status_area.configure(state="normal")
+            self.status_area.delete("1.0", tk.END)
+            self.status_area.insert(tk.END, line)
+            self.status_area.configure(state="disabled")
             self._sync_toggle_dots()  # 联网/自动朗读圆点颜色跟随（每 2s 刷新）
         except Exception as exc:  # noqa: BLE001
             self.status_text.set(f"（状态读取失败：{type(exc).__name__} {str(exc)[:60]}）")
 
     def _refresh_files(self) -> None:
         try:
+            self._sync_ui_context()
+            epoch = self._ui_context_epoch
             data_dir = self.server.runtime.settings.data_dir
             works = sorted((data_dir / "作品集").glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
             names = [w.name for w in works[:40]]
             current = list(self.works_list.get(0, tk.END))
+            selection = self.works_list.curselection()
+            selected = self.works_list.get(selection[0]) if selection else None
+            if not self.server.context_current(epoch):
+                self._sync_ui_context()
+                return
             if names != current:
                 self.works_list.delete(0, tk.END)
                 for n in names:
                     self.works_list.insert(tk.END, n)
-                if names and not self.works_list.curselection():
-                    self.works_list.selection_set(0)
-                    self._preview_works(works[0])
+            if names:
+                index = names.index(selected) if selected in names else 0
+                self.works_list.selection_clear(0, tk.END)
+                self.works_list.selection_set(index)
+                # A filename can stay unchanged when its source or body changes.
+                self._preview_works(works[index], expected_epoch=epoch)
+            else:
+                self._clear_works_preview()
             story = data_dir / "story.txt"
             if story.exists():
                 lines = story.read_text(encoding="utf-8").splitlines()[-60:]
@@ -1042,22 +1232,56 @@ class TkApp:
                 self.story_area.insert(tk.END, "\n".join(lines))
                 self.story_area.configure(state="disabled")
         except Exception as exc:  # noqa: BLE001
+            self._clear_works_preview()
             self._log_msg(f"文件视图异常：{type(exc).__name__} {str(exc)[:60]}", "warn")
 
     def _on_works_select(self, _event=None) -> None:
+        self._sync_ui_context()
         sel = self.works_list.curselection()
         if not sel:
+            self._clear_works_preview()
             return
         name = self.works_list.get(sel[0])
         path = self.server.runtime.settings.data_dir / "作品集" / name
-        if path.exists():
-            self._preview_works(path)
+        self._preview_works(path, expected_epoch=self._ui_context_epoch)
 
-    def _preview_works(self, path) -> None:
+    def _clear_works_preview(self) -> None:
+        self._works_generation += 1
+        self.works_preview.configure(state="normal")
+        self.works_preview.delete("1.0", tk.END)
+        self.works_preview.configure(state="disabled")
+
+    def _clear_works_view(self) -> None:
+        self._clear_works_preview()
+        self.works_list.delete(0, tk.END)
+
+    def _work_selected(self, path: Path) -> bool:
+        selection = self.works_list.curselection()
+        return bool(selection) and path == (self.server.runtime.settings.data_dir / "作品集"
+                                            / self.works_list.get(selection[0]))
+
+    def _preview_works(self, path, *, expected_epoch=None) -> None:
+        epoch = self._ui_context_epoch if expected_epoch is None else expected_epoch
+        self._works_generation += 1
+        self._render_works_preview(Path(path), epoch, self._works_generation)
+
+    def _render_works_preview(self, path: Path, epoch, generation: int) -> None:
+        if self._closing or not self.server.context_current(epoch):
+            self._sync_ui_context()
+            return
+        if generation != self._works_generation or not self._work_selected(path):
+            return
         try:
             content = path.read_text(encoding="utf-8")[:2000]
-        except OSError:
-            content = "（读取失败）"
+        except (OSError, UnicodeError):
+            self._clear_works_preview()
+            return
+        # The runtime can revoke the source while this UI thread reads the file.
+        if not self.server.context_current(epoch):
+            self._sync_ui_context()
+            return
+        if generation != self._works_generation or not self._work_selected(path):
+            return
         self.works_preview.configure(state="normal")
         self.works_preview.delete("1.0", tk.END)
         self.works_preview.insert(tk.END, content)

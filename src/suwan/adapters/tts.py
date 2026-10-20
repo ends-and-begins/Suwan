@@ -11,6 +11,7 @@ from pathlib import Path
 
 from suwan.adapters.artifacts import create_artifact
 from suwan.clock import Clock, RealClock
+from suwan.calls import CallDenied
 from suwan.config import ENDPOINT_ENV, Settings
 
 TTS_MODEL = "mimo-v2.5-tts"
@@ -32,6 +33,7 @@ class TTSClient:
         self._active = True
         self._api_enabled = True
         self._generation = 0
+        self.call_manager = None
 
     def set_active(self, active: bool) -> None:
         with self._lifecycle_guard:
@@ -65,7 +67,7 @@ class TTSClient:
             self._client = OpenAI(api_key=self.api_key, base_url=self.base_url, max_retries=0, timeout=TTS_TIMEOUT_SECONDS)
         return self._client
 
-    def synthesize(self, text: str, voice: str = "mimo_default", save_dir=None, *, cancelled: threading.Event | None = None, expected_generation: int | None = None) -> tuple[str | None, str | None]:
+    def synthesize(self, text: str, voice: str = "mimo_default", save_dir=None, *, cancelled: threading.Event | None = None, expected_generation: int | None = None, priority: int = 0, source: str = "tts", call_key: str | None = None) -> tuple[str | None, str | None]:
         """合成语音到独立 wav；返回 (filepath, None) 或 (None, error)。"""
         clean_text = text.strip()
         if not clean_text:
@@ -85,15 +87,27 @@ class TTSClient:
             with self._lifecycle_guard:
                 if not self._active or not self._api_enabled or generation != self._generation or (cancelled is not None and cancelled.is_set()):
                     return None, "API 已关闭或语音请求已取消"
-            response = client.chat.completions.create(
-                model=TTS_MODEL,
-                messages=[
-                    {"role": "user", "content": "语速适中，温柔自然，像一个正在认真和你聊天的人，不要机械感"},
-                    {"role": "assistant", "content": clean_text},
-                ],
-                audio={"format": "wav", "voice": voice},
-                timeout=TTS_TIMEOUT_SECONDS,
-            )
+            def allowed():
+                with self._lifecycle_guard:
+                    return self._active and self._api_enabled and generation == self._generation and (cancelled is None or not cancelled.is_set())
+
+            def send():
+                return client.chat.completions.create(
+                    model=TTS_MODEL,
+                    messages=[
+                        {"role": "user", "content": "语速适中，温柔自然，像一个正在认真和你聊天的人，不要机械感"},
+                        {"role": "assistant", "content": clean_text},
+                    ],
+                    audio={"format": "wav", "voice": voice},
+                    timeout=TTS_TIMEOUT_SECONDS,
+                )
+
+            if self.call_manager is None:
+                response = send()
+            else:
+                response = self.call_manager.run(send, kind="tts", provider="mimo", model=TTS_MODEL,
+                    max_output_tokens=None, priority=priority, source=source, call_key=call_key,
+                    cancelled=cancelled, allowed=allowed)
             audio_b64 = response.choices[0].message.audio.data
             audio = base64.b64decode(audio_b64, validate=True)
             if not audio:
@@ -105,6 +119,8 @@ class TTSClient:
                 timestamp = self._clock.now().strftime("%Y%m%d_%H%M%S")
                 path = create_artifact(target, f"reply_{timestamp}", ".wav", audio)
                 return str(path), None
+        except CallDenied as exc:
+            return None, f"语音请求未发送: {exc.reason}"
         except Exception as exc:  # noqa: BLE001
             return None, f"语音合成异常: {exc}"
 

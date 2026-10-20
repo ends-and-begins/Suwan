@@ -1,8 +1,8 @@
-# 苏晚 v3 —— 人格、交流偏好与有来源的关系
+# 苏晚 v4 —— 有连续性的主动生活
 
-> 状态：2026-10-17 第三版8项严格审查问题已补修：411测试、六项离线门禁及冻结20个互动场景通过；补齐生成来源与历史生成隔离、搜索发送前撤销、旧关系迁移去重、状态读取缓存、低频实际交付和界面回调保护。固定记忆检索 Top-3 为20/20、Top-1为14/20。真实接口、声卡、人工自然度和长期运行尚未验证。
+> 状态：2026-10-18 第四版本地实现与验收完成：550测试、六项离线门禁通过。增加可恢复活动、共享调用预算、主动消息日限额与安静时段、按日期去重的日记/故事，以及活动控制入口。保留第三版411项测试和冻结记忆/互动题集；固定记忆检索 Top-3 为20/20、Top-1为14/20。24小时虚拟时钟模拟通过；真实接口、声卡、人工自然度和真实长期运行尚未验证。
 > 本项目承接旧版模块拆分代码，采用 **asyncio 事件总线 + 器官(organ) 架构**。
-> 当前实现与限制见 [第三版补修报告](docs/round3-fix-report.md)、[第三版报告](docs/round3-report.md)、[人格与交流使用说明](docs/personality-v3.md)、[第三版设计](docs/round3-design.md)。记忆沿用 [记忆使用与升级说明](docs/memory-v2.md)；此前验证见 [第二版补修报告](docs/round2-fix-report.md)、[第二版验收报告](docs/round2-report.md)、[第一版严格审查修复报告](docs/review-fix-report.md)和 [第一轮验收报告](docs/round1-report.md)，后续目标见 [阶段性迭代计划](docs/iteration-plan.md)。
+> 当前实现与限制见 [第四版验收报告](docs/round4-report.md)、[活动、预算与恢复说明](docs/activities-v4.md)和 [第四版设计](docs/round4-design.md)。人格与记忆沿用 [人格与交流说明](docs/personality-v3.md)、[记忆使用与升级说明](docs/memory-v2.md)。历史验证见 [第三版补修报告](docs/round3-fix-report.md)、[第三版报告](docs/round3-report.md)、[第二版补修报告](docs/round2-fix-report.md)、[第二版验收报告](docs/round2-report.md)、[第一版严格审查修复报告](docs/review-fix-report.md)和 [第一轮验收报告](docs/round1-report.md)，后续目标见 [阶段性迭代计划](docs/iteration-plan.md)。
 
 ## 历史重构路线（详见 docs/milestones.md；下列勾选为历史记录）
 - M0 规划/基线盘点 ✅
@@ -34,6 +34,9 @@ python scripts/acceptance_round2_ui.py --output memory-ui-result.json
 # 第三版冻结20个互动约束场景（本地运行时与假模型提示词）
 python scripts/acceptance_round3.py --output interaction-result.json
 
+# 第四版：24小时虚拟时钟模拟、请求中进程强退与重启记账（假SDK）
+python scripts/acceptance_round4.py --output activity-result.json
+
 # 交互 REPL（含 /tts <话> /voice <名> /api /net /doc /status /cfg）
 $env:PYTHONPATH="src"; python -m suwan.frontends.repl --home <数据目录>
 
@@ -55,6 +58,7 @@ pip install -e ".[dev]"
 > 同一 `<home>/v2` 目录只允许一个运行实例。关键数据损坏时拒绝启动并保留原件；恢复步骤见验收报告。
 > 分享文件确认记忆落盘后移入 `<home>/share/.processed/`，失败保留原件。第一轮已暂停破坏性记忆压缩。
 > GUI“记忆”页或 REPL `/memory help` 可查看、搜索、设置、纠正、遗忘及暂停。旧列表首次升级前保留原字节副本；旧代码不能直接读取新版记忆文件。
+> 状态页可查看与控制活动；REPL 支持 `/activities`、`/pause`、`/resume`、`/continue ID`、`/discard ID`。外部调用默认每日40次，文本输出累计预留32768；主动展示每日最多8条、22点至次日8点安静。预留不等于实际token或费用，详细配置和回退规则见第四版使用说明。
 > `docs/reference/` 只保留盘点清单（`suwan23-inventory.md`/`suwan-mvp-inventory.md`）；
 > 历史源码可在当前工作区上级目录的 `suwan project`、`suwan_project 模块拆分`、`suwan_mvp` 查阅。
 

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from suwan.adapters.filestore import append_line
 from suwan.clock import Clock, RealClock
+from suwan.calls import CallDenied
 from suwan.config import KEYLESS_PROVIDERS, Settings
 
 LLM_TIMEOUT_SECONDS = 30.0
@@ -34,6 +35,7 @@ class LLMClient:
         self._lifecycle_guard = threading.RLock()
         self._active = True
         self._generation = 0
+        self.call_manager = None  # runtime 注入；独立离线替身仍可使用旧接口
 
     def set_active(self, active: bool) -> None:
         """停止后禁止线程迟到结果写日志；代数区分同一runtime的后续启动。"""
@@ -100,7 +102,7 @@ class LLMClient:
             except OSError:  # noqa: BLE001
                 self._log.warning("API 用量日志写入失败: %s", self.api_log_file)
 
-    def chat(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None, *, expected_generation: int | None = None, cancelled: threading.Event | None = None) -> str | None:
+    def chat(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None, *, expected_generation: int | None = None, cancelled: threading.Event | None = None, priority: int = 0, source: str = "chat", call_key: str | None = None, raise_on_denied: bool = False) -> str | None:
         with self._lifecycle_guard:
             if not self._active or (cancelled is not None and cancelled.is_set()):
                 return None
@@ -109,30 +111,50 @@ class LLMClient:
                 return None
             # GUI 可在请求进行中切换模型，网络参数和审计必须共用同一快照。
             provider, model = self.provider, self.model
-            tokens = max_tokens or self.default_max_tokens
+            tokens = self.default_max_tokens if max_tokens is None else max_tokens
+            if type(tokens) is not int or tokens <= 0:
+                if raise_on_denied:
+                    raise CallDenied("invalid_request")
+                return None
             call_id = str(uuid.uuid4())
         try:
             client = self._get_client()
             if client is None:
                 return None
+            def allowed():
+                with self._lifecycle_guard:
+                    return self._active and generation == self._generation and (cancelled is None or not cancelled.is_set())
+
             with self._lifecycle_guard:
                 # 这是请求的发送授权边界。初始化/排队期间已撤销的提示词
                 # 不进入 SDK；授权后已在途的外部请求不能由本地取消撤回。
                 if not self._active or generation != self._generation or (cancelled is not None and cancelled.is_set()):
                     return None
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                temperature=0.85,
-                max_tokens=tokens,
-                timeout=LLM_TIMEOUT_SECONDS,
-            )
+            def send():
+                return client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                    temperature=0.85,
+                    max_tokens=tokens,
+                    timeout=LLM_TIMEOUT_SECONDS,
+                )
+
+            if self.call_manager is None:
+                resp = send()
+            else:
+                resp = self.call_manager.run(send, kind="llm", provider=provider, model=model,
+                    max_output_tokens=tokens, priority=priority, source=source, call_key=call_key,
+                    cancelled=cancelled, allowed=allowed)
             text = (resp.choices[0].message.content or "").strip() or None
             with self._lifecycle_guard:
                 if not self._active or self._generation != generation or (cancelled is not None and cancelled.is_set()):
                     return None
                 self._log_call(success=True, system_prompt=system_prompt, user_prompt=user_prompt, response=text or "", max_tokens=tokens, generation=generation, provider=provider, model=model, call_id=call_id)
             return text
+        except CallDenied:
+            if raise_on_denied:
+                raise
+            return None
         except Exception as exc:  # noqa: BLE001 任何失败都降级
             self._log.warning("LLM 调用失败(%s/%s): %s", provider, model, type(exc).__name__)
             if cancelled is None or not cancelled.is_set():

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "seed": 20261017,
+  "duration_hours": 24,
+  "frozen_before_implementation": true,
+  "cases": [
+    {"id":"R4-01","case":"24h simulation","expect":"proactive <= daily limit; none during quiet hours; unique notification IDs"},
+    {"id":"R4-02","case":"reason and terminal states","expect":"each started activity has reason, stable ID and inspectable state"},
+    {"id":"R4-03","case":"foreground over queued background","expect":"foreground sends before queued background; no executor starvation"},
+    {"id":"R4-04","case":"user interrupts multi-step work","expect":"saved phase survives; no new background sends during foreground hold"},
+    {"id":"R4-05","case":"pause restart resume","expect":"stable activity ID and draft reused"},
+    {"id":"R4-06","case":"near-budget process exit in flight","expect":"restart retains unknown allocations; new send cannot exceed limits"},
+    {"id":"R4-07","case":"daily output reservation","expect":"sent max_tokens charged even when completion short or missing"},
+    {"id":"R4-08","case":"SDK retries","expect":"max_retries=0 and physical sends counted once each"},
+    {"id":"R4-09","case":"missing provider usage","expect":"actual usage unknown, never copied from requested max_tokens"},
+    {"id":"R4-10","case":"corrupt or unwritable ledger","expect":"no external send; preserve source file and local chat"},
+    {"id":"R4-11","case":"late worker after close","expect":"cannot overwrite a new runtime ledger"},
+    {"id":"R4-12","case":"artifact committed before activity checkpoint","expect":"recover one identical artifact; no repeated generation"},
+    {"id":"R4-13","case":"goal duplicate completion","expect":"one durable progress receipt"},
+    {"id":"R4-14","case":"notification duplicate and restart","expect":"at most one claim per stable result ID"},
+    {"id":"R4-15","case":"failed work","expect":"no success progress"},
+    {"id":"R4-16","case":"forget source while awaiting","expect":"clear linked draft and reject delayed result"},
+    {"id":"R4-17","case":"feedback","expect":"bounded short-term selection influence; no permanent interest rewrite"},
+    {"id":"R4-18","case":"calendar restart same day","expect":"one diary and story; recover committed artifact"},
+    {"id":"R4-19","case":"offline days and date rollover","expect":"only current day; no backlog of external calls"},
+    {"id":"R4-20","case":"quiet and low initiative","expect":"queued stale notifications rejected; no restart quota reset"},
+    {"id":"R4-21","case":"API disabled before queued send","expect":"zero queued physical sends after invalidation"},
+    {"id":"R4-22","case":"TTS accounting","expect":"same daily call quota; no fictitious audio output-token hard cap"},
+    {"id":"R4-23","case":"actual Tk status controls","expect":"seven tabs; activity pause/resume and privacy-safe late callbacks"},
+    {"id":"R4-24","case":"actual REPL and old regressions","expect":"activity controls work; previous 411 tests and frozen scenarios pass"}
+  ]
+}

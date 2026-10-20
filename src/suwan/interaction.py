@@ -216,14 +216,18 @@ class InteractionContext:
             return False
         return self.initiative != "low" or self.clock.monotonic() - self._last_proactive_mono >= LOW_CONTACT_SECONDS
 
-    def notification_token(self, *, source_generation: int | None = None) -> dict | None:
+    def notification_token(self, *, source_generation: int | None = None, notification_key=None) -> dict | None:
         generation = self.organs["memory"].privacy_generation
         if source_generation is not None and (type(source_generation) is not int or source_generation != generation):
             return None
         if not self.can_notify():
             return None
+        ledger = getattr(self, "notification_ledger", None)
+        claim = ledger.claim(notification_key) if ledger is not None else {}
+        if claim is None:
+            return None
         self._last_proactive_mono = self.clock.monotonic()
-        return {"proactive": True, "show_proactive": True,
+        return {**claim, "proactive": True, "show_proactive": True,
                 "policy_revision": self._revision(), "issued_at": self._last_proactive_mono,
                 "delivery_interval": LOW_CONTACT_SECONDS if self.initiative == "low" else 0.0,
                 "source_generation": generation, "context_ts": event_timestamp()}
@@ -231,7 +235,8 @@ class InteractionContext:
     def notification_data(self, text: str, *, source_generation: int | None = None, **extra) -> dict:
         generation = self.organs["memory"].privacy_generation
         stale = source_generation is not None and (type(source_generation) is not int or source_generation != generation)
-        token = self.notification_token(source_generation=source_generation)
+        token = self.notification_token(source_generation=source_generation,
+                                        notification_key=extra.get("activity_id") or extra.get("calendar_id"))
         # 即使安静模式只保留内部独白，也必须携带正文构造水位，不能晚发布后回填。
         return {**extra, "text": "" if stale else text, "context_ts": event_timestamp(),
                 "source_generation": generation if source_generation is None else source_generation,
@@ -241,6 +246,9 @@ class InteractionContext:
         """队列交付时再次检查；已经发出的文本不能在改偏好后重新冒出来。"""
         if not data.get("proactive"):
             return True
+        ledger = getattr(self, "notification_ledger", None)
+        if ledger is not None and not ledger.current(data):
+            return False
         return (data.get("show_proactive") is True and data.get("policy_revision") == self._revision()
                 and type(data.get("source_generation")) is int
                 and data["source_generation"] == self.organs["memory"].privacy_generation
