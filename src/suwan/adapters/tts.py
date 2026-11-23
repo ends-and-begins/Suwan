@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import base64
 import threading
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from suwan.adapters.artifacts import create_artifact
 from suwan.clock import Clock, RealClock
 from suwan.calls import CallDenied
 from suwan.config import ENDPOINT_ENV, Settings
+from suwan.adapters.http_chat import HTTPChatClient, HTTPChatError, decode_response_audio, describe_api_error
 
 TTS_MODEL = "mimo-v2.5-tts"
 TTS_TIMEOUT_SECONDS = 30.0
@@ -30,6 +30,8 @@ class TTSClient:
         self._clock = clock or RealClock()
         self._client = None
         self._lifecycle_guard = threading.RLock()
+        self._write_condition = threading.Condition(self._lifecycle_guard)
+        self._pending_writes = 0
         self._active = True
         self._api_enabled = True
         self._generation = 0
@@ -56,18 +58,52 @@ class TTSClient:
         with self._lifecycle_guard:
             self._generation += 1
 
+    def wait_for_writes(self) -> None:
+        """Drain authorized file writes and disposal off the owner loop.
+
+        Deactivate first; an in-flight network request then cannot authorize
+        a new artifact after this boundary has returned.
+        """
+        with self._write_condition:
+            self._write_condition.wait_for(lambda: self._pending_writes == 0)
+
+    def discard_artifact(self, path: str, *, background: bool = False) -> None:
+        """Remove an unclaimed result; register disposal before dispatching it."""
+        with self._write_condition:
+            self._pending_writes += 1
+        def remove():
+            try:
+                Path(path).unlink(missing_ok=True)
+            finally:
+                with self._write_condition:
+                    self._pending_writes -= 1
+                    self._write_condition.notify_all()
+        if background:
+            try:
+                threading.Thread(target=remove, name="suwan-audio-discard", daemon=True).start()
+            except BaseException:
+                with self._write_condition:
+                    self._pending_writes -= 1
+                    self._write_condition.notify_all()
+                raise
+        else:
+            remove()
+
     @property
     def available(self) -> bool:
         return bool(self.api_key)
 
     def _get_client(self):
         if self._client is None and self.available:
-            from openai import OpenAI  # 延迟导入
-
-            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url, max_retries=0, timeout=TTS_TIMEOUT_SECONDS)
+            try:
+                from openai import OpenAI  # 可选；标准库后备同样支持 MiMo 音频字段
+            except ImportError:
+                self._client = HTTPChatClient(api_key=self.api_key, base_url=self.base_url, timeout=TTS_TIMEOUT_SECONDS)
+            else:
+                self._client = OpenAI(api_key=self.api_key, base_url=self.base_url, max_retries=0, timeout=TTS_TIMEOUT_SECONDS)
         return self._client
 
-    def synthesize(self, text: str, voice: str = "mimo_default", save_dir=None, *, cancelled: threading.Event | None = None, expected_generation: int | None = None, priority: int = 0, source: str = "tts", call_key: str | None = None) -> tuple[str | None, str | None]:
+    def synthesize(self, text: str, voice: str = "mimo_default", save_dir=None, *, cancelled: threading.Event | None = None, expected_generation: int | None = None, priority: int = 0, source: str = "tts", call_key: str | None = None, on_artifact=None) -> tuple[str | None, str | None]:
         """合成语音到独立 wav；返回 (filepath, None) 或 (None, error)。"""
         clean_text = text.strip()
         if not clean_text:
@@ -108,8 +144,11 @@ class TTSClient:
                 response = self.call_manager.run(send, kind="tts", provider="mimo", model=TTS_MODEL,
                     max_output_tokens=None, priority=priority, source=source, call_key=call_key,
                     cancelled=cancelled, allowed=allowed)
-            audio_b64 = response.choices[0].message.audio.data
-            audio = base64.b64decode(audio_b64, validate=True)
+            try:
+                audio_b64 = response.choices[0].message.audio.data
+            except (AttributeError, IndexError, KeyError, TypeError):
+                raise HTTPChatError("invalid_response") from None
+            audio = decode_response_audio(audio_b64)
             if not audio:
                 return None, "语音接口返回空音频"
             with self._lifecycle_guard:
@@ -117,12 +156,32 @@ class TTSClient:
                     return None, "运行时已停止，语音结果已取消"
                 target = save_dir if save_dir else Path("audio_output")
                 timestamp = self._clock.now().strftime("%Y%m%d_%H%M%S")
+                self._pending_writes += 1
+            path = None
+            try:
                 path = create_artifact(target, f"reply_{timestamp}", ".wav", audio)
+                # fsync/publication must not hold the API/lifecycle short lock.
+                # A cancellation during either stage owns disposal as well.
+                if not allowed():
+                    path.unlink(missing_ok=True)
+                    return None, "运行时已停止或语音请求已取消"
+                if on_artifact is not None:
+                    # Transfer cleanup responsibility before the writer drain
+                    # can observe zero, covering result/future delivery races.
+                    on_artifact(str(path))
                 return str(path), None
+            except BaseException:
+                if path is not None:
+                    path.unlink(missing_ok=True)
+                raise
+            finally:
+                with self._write_condition:
+                    self._pending_writes -= 1
+                    self._write_condition.notify_all()
         except CallDenied as exc:
             return None, f"语音请求未发送: {exc.reason}"
         except Exception as exc:  # noqa: BLE001
-            return None, f"语音合成异常: {exc}"
+            return None, f"语音合成异常: {describe_api_error(exc)}"
 
 
 def play_audio(filepath: str) -> None:

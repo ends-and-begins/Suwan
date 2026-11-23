@@ -36,13 +36,13 @@ class StateStoreOrgan(Organ):
 
     async def _on_start(self) -> None:
         self._subscribe(CLOCK_TICK, self._on_tick)
-        await asyncio.to_thread(self.restore)
+        await self._wait_for_io(self.restore)
 
     async def _on_stop(self) -> None:
         if self._write_error is not None:
             self._log.error("快照写保护：退出时保留原文件：%s", self._write_error)
             return
-        await asyncio.to_thread(self.save)
+        await self._wait_for_io(self.save)
 
     async def _on_tick(self, event) -> None:  # noqa: ANN001
         dt = float(event.data.get("dt", 0.0))
@@ -51,11 +51,43 @@ class StateStoreOrgan(Organ):
         self._acc += dt
         if self._acc >= self.save_interval:
             self._acc = 0.0
-            await asyncio.to_thread(self.save)
+            await self._wait_for_io(self.save)
+
+    async def _wait_for_io(self, operation):
+        """A cancelled waiter cannot abandon a thread which may replace state.
+
+        This also covers restore's durable format upgrades. Bus unsubscription
+        and failed startup cleanup wait for this boundary before the runtime
+        can transfer its data-directory lock.
+        """
+        def outcome():
+            try:
+                return operation(), None
+            except BaseException as exc:
+                return None, exc
+
+        pending = asyncio.create_task(asyncio.to_thread(outcome))
+        cancelled = False
+        while True:
+            try:
+                result, error = await asyncio.shield(pending)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+        if error is not None:
+            raise error
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     # ---------- 快照 ----------
     def snapshot(self) -> dict:
-        return {name: organ.state() for name, organ in self.tracked.items()}
+        # Memory validates disk authority and may revoke identity/history.
+        # Do that before collecting any derived state, regardless of organ order.
+        memory = self.tracked.get("memory")
+        memory_state = memory.state() if memory is not None else None
+        return {name: memory_state if name == "memory" else organ.state()
+                for name, organ in self.tracked.items()}
 
     def save(self) -> None:
         with self._io_lock:
@@ -91,6 +123,16 @@ class StateStoreOrgan(Organ):
                     organ = self.tracked.get(name)
                     if organ is None or not hasattr(organ, "restore_state"):
                         continue
+                    memory_state = data["organs"].get("memory", {})
+                    canonical_fact = getattr(self.tracked.get("memory"), "get_fact", None)
+                    if (name == "identity" and callable(canonical_fact)
+                            and memory_state.get("version") == 2):
+                        # V2 identity is a projection of canonical memory, not
+                        # a legacy migration source. If memory disappeared even
+                        # during state publication, its stale name cannot
+                        # bootstrap a new fact at the next startup.
+                        fact = canonical_fact("user.name")
+                        payload = dict(payload, user_name=fact.fact_value if fact else None)
                     try:
                         organ.restore_state(payload)
                     except Exception as exc:  # noqa: BLE001

@@ -17,10 +17,10 @@ from typing import Mapping
 from suwan.calls import CallPolicy
 from suwan.notification_policy import ProactivePolicy
 
-try:  # python-dotenv 是运行依赖；缺失时优雅降级（仅环境变量可用）
+try:  # 已安装时沿用 python-dotenv；无依赖环境使用内置的有限语法读取器。
     from dotenv import load_dotenv
-except ImportError:  # pragma: no cover
-    load_dotenv = None  # type: ignore[assignment]
+except ImportError:
+    from suwan._dotenv import load_dotenv
 
 # 旧版默认数据根（环境变量 SUWAN_HOME 可覆盖）
 DEFAULT_HOME_DIR = Path("D:/SuwanData")
@@ -29,7 +29,7 @@ DEFAULT_HOME_DIR = Path("D:/SuwanData")
 # 全部走 OpenAI 兼容协议（Anthropic/原生 Gemini 等非兼容端点不在此列）。
 # 默认模型可用环境变量 MODEL_<PROVIDER大写> 覆盖（如 MODEL_OPENAI=gpt-4o）。
 ENDPOINT_ENV = {
-    "deepseek": ("DEEPSEEK_API_KEY", "https://api.deepseek.com", "deepseek-chat"),
+    "deepseek": ("DEEPSEEK_API_KEY", "https://api.deepseek.com", "deepseek-flash"),
     "openai": ("OPENAI_API_KEY", "https://api.openai.com/v1", "gpt-4o-mini"),
     "gemini": ("GEMINI_API_KEY", "https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-2.0-flash"),
     "qwen": ("DASHSRCOPE_API_KEY", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-turbo"),
@@ -58,7 +58,7 @@ PROVIDER_LABELS = {
 
 # 供应商 -> 常用模型候选（GUI 二级下拉用；实际以所选为准，可用 MODEL_XX 追加）
 MODEL_CANDIDATES = {
-    "deepseek": ["deepseek-chat", "deepseek-reasoner"],
+    "deepseek": ["deepseek-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
     "openai": ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "o3-mini"],
     "gemini": ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"],
     "qwen": ["qwen-turbo", "qwen-plus", "qwen-max"],

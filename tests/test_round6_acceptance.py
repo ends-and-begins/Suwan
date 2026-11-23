@@ -347,7 +347,7 @@ class DesktopAcceptanceTest(unittest.TestCase):
             self.app.desktop_setting_vars[key].set(str(value))
         self.app.desktop_save_button.invoke()
         self.pump_until(lambda: not self.app._desktop_pending and self.view()["settings"]["daily_calls"] == 17)
-        self.assertNotIn("QUEUED_PROACTIVE_606", self.app.chat_area.get("1.0", "end"))
+        self.assertNotIn("QUEUED_PROACTIVE_606", self.app.chat_area.text())
         async def manual_receipt():
             await self.runtime.bus.publish(NOTIFY_TOAST, {"text": "MANUAL_RECEIPT_606"})
             await self.runtime.bus.flush()
@@ -411,7 +411,7 @@ class DesktopAcceptanceTest(unittest.TestCase):
         self.app.chat_cancel_button.invoke()
         endpoint.release.set()
         self.pump_until(lambda: self.runtime.call_manager.snapshot()["in_flight_calls"] == 0)
-        self.assertNotIn("LATE_DESKTOP_REPLY_608", self.app.chat_area.get("1.0", "end"))
+        self.assertNotIn("LATE_DESKTOP_REPLY_608", self.app.chat_area.text())
         self.assertNotEqual(self.app._last_reply, "LATE_DESKTOP_REPLY_608")
         self.assertEqual(endpoint.sdk_parameters[0]["timeout"], 30.0)
         self.assertEqual(self.runtime.call_manager.snapshot()["used_calls"], 1)

@@ -16,6 +16,15 @@ from suwan.organs.base import Organ
 from suwan.services.llm_request import llm_chat
 
 
+class DocumentGenerationError(RuntimeError):
+    """A task failure safe for both console and GUI, without provider/disk details."""
+    def __init__(self, kind: str):
+        self.kind = kind
+        message = ("文档生成超时，请稍后重试。" if kind == "timeout"
+                   else "文档保存失败，请检查输出目录权限和磁盘空间。")
+        super().__init__(message)
+
+
 class DocService(Organ):
     name = "doc"
 
@@ -38,7 +47,15 @@ class DocService(Organ):
         pass
 
     async def generate(self, user_text: str) -> str | None:
-        """生成详细文档并保存；成功返回文件路径，失败返回 None。"""
+        """返回路径或撤销/不可用的 None；预期任务错误用安全类别报告。"""
+        try:
+            return await self._generate(user_text)
+        except TimeoutError:
+            raise DocumentGenerationError("timeout") from None
+        except OSError:
+            raise DocumentGenerationError("storage") from None
+
+    async def _generate(self, user_text: str) -> str | None:
         if self.llm is None or not self.llm.available or not self.api_enabled:
             return None
         epoch = self._epoch()

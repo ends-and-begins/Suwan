@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import threading
 import time as _time
 from collections import defaultdict
@@ -53,6 +54,21 @@ def pattern_matches(pattern: str, topic: str) -> bool:
 
 
 @dataclass
+class _Delivery:
+    event: Event
+    admitted: bool = False
+
+
+class _DeliveryQueue(asyncio.Queue):
+    def put_nowait(self, delivery: _Delivery) -> None:
+        super().put_nowait(delivery)
+        # This is the actual queue commit boundary, including puts that had to
+        # wait for space. Task completion can lag admission (e.g. tracing or a
+        # slow queue wrapper); shutdown must not count that event twice.
+        delivery.admitted = True
+
+
+@dataclass
 class Subscription:
     """一次订阅句柄：可注销；内部含投递队列与工作协程。"""
 
@@ -65,9 +81,12 @@ class Subscription:
     task: Optional[asyncio.Task] = field(default=None, init=False, repr=False, compare=False)
     active: int = field(default=0, init=False, repr=False, compare=False)
     cancelled: bool = field(default=False, init=False, compare=False)
+    closed: asyncio.Event = field(init=False, repr=False, compare=False)
+    pending_puts: set[asyncio.Task] = field(default_factory=set, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        self.queue = asyncio.Queue(maxsize=self.queue_size)
+        self.queue = _DeliveryQueue(maxsize=self.queue_size)
+        self.closed = asyncio.Event()
 
     def unsubscribe(self) -> None:
         """同步注销（推荐在事件循环内调用；bus.stop 会兜底清理）。"""
@@ -94,6 +113,8 @@ class EventBus:
         self._total_delivered = 0
         self._total_dropped = 0
         self._append_lock = threading.Lock()
+        self._retired_workers: set[asyncio.Task] = set()
+        self._replay_skipped = 0
 
     # ---------- 生命周期 ----------
     @property
@@ -110,11 +131,16 @@ class EventBus:
 
     async def stop(self) -> None:
         """停止：注销全部订阅并等待工作协程退出。"""
-        if not self._running:
+        if not self._running and not self._subs and not self._retired_workers:
             return
-        for sub in list(self._subs):
-            await self._close_subscription(sub)
         self._running = False
+        # Close every admission boundary before awaiting a worker. A publisher
+        # waking during shutdown must not move on to another closing queue.
+        for sub in list(self._subs):
+            self._remove_subscription(sub)
+        tasks = [task for task in self._retired_workers if task is not asyncio.current_task()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # ---------- 订阅 ----------
     def subscribe(
@@ -144,26 +170,50 @@ class EventBus:
             sub.task = asyncio.create_task(self._worker(sub), name=f"bus:{sub.pattern}")
 
     def _remove_subscription(self, sub: Subscription) -> None:
+        if sub.cancelled:
+            return
         sub.cancelled = True
+        sub.closed.set()
         if sub in self._subs:
             self._subs.remove(sub)
-        if sub.task is not None:
-            sub.task.cancel()
+        # Cancel blocked puts before draining: a newly freed slot must not
+        # accept an orphan event after the subscription has been removed.
+        for put in sub.pending_puts:
+            put.cancel()
+        while True:
+            try:
+                sub.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            sub.queue.task_done()
+            self._total_dropped += 1
+        if sub.task is not None and not sub.task.done():
+            self._retired_workers.add(sub.task)
+            sub.task.add_done_callback(self._retired_workers.discard)
+            # A handler may unsubscribe/close itself. Let that invocation
+            # complete instead of cancelling or awaiting its own task.
+            # Synchronous cleanup may run between turns of the owning loop.
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:
+                current = None
+            if sub.task is not current:
+                sub.task.cancel()
 
     async def _close_subscription(self, sub: Subscription) -> None:
-        sub.cancelled = True
-        if sub in self._subs:
-            self._subs.remove(sub)
-        if sub.task is not None and not sub.task.done():
-            sub.task.cancel()
+        self._remove_subscription(sub)
+        if sub.task is not None and sub.task is not asyncio.current_task() and not sub.task.done():
             try:
                 await sub.task
             except asyncio.CancelledError:
-                pass
+                # Awaiting our cancelled worker is expected. Cancellation of
+                # the caller itself must still propagate to its owner.
+                if asyncio.current_task().cancelling():
+                    raise
 
     # ---------- 发布 ----------
     async def publish(self, topic: str, data: dict[str, Any] | None = None, *, persist: bool = True) -> None:
-        """发布事件到所有匹配订阅者。队列满时背压等待。"""
+        """发布事件，队满时背压等待；关闭的订阅丢弃待投递项并唤醒发布者。"""
         event = Event(topic=topic, data=dict(data or {}))
         if persist and self._persist_path is not None:
             await self._persist(event)
@@ -177,21 +227,52 @@ class EventBus:
             if not pattern_matches(sub.pattern, event.topic):
                 continue
             try:
-                await sub.queue.put(event)  # 背压：队列满则等待
+                if not await self._enqueue(sub, event):
+                    self._total_dropped += 1
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self._total_dropped += 1
                 self._log.exception("投递失败 topic=%s", event.topic)
 
+    async def _enqueue(self, sub: Subscription, event: Event) -> bool:
+        if sub.cancelled:
+            return False
+        delivery = _Delivery(event)
+        try:
+            sub.queue.put_nowait(delivery)
+            return True
+        except asyncio.QueueFull:
+            pass
+        put = asyncio.create_task(sub.queue.put(delivery), name="bus:pending-put")
+        closed = asyncio.create_task(sub.closed.wait(), name="bus:wait-close")
+        sub.pending_puts.add(put)
+        try:
+            await asyncio.wait((put, closed), return_when=asyncio.FIRST_COMPLETED)
+            if sub.cancelled:
+                # Already-admitted events are accounted for by queue draining
+                # or the worker, even if their put task has not returned yet.
+                return delivery.admitted
+            put.result()
+            return True
+        finally:
+            # External cancellation and subscription closure both own cleanup;
+            # no detached put can enqueue later or retain a full queue forever.
+            put.cancel()
+            closed.cancel()
+            await asyncio.gather(put, closed, return_exceptions=True)
+            sub.pending_puts.discard(put)
+
     async def _worker(self, sub: Subscription) -> None:
         while not sub.cancelled:
-            event = await sub.queue.get()
+            event = (await sub.queue.get()).event
             sub.active += 1
             try:
                 await sub.handler(event)
                 self._total_delivered += 1
             except asyncio.CancelledError:
+                if sub.cancelled:
+                    self._total_dropped += 1
                 raise
             except Exception:
                 # 订阅者故障隔离：记录后继续
@@ -218,16 +299,28 @@ class EventBus:
             return 0
         lines = await asyncio.to_thread(self._read_lines)
         count = 0
-        for line in lines:
+        for number, line in enumerate(lines, 1):
             line = line.strip()
             if not line:
                 continue
             try:
                 record = json.loads(line)
-                await self._dispatch(Event(topic=record["topic"], data=record.get("data") or {}, ts=record.get("ts", 0.0)))
-                count += 1
-            except (ValueError, KeyError):
-                self._log.warning("历史事件行解析失败，跳过")
+                if type(record) is not dict:
+                    raise ValueError("event must be an object")
+                topic, data, ts = record.get("topic"), record.get("data", {}), record.get("ts", 0.0)
+                if type(topic) is not str or not topic or type(data) is not dict:
+                    raise ValueError("invalid event fields")
+                topic.encode("utf-8")
+                if type(ts) not in (int, float) or not math.isfinite(ts):
+                    raise ValueError("invalid event timestamp")
+            except (ValueError, TypeError, OverflowError, RecursionError):
+                self._replay_skipped += 1
+                self._log.warning("历史事件第 %d 行格式无效，跳过", number)
+                continue
+            # Dispatch is outside the parser boundary: an operational failure
+            # must not be misreported as a malformed history record.
+            await self._dispatch(Event(topic=topic, data=data, ts=ts))
+            count += 1
         return count
 
     def _read_lines(self) -> list[str]:
@@ -252,5 +345,6 @@ class EventBus:
             "published_by_topic": dict(self._published_by_topic),
             "delivered": self._total_delivered,
             "dropped": self._total_dropped,
+            "replay_skipped": self._replay_skipped,
             "persist_path": str(self._persist_path) if self._persist_path else None,
         }

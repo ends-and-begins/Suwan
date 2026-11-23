@@ -79,6 +79,12 @@ def _home_size(home):
     _no_links(home)
     count, size = 0, 0
     def failed(exc):
+        # A child staging directory may be removed between listing its parent
+        # and entering it. A missing observation root still invalidates the run.
+        if isinstance(exc, FileNotFoundError) and exc.filename is not None:
+            missing = Path(exc.filename)
+            if missing != home and missing.is_relative_to(home):
+                return
         raise exc
     for current, directories, files in os.walk(home, followlinks=False, onerror=failed):
         folder = Path(current)

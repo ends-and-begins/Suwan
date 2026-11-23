@@ -1,9 +1,8 @@
-"""苏晚 tkinter 前端（记忆管理、交流偏好与关系解释）。
+"""苏晚 tkinter 前端，以会话为主的桌面工作区。
 
-布局（grid）：
-  row0 标题栏（极简：品牌 + 当前供应商/模型）
-  row1 Notebook：对话 | 记忆 | 状态板 | 设置 | 作品集 | 人生故事 | 系统日志
-  row2 底部状态栏：API ✓/✕/◦ 指示 · 音色
+左侧导航，右侧保留七页 Notebook 的选择及生命周期行为。
+对话空态不写入聊天正文；侧栏、快捷入口不复制任何记忆或业务状态。
+模型、偏好、撤销、保存与退出仍由原有运行时和桥接处理。
 "设置"页：API/联网开关、模型=供应商+具体模型二级下拉、音色/自动朗读/朗读上句、测试连接
 "系统日志"页：日志正文 + 级别过滤(全部/INFO/OK/WARN/ERROR) + 清空
 分流：对话=人话；其余系统提示全部进日志。
@@ -24,24 +23,21 @@ from suwan.adapters.tts import VOICE_PRESETS
 from suwan.adapters.playback import AudioPlayback
 from suwan.config import ENDPOINT_ENV, MODEL_CANDIDATES, PROVIDER_LABELS, Settings
 from suwan.frontends.bridge import RuntimeThread, TkBridge
+from suwan.frontends.chat_composer import ChatComposer
+from suwan.frontends.chat_transcript import ChatTranscript
+from suwan.frontends.warm_theme import (
+    ACCENT, ACCENT_SOFT, BG, CHAT_BG, ERR, FG, FIELD,
+    FONT, LINE, LOG_COLORS, OK, PANEL, RAIL, RAIL_TEXT, SIDEBAR, SUB, WARN,
+    apply_theme, draw_mark,
+)
 
 try:
     from suwan.app import SuwanRuntime  # noqa: PLC0415
 except ImportError:  # pragma: no cover
     SuwanRuntime = None  # type: ignore[assignment]
 
-BG = "#14161a"
-PANEL = "#1e2126"
-FIELD = "#2b2f36"
-FG = "#d7dae0"
-SUB = "#8b919c"
-ACCENT = "#e8b26a"
-OK = "#7fc97f"
-ERR = "#ff6b6b"
-WARN = "#f0b35e"
-COLORS = {"你": "#9fb4c7", "苏晚": ACCENT, "苏晚·主动": "#ffd28a", "独白": "#7cc0ff"}
-LOG_COLORS = {"info": SUB, "ok": OK, "warn": WARN, "error": ERR}
 LOG_LEVELS = ("ALL", "INFO", "OK", "WARN", "ERROR")
+API_OFF_HINT = "● API 未开启，请勾选「启用模型 API」"
 
 
 class TkApp:
@@ -55,11 +51,18 @@ class TkApp:
         self.server = RuntimeThread(runtime, TkBridge())
         self.server.start()
         self.root = tk.Tk()
-        self.root.title("苏晚 · 数字生命控制台")
-        self.root.geometry("1140x820")
+        self.root.title("苏晚 · 把日子慢慢说")
+        self.root.geometry("1180x820")
         self.root.minsize(960, 660)
         self.root.configure(bg=BG)
         self._style()
+        artwork_path = Path(__file__).resolve().parents[1] / "assets" / "evening-window.png"
+        artwork = tk.PhotoImage(master=self.root, file=str(artwork_path))
+        self._welcome_art = artwork.subsample(3)
+        self._review_art_wide = artwork.subsample(8)
+        self._review_art_narrow = artwork.subsample(10)
+        self._review_has_art = False
+        self.api_status_text = tk.StringVar(value=API_OFF_HINT)
 
         self._provider_by_label = {PROVIDER_LABELS[p]: p for p in ENDPOINT_ENV}
         self._last_reply = ""
@@ -80,6 +83,7 @@ class TkApp:
         self._learning_generation = 0
         self._works_generation = 0
         self._api_probe_generation = 0
+        self._api_probe_indicator = None
         self._chat_generation = 0
         self._chat_future = None
         self._chat_started = 0.0
@@ -104,10 +108,16 @@ class TkApp:
         self._toggles: list = []  # (canvas, oval, var, on_color, on_toggle)
 
         self.root.grid_rowconfigure(1, weight=1)
-        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_columnconfigure(1, weight=1)
+        self._build_sidebar()
         self._build_header(0)
         self._build_notebook(1)
         self._build_statusbar(2)
+        self._navigate("chat")
+        self.root.bind("<Configure>", self._resize_shell, add="+")
+        for number, key in enumerate(self._pages, 1):
+            self.root.bind(f"<Alt-Key-{number}>", lambda _event, target=key: self._navigate(target))
+        self.root.bind("<Control-f>", self._open_chat_find)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._pump()
@@ -125,47 +135,250 @@ class TkApp:
 
     # ---------- 样式 ----------
     def _style(self) -> None:
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", background=PANEL, foreground=FG, padding=(14, 8), font=("Microsoft YaHei UI", 10))
-        style.map("TNotebook.Tab", background=[("selected", ACCENT)], foreground=[("selected", "#14161a")])
-        style.configure("TCheckbutton", background=BG, foreground=FG, font=("Microsoft YaHei UI", 9))
-        style.map("TCheckbutton", background=[("active", BG)])
-        style.configure("TCombobox", fieldbackground=FIELD, background=FIELD, foreground=FG, arrowcolor=SUB)
-        style.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", FG)])
-        style.configure("Accent.TButton", background=ACCENT, foreground="#14161a", font=("Microsoft YaHei UI", 9, "bold"), padding=(12, 6))
-        style.map("Accent.TButton", background=[("active", "#f3c586")])
-        style.configure("TButton", background=FIELD, foreground=FG, padding=(10, 5), font=("Microsoft YaHei UI", 9))
-        style.map("TButton", background=[("active", ACCENT)], foreground=[("active", "#14161a")])
-        style.configure("Radiobutton", background=BG, foreground=FG, font=("Microsoft YaHei UI", 9))
-        style.map("Radiobutton", background=[("active", BG)])
+        apply_theme(self.root)
 
-    def _label(self, parent, text: str, *, color: str = FG, size: int = 9, bg: str = BG) -> tk.Label:
-        return tk.Label(parent, text=text, font=("Microsoft YaHei UI", size), fg=color, bg=bg)
+    def _label(self, parent, text: str, *, color: str = FG, size: int = 9, bg: str | None = None) -> tk.Label:
+        return tk.Label(parent, text=text, font=(FONT, size), fg=color, bg=bg or parent.cget("background"))
 
-    def _scrolled(self, parent, *, bg: str = "#121317", fg: str = "#e6e8ec") -> scrolledtext.ScrolledText:
-        return scrolledtext.ScrolledText(parent, wrap=tk.WORD, font=("Microsoft YaHei UI", 10), bg=bg, fg=fg,
-                                         insertbackground=FG, relief=tk.FLAT, padx=10, pady=8)
+    def _scrolled(self, parent, *, bg: str = PANEL, fg: str = FG) -> scrolledtext.ScrolledText:
+        area = scrolledtext.ScrolledText(parent, wrap=tk.WORD, font=(FONT, 10), bg=bg, fg=fg,
+                                         insertbackground=FG, relief=tk.FLAT, borderwidth=0,
+                                         highlightthickness=0, padx=16, pady=12,
+                                         selectbackground=ACCENT_SOFT, selectforeground=FG,
+                                         spacing1=3, spacing3=5)
+        area.frame.configure(background=bg)
+        area.vbar.configure(background=bg, activebackground=LINE, troughcolor=bg,
+                            relief=tk.FLAT, borderwidth=0, width=10)
+        return area
 
-    # ---------- row0 标题（极简） ----------
+    def _build_sidebar(self) -> None:
+        self._pages = {
+            "chat": ("苏晚", "本次会话"),
+            "memory": ("记忆", "搜索、修正与遗忘"),
+            "status": ("近况", "活动进度与调用预算"),
+            "works": ("作品", "阅读已保存的作品"),
+            "story": ("故事", "按时间回看生活记录"),
+            "settings": ("设置", "模型连接、声音和偏好"),
+            "log": ("运行记录", "查看操作结果与错误"),
+        }
+        self.sidebar = tk.Frame(self.root, bg=SIDEBAR, width=254)
+        self.sidebar.grid(row=0, column=0, rowspan=3, sticky="nsew")
+        self.sidebar.grid_propagate(False)
+        self.sidebar.grid_columnconfigure(1, weight=1)
+        self.sidebar.grid_rowconfigure(0, weight=1)
+        rail = tk.Frame(self.sidebar, bg=RAIL, width=64)
+        rail.grid(row=0, column=0, sticky="ns")
+        rail.pack_propagate(False)
+        mark = tk.Canvas(rail, width=34, height=34, bg=RAIL, highlightthickness=0)
+        mark.pack(pady=(16, 16))
+        draw_mark(mark)
+        tools = tk.Frame(rail, bg=RAIL)
+        tools.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 12))
+        rail_labels = {"chat": "会话", "log": "日志"}
+        self.nav_buttons = {}
+        self._rail_tiles = {}
+        for key, (title, _caption) in self._pages.items():
+            target = tools if key in {"settings", "log"} else rail
+            tile = tk.Frame(target, bg=RAIL)
+            tile.pack(fill=tk.X, padx=7, pady=2)
+            icon = tk.Canvas(tile, width=24, height=22, bg=RAIL, highlightthickness=0, cursor="hand2")
+            icon.pack(pady=(4, 0))
+            self._draw_rail_icon(icon, key)
+            button = tk.Button(tile, text=rail_labels.get(key, title), font=(FONT, 8),
+                               bg=RAIL, fg=RAIL_TEXT, activebackground=RAIL, activeforeground=RAIL_TEXT,
+                               relief=tk.FLAT, bd=0, padx=0, pady=1, cursor="hand2",
+                               highlightthickness=1, highlightbackground=RAIL, highlightcolor=RAIL_TEXT,
+                               takefocus=True, command=lambda target=key: self._navigate(target))
+            button.pack(fill=tk.X, padx=3, pady=(0, 2))
+            marker = tk.Frame(tile, bg=RAIL, width=2)
+            marker.place(x=0, rely=.19, relheight=.62)
+            for surface in (tile, icon, marker):
+                surface.bind("<ButtonRelease-1>", lambda _event, control=button: control.invoke())
+            self.nav_buttons[key] = button
+            self._rail_tiles[key] = (tile, icon, marker)
+
+        inbox = self._chat_inbox = tk.Frame(self.sidebar, bg=SIDEBAR)
+        inbox.grid(row=0, column=1, sticky="nsew")
+        inbox.grid_columnconfigure(0, weight=1)
+        inbox.grid_rowconfigure(2, weight=1)
+        self._label(inbox, "会话", color=FG, size=16).grid(row=0, column=0, sticky="w", padx=14, pady=(19, 15))
+
+        self._chat_sidebar_preview = tk.StringVar(value="还没有消息")
+        self._chat_sidebar_time = tk.StringVar()
+        conversation = tk.Frame(inbox, bg=ACCENT_SOFT, cursor="hand2", height=62)
+        conversation.grid(row=1, column=0, sticky="ew", padx=(8, 9))
+        conversation.grid_propagate(False)
+        conversation.grid_columnconfigure(1, weight=1)
+        conversation.grid_rowconfigure(0, weight=1)
+        avatar = tk.Canvas(conversation, width=34, height=34, bg=ACCENT_SOFT, highlightthickness=0)
+        avatar.grid(row=0, column=0, padx=(8, 6))
+        draw_mark(avatar)
+        details = tk.Frame(conversation, bg=ACCENT_SOFT)
+        details.grid(row=0, column=1, sticky="ew", padx=(0, 7))
+        details.grid_columnconfigure(0, weight=1)
+        name = tk.Label(details, text="苏晚", bg=ACCENT_SOFT, fg=FG, font=(FONT, 10, "bold"))
+        name.grid(row=0, column=0, sticky="w")
+        clock = tk.Label(details, textvariable=self._chat_sidebar_time, bg=ACCENT_SOFT, fg=SUB, font=(FONT, 7))
+        clock.grid(row=0, column=1, sticky="e")
+        preview = self._chat_sidebar_preview_label = tk.Label(
+            details, bg=ACCENT_SOFT, fg=SUB, font=(FONT, 8), anchor="w", width=1,
+        )
+        preview.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(1, 0))
+        preview.bind("<Configure>", self._fit_sidebar_preview)
+        self._chat_sidebar_preview.trace_add("write", self._fit_sidebar_preview)
+        for widget in (conversation, avatar, details, name, clock, preview):
+            widget.bind("<ButtonRelease-1>", lambda _event: self._navigate("chat"))
+
+        self.review_button = ttk.Button(inbox, text="今日回顾  ›", style="Review.TButton",
+                                        compound=tk.TOP, command=self._open_review)
+        self.review_button.grid(row=3, column=0, sticky="ew", padx=(8, 9), pady=(10, 9))
+        foot = tk.Frame(inbox, bg=SIDEBAR)
+        foot.grid(row=4, column=0, sticky="ew", padx=13, pady=(2, 12))
+        tk.Frame(foot, bg=LINE, height=1).pack(fill=tk.X, pady=(0, 9))
+        self._label(foot, "当前模型", size=8, color=FG).pack(anchor="w")
+        self.mode_lbl = tk.Label(foot, text="", font=(FONT, 8), fg=SUB, bg=SIDEBAR,
+                                 wraplength=156, justify="left", anchor="w")
+        self.mode_lbl.pack(anchor="w", pady=(2, 0))
+        tk.Frame(inbox, bg=LINE, width=1).place(relx=1, x=-1, relheight=1)
+
+    def _fit_sidebar_preview(self, *_args) -> None:
+        label = self._chat_sidebar_preview_label
+        width = label.winfo_width() - 4
+        if width < 1:
+            return
+        font = label.cget("font")
+        text = self._chat_sidebar_preview.get()
+        if int(label.tk.call("font", "measure", font, text)) > width:
+            text = text.rstrip("…")
+            while text and int(label.tk.call("font", "measure", font, text + "…")) > width:
+                text = text[:-1]
+            text += "…"
+        label.configure(text=text)
+
+    @staticmethod
+    def _draw_rail_icon(icon: tk.Canvas, key: str) -> None:
+        def line(*points):
+            icon.create_line(*points, fill=RAIL_TEXT, width=1.5, capstyle=tk.ROUND,
+                             joinstyle=tk.ROUND, tags="stroke")
+
+        def shape(kind, *box):
+            kind(*box, outline=RAIL_TEXT, width=1.5, tags="outline")
+
+        if key == "chat":
+            line(4, 4, 20, 4, 20, 15, 11, 15, 7, 19, 7, 15, 4, 15, 4, 4)
+            line(8, 9, 16, 9)
+        elif key == "memory":
+            line(12, 6, 8, 4, 4, 4, 4, 16, 8, 16, 12, 18, 16, 16, 20, 16, 20, 4, 16, 4, 12, 6, 12, 18)
+        elif key == "status":
+            line(3, 12, 8, 12, 11, 5, 14, 17, 17, 12, 21, 12)
+        elif key == "works":
+            line(4, 8, 4, 5, 10, 5, 12, 8, 20, 8, 20, 18, 4, 18, 4, 8, 12, 8)
+        elif key == "story":
+            line(6, 3, 15, 3, 19, 7, 19, 19, 6, 19, 6, 3)
+            line(15, 3, 15, 7, 19, 7)
+            line(9, 11, 16, 11)
+            line(9, 15, 15, 15)
+        elif key == "settings":
+            line(5, 5, 19, 5)
+            line(5, 11, 19, 11)
+            line(5, 17, 19, 17)
+            line(9, 3, 9, 7)
+            line(15, 9, 15, 13)
+            line(10, 15, 10, 19)
+        else:
+            shape(icon.create_rectangle, 4, 4, 20, 18)
+            line(8, 8, 11, 11, 8, 14)
+            line(13, 14, 17, 14)
+
+    def _navigate(self, key: str) -> str:
+        if self._closing or key not in self._pages:
+            return "break"
+        self.notebook.select(self._page_frames[key])
+        self._sync_navigation()
+        return "break"
+
+    def _sync_navigation(self, _event=None) -> None:
+        selected = self.notebook.select()
+        for key, frame in self._page_frames.items():
+            active = str(frame) == selected
+            tile, icon, marker = self._rail_tiles[key]
+            background = "#62455B" if active else RAIL
+            foreground = "#FFF4EC" if active else RAIL_TEXT
+            tile.configure(bg=background)
+            icon.configure(bg=background)
+            icon.itemconfigure("stroke", fill=foreground)
+            icon.itemconfigure("outline", outline=foreground)
+            marker.configure(bg="#EBB8A6" if active else background)
+            self.nav_buttons[key].configure(bg=background, fg=foreground, activebackground=background,
+                                            activeforeground=foreground, highlightbackground=background)
+            if not active:
+                continue
+            self.page_title.set(self._pages[key][0])
+            self.subtitle.configure(text=self._pages[key][1])
+            if key == "chat":
+                self._header_avatar.grid()
+                self._chat_header_actions.grid()
+                self._header_title.grid_configure(padx=(0, 10))
+                self._chat_inbox.grid()
+            else:
+                self._header_avatar.grid_remove()
+                self._chat_header_actions.grid_remove()
+                self._header_title.grid_configure(padx=(21, 10))
+                self._chat_inbox.grid_remove()
+        self._set_shell_width(self.root.winfo_width(), selected == str(self._tab_chat))
+
+    def _resize_shell(self, event) -> None:
+        if event.widget is not self.root or self._closing:
+            return
+        self._set_shell_width(event.width, self.notebook.select() == str(self._tab_chat))
+
+    def _set_shell_width(self, width: int, chat: bool) -> None:
+        compact = width < 1080
+        self.sidebar.configure(width=(223 if compact else 254) if chat else 64)
+        self.mode_lbl.configure(wraplength=126 if compact else 156)
+        self._sync_review_art(width)
+
+    def _sync_review_art(self, width: int) -> None:
+        art = self._review_art_wide if width >= 1080 else self._review_art_narrow
+        self.review_button.configure(image=art if self._review_has_art else "")
+
+    def _use_prompt(self, text: str) -> None:
+        if not self._closing:
+            self.entry_var.set(text)
+            self.chat_entry.focus_set()
+
+    # ---------- 会话栏 ----------
     def _build_header(self, row: int) -> None:
-        bar = tk.Frame(self.root, bg=BG)
-        bar.grid(row=row, column=0, sticky="ew", padx=16, pady=(12, 4))
-        tk.Label(bar, text="苏晚", font=("Microsoft YaHei UI", 20, "bold"), fg=ACCENT, bg=BG).pack(side=tk.LEFT)
-        self.subtitle = self._label(bar, "住在你电脑里的数字生命", color=SUB, size=10)
-        self.subtitle.pack(side=tk.LEFT, padx=(12, 0), pady=(3, 0))
-        self.mode_lbl = self._label(bar, "", color=SUB, size=9)
-        self.mode_lbl.pack(side=tk.RIGHT)
+        bar = tk.Frame(self.root, bg=PANEL)
+        bar.grid(row=row, column=1, sticky="ew")
+        bar.grid_columnconfigure(1, weight=1)
+        self._header_avatar = tk.Canvas(bar, width=36, height=36, bg=PANEL, highlightthickness=0)
+        self._header_avatar.grid(row=0, column=0, padx=(20, 9), pady=10)
+        draw_mark(self._header_avatar)
+        title = self._header_title = tk.Frame(bar, bg=PANEL)
+        title.grid(row=0, column=1, sticky="w", padx=(0, 10), pady=8)
+        self.page_title = tk.StringVar(value="苏晚")
+        tk.Label(title, textvariable=self.page_title, bg=PANEL, fg=FG,
+                 font=(FONT, 13, "bold")).pack(anchor="w")
+        self.subtitle = self._label(title, "本次会话", color=SUB, size=8)
+        self.subtitle.pack(anchor="w", pady=(1, 0))
+        self._chat_header_actions = tk.Frame(bar, bg=PANEL)
+        self._chat_header_actions.grid(row=0, column=2, padx=(0, 16), sticky="e")
+        ttk.Button(self._chat_header_actions, text="搜索", style="Quiet.TButton", width=5,
+                   command=self._open_chat_find).pack(side=tk.LEFT)
+        self.today_works_button = ttk.Button(self._chat_header_actions, text="作品", style="Quiet.TButton",
+                                             width=5, command=self._show_works)
+        self.today_works_button.pack(side=tk.LEFT)
+        tk.Frame(self._chat_header_actions, width=1, height=19, bg=LINE).pack(side=tk.LEFT, padx=8)
+        ttk.Button(self._chat_header_actions, text="连接设置", width=7,
+                   command=lambda: self._navigate("settings")).pack(side=tk.LEFT)
+        tk.Frame(bar, height=1, bg=LINE).grid(row=1, column=0, columnspan=3, sticky="ew")
 
     # ---------- row1 主区 ----------
     def _build_notebook(self, row: int) -> None:
-        nb = ttk.Notebook(self.root)
+        nb = ttk.Notebook(self.root, style="Warm.TNotebook", takefocus=False)
         self.notebook = nb
-        nb.grid(row=row, column=0, sticky="nsew", padx=12)
+        nb.grid(row=row, column=1, sticky="nsew")
         tabs = {}
         for key, text in (("chat", "对话"), ("memory", "记忆"), ("status", "状态板"), ("settings", "设置"),
                           ("works", "作品集"), ("story", "人生故事"), ("log", "系统日志")):
@@ -176,6 +389,7 @@ class TkApp:
         self._tab_settings = tabs["settings"]
         self._tab_memory = tabs["memory"]
         self._tab_works, self._tab_story, self._tab_log = tabs["works"], tabs["story"], tabs["log"]
+        self._page_frames = tabs
         self._build_chat()
         self._build_memory()
         self._build_status()
@@ -183,63 +397,138 @@ class TkApp:
         self._build_works()
         self._build_story()
         self._build_log()
+        nb.bind("<<NotebookTabChanged>>", self._sync_navigation)
 
     def _build_chat(self) -> None:
-        overview = tk.Frame(self._tab_chat, bg=PANEL)
-        overview.pack(fill=tk.X, padx=10, pady=(8, 0))
+        self._tab_chat.configure(bg=CHAT_BG)
+        self._tab_chat.grid_columnconfigure(0, weight=1)
+        self._tab_chat.grid_rowconfigure(1, weight=1)
         self.today_summary = tk.StringVar(value="正在读取今日概览…")
-        tk.Label(overview, textvariable=self.today_summary, bg=PANEL, fg=ACCENT,
-                 font=("Microsoft YaHei UI", 9), justify="left", anchor="w", wraplength=620).pack(
-                     side=tk.LEFT, fill=tk.X, expand=True)
-        self.review_button = ttk.Button(overview, text="今日回顾", command=self._open_review)
-        self.review_button.pack(side=tk.RIGHT)
-        self.today_works_button = ttk.Button(overview, text="查看作品", command=self._show_works)
-        self.today_works_button.pack(side=tk.RIGHT, padx=6)
-        self.chat_area = self._scrolled(self._tab_chat)
-        self.chat_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 6))
-        tip = self._label(self._tab_chat, "回车发送 · /api on|off · /net on|off · /doc 主题 · /tts 文本", color="#5f6670", size=8)
-        tip.pack(fill=tk.X, padx=12, pady=(0, 4))
-        row = tk.Frame(self._tab_chat, bg=PANEL)
-        row.pack(fill=tk.X, padx=10, pady=(0, 10))
+        self._build_chat_find()
+        conversation = tk.Frame(self._tab_chat, bg=CHAT_BG)
+        conversation.grid(row=1, column=0, sticky="nsew")
+        self.chat_area = ChatTranscript(conversation)
+        self._chat_scrollbar = ttk.Scrollbar(conversation, orient=tk.VERTICAL, command=self.chat_area.yview)
+        self._chat_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.chat_area.pack(fill=tk.BOTH, expand=True)
+        self._has_new_chat = False
+        self.chat_jump = ttk.Button(conversation, text="回到最新消息 ↓", style="Accent.TButton",
+                                    command=self._jump_to_latest)
+        self.chat_area.configure(yscrollcommand=self._on_chat_scroll)
+        self.chat_empty_frame = tk.Frame(conversation, bg=CHAT_BG)
+        self.chat_empty_frame.place(relx=.5, rely=.43, anchor="center")
+        tk.Label(self.chat_empty_frame, image=self._welcome_art, bg=CHAT_BG,
+                 borderwidth=0, highlightthickness=0).pack(pady=(0, 22))
+        tk.Label(self.chat_empty_frame, text="和苏晚开始聊天", bg=CHAT_BG, fg=FG,
+                 font=(FONT, 20, "bold")).pack()
+        ttk.Button(self.chat_empty_frame, text="聊聊今天", style="Accent.TButton",
+                   command=lambda: self._use_prompt("今天想和你聊聊。")).pack(pady=(12, 0))
+        composer = ChatComposer(self._tab_chat, send=self.send, cancel=self._cancel_chat)
+        composer.grid(row=2, column=0, sticky="ew")
         self.entry_var = tk.StringVar()
-        entry = tk.Entry(row, textvariable=self.entry_var, font=("Microsoft YaHei UI", 11), bg=FIELD, fg=FG,
-                         insertbackground=FG, relief=tk.FLAT)
-        entry.pack(fill=tk.X, side=tk.LEFT, expand=True, ipady=7, padx=(0, 8))
-        entry.bind("<Return>", self.send)
-        self.send_button = ttk.Button(row, text="发送", style="Accent.TButton", command=self.send)
-        self.send_button.pack(side=tk.RIGHT)
-        wait_row = tk.Frame(self._tab_chat, bg=PANEL)
-        wait_row.pack(fill=tk.X, padx=10, pady=(0, 6))
-        self.chat_wait_var = tk.StringVar(value="近期对话仅属于本次会话；持久记忆请在“记忆”或“今日回顾”查看。")
-        tk.Label(wait_row, textvariable=self.chat_wait_var, bg=PANEL, fg=SUB, anchor="w",
-                 font=("Microsoft YaHei UI", 8)).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.chat_cancel_button = ttk.Button(wait_row, text="取消等待", state="disabled", command=self._cancel_chat)
-        self.chat_cancel_button.pack(side=tk.RIGHT)
-        entry.focus_set()
+        self.chat_entry = composer.entry
+        self.send_button = composer.send_button
+        self.chat_wait_var = composer.status
+        self.chat_cancel_button = composer.cancel_button
+        self.chat_entry.bind("<Return>", self._send_from_keyboard)
+        self.chat_entry.bind("<Shift-Return>", self._composer_newline)
+        self.entry_var.trace_add("write", self._set_composer_text)
+        self.chat_entry.focus_set()
+
+    def _set_composer_text(self, *_args) -> None:
+        self.chat_entry.delete("1.0", tk.END)
+        self.chat_entry.insert("1.0", self.entry_var.get())
+
+    def _send_from_keyboard(self, _event) -> str:
+        self.send()
+        return "break"
+
+    def _composer_newline(self, _event) -> str:
+        if self.chat_entry.tag_ranges(tk.SEL):
+            self.chat_entry.delete("sel.first", "sel.last")
+        self.chat_entry.insert(tk.INSERT, "\n")
+        return "break"
+
+    def _build_chat_find(self) -> None:
+        row = self._chat_find_row = tk.Frame(self._tab_chat, bg=PANEL)
+        row.grid(row=0, column=0, sticky="ew")
+        row.grid_remove()
+        self.chat_find_query = tk.StringVar()
+        self.chat_find_status = tk.StringVar()
+        self._label(row, "本次会话", color=SUB, size=8).pack(side=tk.LEFT, padx=(18, 0))
+        self._chat_find_entry = ttk.Entry(row, textvariable=self.chat_find_query, width=26)
+        self._chat_find_entry.pack(side=tk.LEFT, padx=(8, 6), pady=7)
+        self._chat_find_entry.bind("<Return>", lambda _event: self._find_chat_message())
+        self._chat_find_entry.bind("<Escape>", self._close_chat_find)
+        self.chat_find_query.trace_add("write", self._reset_chat_find)
+        for text, command in (("上一个", lambda: self._find_chat_message(backwards=True)),
+                              ("下一个", self._find_chat_message), ("关闭查找", self._close_chat_find)):
+            ttk.Button(row, text=text, style="Quiet.TButton", command=command).pack(side=tk.LEFT)
+        tk.Label(row, textvariable=self.chat_find_status, bg=PANEL, fg=SUB,
+                 font=(FONT, 8)).pack(side=tk.LEFT, padx=6)
+
+    def _open_chat_find(self, _event=None) -> str | None:
+        if self._closing or self.notebook.select() != str(self._tab_chat):
+            return None
+        self._chat_find_row.grid()
+        self._chat_find_entry.focus_set()
+        self._chat_find_entry.selection_range(0, tk.END)
+        return "break"
+
+    def _close_chat_find(self, _event=None) -> str:
+        self.chat_find_query.set("")
+        self._chat_find_row.grid_remove()
+        self.chat_entry.focus_set()
+        return "break"
+
+    def _reset_chat_find(self, *_args) -> None:
+        self.chat_area.clear_match()
+        self.chat_find_status.set("")
+
+    def _find_chat_message(self, *, backwards: bool = False) -> str:
+        query = self.chat_find_query.get().strip()
+        if not query:
+            return "break"
+        result = self.chat_area.find_message(query, backwards=backwards)
+        self.chat_find_status.set(f"{result[0]} / {result[1]}" if result else "未找到")
+        return "break"
 
     def _build_status(self) -> None:
         canvas = tk.Frame(self._tab_status, bg=PANEL)
-        canvas.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
+        canvas.pack(fill=tk.BOTH, expand=True, padx=16, pady=6)
+        canvas.grid_columnconfigure(0, weight=1)
+        canvas.grid_rowconfigure(0, weight=1)
         self.status_text = tk.StringVar(value="（读取中…）")
         self.status_area = self._scrolled(canvas)
-        self.status_area.configure(height=1, state="disabled", font=("Cascadia Mono", 9))
-        self.status_area.pack(fill=tk.BOTH, expand=True)
-        self.personality_text = tk.StringVar(value="人格说明：正在读取…")
-        tk.Label(canvas, textvariable=self.personality_text, justify="left", anchor="w", wraplength=880,
-                 font=("Microsoft YaHei UI", 8), fg=ACCENT, bg=PANEL).pack(fill=tk.X, pady=(6, 4))
-        self._label(canvas, "关系变化（来源可在“记忆”页按 ID 查看）", color=SUB, bg=PANEL).pack(anchor="w")
+        self.status_area.configure(height=1, state="disabled", font=(FONT, 10), bg=FIELD)
+        self.status_area.grid(row=0, column=0, sticky="nsew")
+        self.personality_text = tk.StringVar(value="正在整理苏晚的近况…")
+        personality_area = self._scrolled(canvas, fg=ACCENT)
+        personality_area.configure(height=2, font=(FONT, 8), padx=0, pady=2, spacing1=0, spacing3=0)
+        personality_area.grid(row=1, column=0, sticky="ew", pady=(6, 4))
+        def update_personality(*_args):
+            personality_area.configure(state="normal")
+            personality_area.delete("1.0", tk.END)
+            personality_area.insert(tk.END, self.personality_text.get())
+            personality_area.configure(state="disabled")
+        self.personality_text.trace_add("write", update_personality)
+        update_personality()
+        self._label(canvas, "关系变化（来源可在“记忆”页按 ID 查看）", color=SUB, bg=PANEL).grid(
+            row=2, column=0, sticky="w")
         self.relation_details = self._scrolled(canvas)
-        self.relation_details.configure(height=3, state="disabled")
-        self.relation_details.pack(fill=tk.X, pady=(4, 0))
+        self.relation_details.configure(height=3, pady=6, spacing1=0, spacing3=0, state="disabled")
+        self.relation_details.grid(row=3, column=0, sticky="ew", pady=(4, 0))
         self._build_activity_surface(canvas)
 
     def _build_activity_surface(self, parent) -> None:
         frame = tk.LabelFrame(parent, text="活动与调用预算", bg=PANEL, fg=ACCENT,
                               font=("Microsoft YaHei UI", 9))
-        frame.pack(fill=tk.X, pady=(8, 0))
+        frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         self.activity_budget = tk.StringVar(value="正在读取调用账目…")
-        tk.Label(frame, textvariable=self.activity_budget, justify="left", anchor="w", wraplength=860,
-                 font=("Microsoft YaHei UI", 8), bg=PANEL, fg=SUB).pack(fill=tk.X, padx=6, pady=(3, 2))
+        budget_label = tk.Label(frame, textvariable=self.activity_budget, justify="left", anchor="w", wraplength=680,
+                                font=(FONT, 8), bg=PANEL, fg=SUB)
+        budget_label.pack(fill=tk.X, padx=6, pady=(3, 2))
+        frame.bind("<Configure>", lambda event: budget_label.configure(wraplength=max(240, event.width - 16)))
         self.activity_tree = ttk.Treeview(frame, columns=("action", "status", "phase"), show="headings", height=2)
         for key, label, width in (("action", "活动", 160), ("status", "状态", 100), ("phase", "阶段", 230)):
             self.activity_tree.heading(key, text=label)
@@ -248,26 +537,29 @@ class TkApp:
         self.activity_tree.bind("<<TreeviewSelect>>", self._activity_selected)
         self.activity_detail = tk.StringVar(value="选择活动可查看原因与稳定 ID。")
         self.activity_detail_area = self._scrolled(frame)
-        self.activity_detail_area.configure(height=3, font=("Microsoft YaHei UI", 8), pady=2, state="disabled")
+        self.activity_detail_area.configure(height=2, font=(FONT, 8), pady=2, spacing1=0, spacing3=0, state="disabled")
         self.activity_detail_area.pack(fill=tk.X, padx=6, pady=3)
         self.activity_detail.trace_add("write", self._update_activity_detail)
         self._update_activity_detail()
         row = tk.Frame(frame, bg=PANEL)
         row.pack(fill=tk.X, padx=6, pady=(0, 5))
         self.activity_pause_button = ttk.Button(row, text="暂停活动", command=lambda: self._request_activities("pause"))
-        self.activity_pause_button.pack(side=tk.LEFT)
         self.activity_resume_button = ttk.Button(row, text="恢复活动", command=lambda: self._request_activities("resume"))
-        self.activity_resume_button.pack(side=tk.LEFT, padx=4)
         self.activity_continue_button = ttk.Button(row, text="继续所选", command=lambda: self._activity_action("continue"))
-        self.activity_continue_button.pack(side=tk.LEFT)
         self.activity_like_button = ttk.Button(row, text="喜欢话题", command=lambda: self._activity_action("like"))
-        self.activity_like_button.pack(side=tk.LEFT, padx=4)
         self.activity_dislike_button = ttk.Button(row, text="少聊话题", command=lambda: self._activity_action("dislike"))
-        self.activity_dislike_button.pack(side=tk.LEFT)
         self.activity_discard_button = ttk.Button(row, text="取消未完成", command=lambda: self._activity_action("discard"))
-        self.activity_discard_button.pack(side=tk.LEFT, padx=4)
         self.learning_view_button = ttk.Button(row, text="查看学习", command=self._request_learning)
-        self.learning_view_button.pack(side=tk.LEFT, padx=4)
+        controls = (self.activity_pause_button, self.activity_resume_button, self.activity_continue_button,
+                    self.activity_discard_button, self.activity_like_button, self.activity_dislike_button,
+                    self.learning_view_button)
+        ttk.Style(self.root).configure("Activity.TButton", padding=(8, 4))
+        for column in range(4):
+            row.grid_columnconfigure(column, weight=1, uniform="activity_actions")
+        for index, control in enumerate(controls):
+            control.configure(style="Activity.TButton")
+            control.grid(row=index // 4, column=index % 4, sticky="ew",
+                         padx=(0, 4) if index % 4 < 3 else 0, pady=(0, 4) if index < 4 else 0)
         self._activity_controls = [self.activity_pause_button, self.activity_resume_button, self.activity_continue_button,
                                    self.activity_like_button, self.activity_dislike_button, self.activity_discard_button]
 
@@ -451,7 +743,7 @@ class TkApp:
         self.memory_page_label = tk.StringVar(value="第 1 / 1 页")
         tk.Label(navigation, textvariable=self.memory_page_label, bg=PANEL, fg=SUB).pack(side=tk.LEFT, padx=8)
         ttk.Button(navigation, text="按 ID 定位", command=self._memory_locate).pack(side=tk.RIGHT)
-        self._label(self._tab_memory, "每页100条活动记忆；列表可筛选类型，管理搜索包含生成内容与推测。", color=SUB).pack(anchor="w", padx=12)
+        self._label(self._tab_memory, "每页100条 · 可以搜索、修正，也可以让苏晚忘记。", color=SUB).pack(anchor="w", padx=12)
         self.memory_tree = ttk.Treeview(self._tab_memory, columns=("kind", "source", "time", "content"), show="headings", height=10)
         for key, text, width in (("kind", "类型", 75), ("source", "来源", 90), ("time", "记录时间", 155), ("content", "内容", 560)):
             self.memory_tree.heading(key, text=text)
@@ -463,7 +755,7 @@ class TkApp:
         self.memory_detail.pack(fill=tk.X, padx=10, pady=(0, 6))
         row = tk.Frame(self._tab_memory, bg=PANEL)
         row.pack(fill=tk.X, padx=10, pady=4)
-        for label, callback in (("补充经历", self._memory_add), ("设置事实", self._memory_set), ("纠正选中记录", self._memory_correct), ("遗忘选中及派生", self._memory_forget)):
+        for label, callback in (("补充经历", self._memory_add), ("设置事实", self._memory_set), ("纠正记录", self._memory_correct), ("遗忘及派生", self._memory_forget)):
             ttk.Button(row, text=label, command=callback).pack(side=tk.LEFT, padx=(0, 6))
         self.memory_pause = ttk.Button(row, text="暂停记录", command=self._memory_toggle)
         self.memory_pause.pack(side=tk.RIGHT)
@@ -599,77 +891,87 @@ class TkApp:
 
     # ---------- 设置页（控制面板搬家） ----------
     def _build_settings(self) -> None:
-        self.settings_canvas = tk.Canvas(self._tab_settings, bg=PANEL, highlightthickness=0)
+        self.settings_canvas = tk.Canvas(self._tab_settings, bg=BG, highlightthickness=0)
         self.settings_scrollbar = ttk.Scrollbar(self._tab_settings, orient="vertical", command=self.settings_canvas.yview)
         self.settings_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.settings_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.settings_canvas.configure(yscrollcommand=self.settings_scrollbar.set)
-        body = tk.Frame(self.settings_canvas, bg=PANEL)
+        body = tk.Frame(self.settings_canvas, bg=BG)
         window = self.settings_canvas.create_window((0, 0), window=body, anchor="nw")
         body.bind("<Configure>", lambda _event: self.settings_canvas.configure(scrollregion=self.settings_canvas.bbox("all")))
         self.settings_canvas.bind("<Configure>", lambda event: self.settings_canvas.itemconfigure(window, width=event.width))
         self.root.bind("<MouseWheel>", self._settings_mousewheel, add="+")
-        ctl = tk.LabelFrame(body, text="连接与声音", bg=PANEL, fg=ACCENT,
-                            font=("Microsoft YaHei UI", 9, "bold"), padx=14, pady=10)
-        ctl.pack(fill=tk.X, padx=12, pady=(12, 6))
 
-        row1 = tk.Frame(ctl, bg=PANEL)
-        row1.pack(fill=tk.X, pady=4)
-        # API 开关 = 圆点 + 文字（无 ✕/✗ 字形），点击切换
+        def card(title: str) -> tuple[tk.Frame, tk.Frame]:
+            panel = tk.Frame(body, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
+            panel.pack(fill=tk.X, padx=18, pady=(0, 10))
+            heading = tk.Frame(panel, bg=PANEL)
+            heading.pack(fill=tk.X, padx=16, pady=(10, 0))
+            tk.Label(heading, text=title, bg=PANEL, fg=FG, font=(FONT, 11, "bold")).pack(side=tk.LEFT)
+            content = tk.Frame(panel, bg=PANEL)
+            content.pack(fill=tk.X, padx=16, pady=(8, 12))
+            return heading, content
+
+        def wrap(label: tk.Label) -> tk.Label:
+            def resize(event) -> None:
+                width = max(100, event.width - 16)
+                if width != int(label.cget("wraplength")):
+                    label.configure(wraplength=width)
+
+            label.bind("<Configure>", resize)
+            return label
+
+        tk.Frame(body, height=12, bg=BG).pack(fill=tk.X)
+        model_header, model_content = card("模型连接")
         self.api_var = tk.BooleanVar(value=False)
-        api_group = tk.Frame(row1, bg=PANEL)
-        api_group.pack(side=tk.LEFT)
-        self.api_dot = tk.Canvas(api_group, width=18, height=18, bg=PANEL, highlightthickness=0)
-        self.api_dot.pack(side=tk.LEFT)
-        self._api_dot_oval = self.api_dot.create_oval(4, 4, 14, 14, fill="#5a5f66", outline="")
-        api_lbl = tk.Label(api_group, text="API", bg=PANEL, fg=FG, font=("Microsoft YaHei UI", 9), cursor="hand2")
-        api_lbl.pack(side=tk.LEFT, padx=(4, 0))
-        for widget in (self.api_dot, api_lbl):
-            widget.bind("<Button-1>", self._toggle_api)
-        # 联网：同款圆点开关
-        self.net_var = tk.BooleanVar(value=False)
-        net_group = self._add_dot_toggle(row1, self.net_var, "联网", "#5aa7ff", self._on_net)
-        net_group.pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Button(row1, text="⚡ 测试连接", style="Accent.TButton", command=self._test_api).pack(side=tk.RIGHT)
+        self.api_test_button = ttk.Button(model_header, text="测试连接", style="Quiet.TButton", command=self._test_api)
+        self.api_test_button.pack(side=tk.RIGHT)
+        self.api_checkbox = ttk.Checkbutton(model_header, text="启用模型 API", variable=self.api_var, command=self._on_api)
+        self.api_checkbox.pack(side=tk.RIGHT, padx=(0, 10))
 
-        row2 = tk.Frame(ctl, bg=PANEL)
-        row2.pack(fill=tk.X, pady=4)
-        self._label(row2, "模型", color=SUB).pack(side=tk.LEFT)
+        fields_row = tk.Frame(model_content, bg=PANEL)
+        fields_row.pack(fill=tk.X)
+        fields_row.grid_columnconfigure(0, weight=1)
+        fields_row.grid_columnconfigure(1, weight=2)
+        self._label(fields_row, "供应商", color=SUB, size=8).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        self._label(fields_row, "模型", color=SUB, size=8).grid(row=0, column=1, sticky="w", pady=(0, 4))
         provider_labels = [PROVIDER_LABELS[p] for p in ENDPOINT_ENV]
         self.provider_var = tk.StringVar()
-        self.provider_cb = ttk.Combobox(row2, textvariable=self.provider_var, values=provider_labels, state="readonly", width=20)
-        self.provider_cb.pack(side=tk.LEFT, padx=(8, 4))
+        self.provider_cb = ttk.Combobox(fields_row, textvariable=self.provider_var, values=provider_labels,
+                                        state="readonly", width=14)
+        self.provider_cb.grid(row=1, column=0, sticky="ew", padx=(0, 10))
         self.provider_cb.bind("<<ComboboxSelected>>", self._on_provider_selected)
-        self._label(row2, "具体模型", color=SUB).pack(side=tk.LEFT, padx=(12, 0))
         self.model_var = tk.StringVar()
-        self.model_cb = ttk.Combobox(row2, textvariable=self.model_var, state="normal", width=26)
-        self.model_cb.pack(side=tk.LEFT, padx=(8, 0))
+        self.model_cb = ttk.Combobox(fields_row, textvariable=self.model_var, state="normal", width=18)
+        self.model_cb.grid(row=1, column=1, sticky="ew", padx=(0, 10))
         self.model_cb.bind("<<ComboboxSelected>>", self._on_model_selected)
         self.model_cb.bind("<Return>", self._on_model_selected)
-        ttk.Button(row2, text="应用模型", command=self._on_model_selected).pack(side=tk.LEFT, padx=6)
+        ttk.Button(fields_row, text="应用模型", command=self._on_model_selected).grid(row=1, column=2, sticky="ns")
+        wrap(tk.Label(model_content, textvariable=self.api_status_text, bg=FIELD, fg=FG,
+                      font=(FONT, 9), anchor="w", justify="left", padx=8, pady=7)).pack(fill=tk.X, pady=(10, 0))
 
-        row3 = tk.Frame(ctl, bg=PANEL)
-        row3.pack(fill=tk.X, pady=(8, 4))
-        self._label(row3, "音色", color=SUB).pack(side=tk.LEFT)
-        self.voice_var = tk.StringVar(value=VOICE_PRESETS[0])
-        voice_cb = ttk.Combobox(row3, textvariable=self.voice_var, values=list(VOICE_PRESETS), state="readonly", width=16)
-        voice_cb.pack(side=tk.LEFT, padx=(8, 4))
-        voice_cb.bind("<<ComboboxSelected>>", self._on_voice_selected)
+        voice_header, voice_content = card("声音")
         self.read_var = tk.BooleanVar(value=False)
-        read_group = self._add_dot_toggle(row3, self.read_var, "自动朗读", "#c792ea", self._on_auto_read)
-        read_group.pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Button(row3, text="🔊 朗读上句", command=self._speak_last).pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Button(row3, text="停止朗读", command=self._stop_speaking).pack(side=tk.LEFT, padx=(6, 0))
-        self._label(ctl, "朗读需要 MiMo 通用 API 密钥。模型名可直接输入，回车或点击“应用模型”保存。",
-                    color=SUB, bg=PANEL, size=8).pack(anchor="w", pady=(3, 0))
+        read_group = self._add_dot_toggle(voice_header, self.read_var, "自动朗读", ACCENT, self._on_auto_read)
+        read_group.pack(side=tk.RIGHT)
+        voice_row = tk.Frame(voice_content, bg=PANEL)
+        voice_row.pack(fill=tk.X)
+        self._label(voice_row, "音色", color=SUB).pack(side=tk.LEFT)
+        self.voice_var = tk.StringVar(value=VOICE_PRESETS[0])
+        voice_cb = ttk.Combobox(voice_row, textvariable=self.voice_var, values=list(VOICE_PRESETS),
+                               state="readonly", width=14)
+        voice_cb.pack(side=tk.LEFT, padx=(8, 10))
+        voice_cb.bind("<<ComboboxSelected>>", self._on_voice_selected)
+        ttk.Button(voice_row, text="朗读上句", command=self._speak_last).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(voice_row, text="停止朗读", command=self._stop_speaking).pack(side=tk.LEFT)
+        self._label(voice_content, "语音需要 MiMo 通用 API 密钥", color=SUB, size=8).pack(anchor="w", pady=(6, 0))
 
-        self._label(body, "连接与声音选项保存后生效并在重启后保持，密钥仍由原环境配置管理。",
-                    color=SUB, size=8).pack(anchor="w", padx=14, pady=(4, 0))
-        preferences = tk.LabelFrame(body, text="交流偏好", bg=PANEL, fg=ACCENT,
-                                    font=("Microsoft YaHei UI", 9, "bold"), padx=14, pady=10)
-        preferences.pack(fill=tk.X, padx=12, pady=(16, 6))
+        preferences_header, preferences = card("交流偏好")
+        self.net_var = tk.BooleanVar(value=False)
+        net_group = self._add_dot_toggle(preferences_header, self.net_var, "网页搜索", ACCENT, self._on_net)
+        net_group.pack(side=tk.RIGHT)
         row = tk.Frame(preferences, bg=PANEL)
-        row.pack(fill=tk.X, pady=4)
+        row.pack(fill=tk.X)
         self._response_styles = {"自然": "normal", "直接": "brief", "详细": "detailed"}
         self._initiative_levels = {"正常": "normal", "少": "low", "停": "off"}
         self.response_style_var = tk.StringVar(value="自然")
@@ -686,14 +988,10 @@ class TkApp:
         self._initiative_controls = (self.response_style_cb, self.initiative_cb)
         self.initiative_cb.bind("<<ComboboxSelected>>", lambda _event: self._set_interaction_preference("preference.initiative"))
         self.interaction_state = tk.StringVar(value="正在读取交流偏好…")
-        tk.Label(preferences, textvariable=self.interaction_state, justify="left", anchor="w", wraplength=850,
-                 bg=PANEL, fg=ACCENT, font=("Microsoft YaHei UI", 9)).pack(fill=tk.X, pady=(8, 4))
-        self._label(preferences, "选择后立即保存，重启后保持。停止主动消息时，你发来的消息仍会正常回应。",
-                    color=SUB, bg=PANEL, size=8).pack(anchor="w")
+        wrap(tk.Label(preferences, textvariable=self.interaction_state, justify="left", anchor="w",
+                      bg=PANEL, fg=SUB, font=(FONT, 8))).pack(fill=tk.X, pady=(7, 0))
 
-        advanced = tk.LabelFrame(body, text="安静时段、限额与音量", bg=PANEL, fg=ACCENT,
-                                 font=("Microsoft YaHei UI", 9, "bold"), padx=14, pady=10)
-        advanced.pack(fill=tk.X, padx=12, pady=6)
+        _advanced_header, advanced = card("安静时段、限额与音量")
         # Direct attributes own Tcl variables.  The lookup must not keep an
         # extra reference after normal owner-thread variable cleanup.
         self.desktop_setting_vars = weakref.WeakValueDictionary()
@@ -710,41 +1008,38 @@ class TkApp:
             self.desktop_setting_vars[key] = value
             self._desktop_draft_revisions[key] = 0
             value.trace_add("write", lambda *_args, field=key: self._desktop_draft_edited(field))
-            tk.Entry(advanced, textvariable=value, width=10, bg=FIELD, fg=FG, insertbackground=FG,
-                     relief=tk.FLAT).grid(row=r, column=c * 2 + 1, sticky="ew", padx=(0, 20), ipady=3)
+            ttk.Entry(advanced, textvariable=value, width=7).grid(
+                row=r, column=c * 2 + 1, sticky="ew", padx=(0, 14 if c == 0 else 0), pady=3)
         self.volume_var = self.desktop_setting_vars["volume"]
         for column in (1, 3):
             advanced.grid_columnconfigure(column, weight=1)
-        tk.Label(advanced, text="安静开始与结束相同时不设安静时段；音量在下次播放生效。token 为分配上限，实际用量以账目为准。",
-                 bg=PANEL, fg=SUB, font=("Microsoft YaHei UI", 8), wraplength=810, anchor="w", justify="left").grid(
-                     row=4, column=0, columnspan=4, sticky="ew", pady=(6, 3))
+        wrap(tk.Label(advanced, text="安静时段的起止相同时，不限制主动消息。音量在下次播放时生效。",
+                      bg=PANEL, fg=SUB, font=(FONT, 8), anchor="w", justify="left")).grid(
+                          row=4, column=0, columnspan=4, sticky="ew", pady=(6, 3))
         self.desktop_save_button = ttk.Button(advanced, text="保存时段与限额", command=self._save_desktop_controls)
         self.desktop_save_button.grid(row=5, column=0, sticky="w", pady=3)
         self.desktop_settings_state = tk.StringVar(value="正在读取桌面设置…")
-        tk.Label(advanced, textvariable=self.desktop_settings_state, bg=PANEL, fg=ACCENT,
-                 font=("Microsoft YaHei UI", 8), wraplength=580, anchor="w", justify="left").grid(
-                     row=5, column=1, columnspan=3, sticky="ew")
+        wrap(tk.Label(advanced, textvariable=self.desktop_settings_state, bg=PANEL, fg=ACCENT,
+                      font=(FONT, 8), anchor="w", justify="left")).grid(
+                          row=5, column=1, columnspan=3, sticky="ew", padx=(8, 0))
         self.desktop_committed_state = tk.StringVar(value="当前生效设置正在读取；输入框中的修改需保存后生效。")
-        tk.Label(advanced, textvariable=self.desktop_committed_state, bg=PANEL, fg=SUB,
-                 font=("Microsoft YaHei UI", 8), wraplength=810, anchor="w", justify="left").grid(
-                     row=6, column=0, columnspan=4, sticky="ew", pady=(3, 0))
+        wrap(tk.Label(advanced, textvariable=self.desktop_committed_state, bg=PANEL, fg=SUB,
+                      font=(FONT, 8), anchor="w", justify="left")).grid(
+                          row=6, column=0, columnspan=4, sticky="ew", pady=(3, 0))
 
-        data = tk.LabelFrame(body, text="数据位置与导出", bg=PANEL, fg=ACCENT,
-                             font=("Microsoft YaHei UI", 9, "bold"), padx=14, pady=10)
-        data.pack(fill=tk.X, padx=12, pady=(6, 12))
+        _data_header, data = card("本地数据")
         self.data_info = tk.StringVar(value="正在读取本地数据位置…")
-        tk.Label(data, textvariable=self.data_info, bg=PANEL, fg=FG, font=("Microsoft YaHei UI", 8),
-                 wraplength=820, justify="left", anchor="w").pack(fill=tk.X)
+        wrap(tk.Label(data, textvariable=self.data_info, bg=PANEL, fg=FG, font=(FONT, 8),
+                      justify="left", anchor="w")).pack(fill=tk.X)
         self.retention_info = tk.StringVar(value="正在读取保留范围说明…")
-        tk.Label(data, textvariable=self.retention_info, bg=PANEL, fg=SUB, font=("Microsoft YaHei UI", 8),
-                 wraplength=820, justify="left", anchor="w").pack(fill=tk.X, pady=(6, 3))
-        self.export_button = ttk.Button(data, text="导出逻辑数据 JSON", command=self._export_data)
+        wrap(tk.Label(data, textvariable=self.retention_info, bg=PANEL, fg=SUB, font=(FONT, 8),
+                      justify="left", anchor="w")).pack(fill=tk.X, pady=(6, 3))
+        self.export_button = ttk.Button(data, text="导出数据快照（JSON）", command=self._export_data)
         self.export_button.pack(anchor="w", pady=(6, 3))
-        self._label(data, "导出用于查看和迁移参考，不是完整恢复备份；修改代码前仍须另做完整备份。",
-                    color=SUB, bg=PANEL, size=8).pack(anchor="w")
+        self._label(data, "完整恢复请使用备份。", color=SUB, size=8).pack(anchor="w")
         self.export_state = tk.StringVar(value="尚未导出。")
-        tk.Label(data, textvariable=self.export_state, bg=PANEL, fg=ACCENT, wraplength=820,
-                 justify="left", anchor="w", font=("Microsoft YaHei UI", 8)).pack(fill=tk.X, pady=(4, 0))
+        wrap(tk.Label(data, textvariable=self.export_state, bg=PANEL, fg=ACCENT,
+                      justify="left", anchor="w", font=(FONT, 8))).pack(fill=tk.X, pady=(4, 0))
 
     def _settings_mousewheel(self, event):
         if str(event.widget).startswith(str(self._tab_settings)):
@@ -786,6 +1081,10 @@ class TkApp:
         self.desktop_settings_state.set("正在保存桌面设置…")
         if set(patch) & {"provider", "model", "api_enabled"}:
             self._api_probe_generation += 1
+            self._api_probe_indicator = None
+            # Revoke the old display at the user's choice boundary, before
+            # the asynchronous settings writer changes runtime configuration.
+            self._refresh_api_indicator()
         # Coalesce edits made in one Tk turn.  Apart from avoiding transient
         # on/off states, this keeps saving asynchronous even on a busy disk.
         self._pending_settings_patch.update(patch)
@@ -829,14 +1128,18 @@ class TkApp:
     def _apply_desktop_settings(self, settings: dict, committed_revisions: dict | None = None) -> None:
         self._desktop_settings_loaded = True
         provider = str(settings.get("provider", "mimo"))
-        self.provider_var.set(PROVIDER_LABELS.get(provider, provider))
         model_submitted_current = (committed_revisions is not None and "model" in committed_revisions
                                    and committed_revisions["model"] == self._desktop_draft_revisions["model"])
         model_dirty = "model" in self._desktop_dirty_fields and not model_submitted_current
+        # A newer model draft still belongs to the provider the user selected,
+        # including when the earlier provider save failed and runtime stayed put.
+        draft_provider = self._current_provider() if model_dirty else None
+        display_provider = draft_provider or provider
+        self.provider_var.set(PROVIDER_LABELS.get(display_provider, display_provider))
         model = self.model_var.get() if model_dirty else str(settings.get("model", ""))
         self._desktop_applying_settings = True
         try:
-            self._refresh_model_options(provider)
+            self._refresh_model_options(display_provider, model)
             self.model_var.set(model)
         finally:
             self._desktop_applying_settings = False
@@ -898,8 +1201,6 @@ class TkApp:
         self.desktop_settings_state.set(str(result.get("text") or ("桌面设置已保存。" if result.get("ok") else "桌面设置未保存。")))
         if result.get("settings_readonly"):
             self.desktop_save_button.configure(state="disabled")
-        if result.get("ok") and patch.get("api_enabled"):
-            self._after(500, self._test_api)
         self._request_desktop()
 
     def _export_data(self) -> None:
@@ -1220,12 +1521,6 @@ class TkApp:
         self.relation_details.configure(state="disabled")
         self._request_interaction()
 
-    def _toggle_api(self, _event=None) -> None:
-        if self._closing:
-            return
-        self.api_var.set(not self.api_var.get())
-        self._on_api()
-
     def _add_dot_toggle(self, parent, var, text: str, on_color: str, on_toggle) -> tk.Frame:
         """通用圆点开关：灰色=关，彩色=开；点击切换并回调。"""
         group = tk.Frame(parent, bg=PANEL)
@@ -1265,30 +1560,56 @@ class TkApp:
     def _current_provider(self) -> str | None:
         return self._provider_by_label.get(self.provider_var.get())
 
-    def _refresh_model_options(self, provider: str | None) -> None:
+    def _refresh_model_options(self, provider: str | None, model: str | None = None) -> None:
         if not provider:
             return
-        runtime_model = getattr(self.server.runtime.llm, "model", "")
+        if model is None:
+            llm = self.server.runtime.llm
+            # A provider save can still be waiting for its physical writer.
+            # Only use the live model when it belongs to this provider.
+            model = (getattr(llm, "model", "") if getattr(llm, "provider", None) == provider
+                     else self.server.runtime.settings.model_names.get(provider, ""))
         options = list(MODEL_CANDIDATES.get(provider, []))
-        if runtime_model and runtime_model not in options:
-            options.insert(0, runtime_model)
-        elif not options and runtime_model:
-            options = [runtime_model]
+        if model and model not in options:
+            options.insert(0, model)
         self.model_cb.configure(values=options)
-        self.model_var.set(runtime_model if runtime_model in options else (options[0] if options else ""))
+        self.model_var.set(model if model in options else (options[0] if options else ""))
 
     # ---------- 作品/故事 ----------
     def _build_works(self) -> None:
-        self.works_list = tk.Listbox(self._tab_works, bg="#121317", fg=FG, font=("Microsoft YaHei UI", 10),
-                                     relief=tk.FLAT, highlightthickness=0, selectbackground="#3a4048")
-        self.works_list.pack(fill=tk.X, padx=10, pady=(10, 4), ipady=4)
+        body = tk.Frame(self._tab_works, bg=PANEL)
+        body.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        body.grid_rowconfigure(1, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+        self._label(body, "灵感手记", color=ACCENT, size=10).grid(row=0, column=0, sticky="w", pady=(0, 14))
+        self._label(body, "留下一些，值得重读的文字。", color=SUB, size=9).grid(row=0, column=1, sticky="w", padx=24, pady=(0, 14))
+        self.works_list = tk.Listbox(body, bg=FIELD, fg=FG, font=(FONT, 10), width=23,
+                                     relief=tk.FLAT, highlightthickness=0, selectbackground=ACCENT_SOFT,
+                                     selectforeground=FG, activestyle="none")
+        self.works_list.grid(row=1, column=0, sticky="nsw", ipadx=8, ipady=8)
         self.works_list.bind("<<ListboxSelect>>", self._on_works_select)
-        self.works_preview = self._scrolled(self._tab_works)
-        self.works_preview.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        reading = tk.Frame(body, bg=PANEL)
+        reading.grid(row=1, column=1, sticky="nsew", padx=(14, 0))
+        self.works_preview = self._scrolled(reading)
+        self.works_preview.configure(state="disabled", font=(FONT, 11), spacing3=8)
+        self.works_preview.pack(fill=tk.BOTH, expand=True)
+        self.works_empty = tk.Label(reading, text="灵感会在这里，慢慢长大。\n\n完成的文章与创作，都会收在这一页。",
+                                    bg=PANEL, fg=SUB, font=(FONT, 10), justify="center", wraplength=270)
+        self.works_empty.place(relx=.5, rely=.4, anchor="center")
 
     def _build_story(self) -> None:
-        self.story_area = self._scrolled(self._tab_story, fg="#e6c9a0")
+        heading = tk.Frame(self._tab_story, bg=PANEL)
+        heading.pack(fill=tk.X, padx=28, pady=(24, 8))
+        self._label(heading, "我们的慢时光", size=16, color=ACCENT).pack(anchor="w")
+        self._label(heading, "一些经历，一些成长。故事从每一次相处开始。", color=SUB, size=9).pack(anchor="w", pady=(8, 0))
+        reading = tk.Frame(self._tab_story, bg=PANEL)
+        reading.pack(fill=tk.BOTH, expand=True)
+        self.story_area = self._scrolled(reading, fg=FG)
+        self.story_area.configure(font=(FONT, 11), padx=28, pady=24, spacing1=5, spacing3=8)
         self.story_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.story_empty = tk.Label(reading, text="故事还在慢慢写。\n\n等有了新的篇章，再来这里读一读。",
+                                    bg=PANEL, fg=SUB, font=(FONT, 10), justify="center")
+        self.story_empty.place(relx=.5, rely=.4, anchor="center")
 
     # ---------- 系统日志页（过滤 + 清空） ----------
     def _build_log(self) -> None:
@@ -1300,7 +1621,7 @@ class TkApp:
             rb = ttk.Radiobutton(head, text=level, variable=self.filter_var, value=level, command=self._render_log)
             rb.pack(side=tk.LEFT, padx=(2, 8))
         ttk.Button(head, text="清空日志", command=self._clear_log).pack(side=tk.RIGHT)
-        self.log_area = self._scrolled(self._tab_log, bg="#0f1012", fg="#c8ccd2")
+        self.log_area = self._scrolled(self._tab_log, bg=PANEL, fg=SUB)
         self.log_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
     def _matches_filter(self, level: str) -> bool:
@@ -1313,25 +1634,49 @@ class TkApp:
 
     # ---------- row2 状态栏 ----------
     def _build_statusbar(self, row: int) -> None:
-        bar = tk.Frame(self.root, bg="#1a1c21")
-        bar.grid(row=row, column=0, sticky="ew", padx=12, pady=(0, 10), ipady=3)
-        self.api_state_lbl = tk.Label(bar, text="● API 未开启", font=("Microsoft YaHei UI", 9, "bold"), bg="#1a1c21", fg="#5a5f66")
-        self.api_state_lbl.pack(side=tk.LEFT, padx=10)
-        self.voice_state_lbl = tk.Label(bar, text="音色：mimo_default", bg="#1a1c21", fg=SUB, font=("Microsoft YaHei UI", 8))
-        self.voice_state_lbl.pack(side=tk.LEFT, padx=8)
-        self.hint_lbl = tk.Label(bar, text="设置在“设置”页 · 日志在“系统日志”页", bg="#1a1c21", fg="#5f6670", font=("Microsoft YaHei UI", 8))
-        self.hint_lbl.pack(side=tk.RIGHT, padx=10)
+        bar = tk.Frame(self.root, bg=PANEL)
+        bar.grid(row=row, column=1, sticky="ew")
+        bar.grid_columnconfigure(0, weight=1)
+        self.api_state_lbl = tk.Label(bar, text=API_OFF_HINT, font=(FONT, 8), bg=PANEL, fg=SUB,
+                                      wraplength=450, justify="left", anchor="w")
+        self.api_state_lbl.grid(row=0, column=0, sticky="w", padx=(20, 8), pady=(4, 7))
+        self.voice_state_lbl = tk.Label(bar, text="音色：mimo_default", bg=PANEL, fg=SUB, font=(FONT, 8))
+        self.voice_state_lbl.grid(row=0, column=1, sticky="e", padx=(0, 18), pady=(4, 7))
+        self.hint_lbl = tk.Label(bar, text="", bg=PANEL, fg=SUB, font=(FONT, 8),
+                                wraplength=175, justify="right")
+        self.hint_lbl.grid(row=0, column=2, sticky="e", padx=(0, 12))
 
     # ---------- 输出分流 ----------
     def _ts(self) -> str:
         return datetime.now().strftime("%H:%M:%S")
 
     def _show_chat(self, sender: str, msg: str) -> None:
-        self.chat_area.configure(state="normal")
-        self.chat_area.tag_config(sender, foreground=COLORS.get(sender, FG))
-        self.chat_area.insert(tk.END, f"{sender}：{msg}\n", sender)
-        self.chat_area.see(tk.END)
-        self.chat_area.configure(state="disabled")
+        self.chat_empty_frame.place_forget()
+        follow = sender == "你" or self.chat_area.yview()[1] >= 0.995
+        now = datetime.now()
+        self.chat_area.append(sender, now, msg)
+        if not self._review_has_art:
+            self._review_has_art = True
+            self._sync_review_art(self.root.winfo_width())
+        preview = " ".join(msg.split())
+        self._chat_sidebar_preview.set(preview[:80] + "…" if len(preview) > 80 else preview or sender)
+        self._chat_sidebar_time.set(now.strftime("%H:%M"))
+        if follow:
+            self._jump_to_latest()
+        else:
+            self._has_new_chat = True
+            self.chat_jump.place(relx=1, rely=1, x=-28, y=-14, anchor="se")
+
+    def _on_chat_scroll(self, first: str, last: str) -> None:
+        self._chat_scrollbar.set(first, last)
+        if self._has_new_chat and float(last) >= 0.995:
+            self._has_new_chat = False
+            self.chat_jump.place_forget()
+
+    def _jump_to_latest(self) -> None:
+        self._has_new_chat = False
+        self.chat_area.yview_moveto(1)
+        self.chat_jump.place_forget()
 
     def _log_msg(self, text: str, level: str = "info") -> None:
         self._log_entries.append((level, text))
@@ -1370,6 +1715,11 @@ class TkApp:
         self._desktop_draft_revisions["model"] += 1
         self._pending_settings_patch.pop("model", None)
         self._pending_settings_revisions.pop("model", None)
+        self._desktop_applying_settings = True
+        try:
+            self._refresh_model_options(provider)
+        finally:
+            self._desktop_applying_settings = False
         self._save_desktop_settings({"provider": provider})
         # A provider selection is already a completed choice.  Submit it now
         # so an in-flight probe is followed by the new owner's configuration.
@@ -1380,9 +1730,13 @@ class TkApp:
         provider = self._current_provider()
         if not model or not provider:
             return
-        self._save_desktop_settings({"model": model})
+        # Preserve the visible draft's provider ownership if an earlier
+        # provider transaction failed or another switch is still queued.
+        self._save_desktop_settings({"provider": provider, "model": model})
 
     def _on_api(self) -> None:
+        if self._closing:
+            return
         if not self.api_var.get():
             self._stop_speaking()
         self._save_desktop_settings({"api_enabled": self.api_var.get()})
@@ -1398,7 +1752,7 @@ class TkApp:
     def send(self, _event=None) -> None:
         if self._closing:
             return
-        text = self.entry_var.get().strip()
+        text = self.chat_entry.get("1.0", "end-1c").strip()
         if not text:
             return
         if (self._chat_future is not None and not self._chat_future.done()
@@ -1516,7 +1870,7 @@ class TkApp:
         self._chat_future = None
         self.send_button.configure(state="normal")
         self.chat_cancel_button.configure(state="disabled")
-        self.chat_wait_var.set("近期对话仅属于本次会话；持久记忆可在“今日回顾”查看。")
+        self.chat_wait_var.set("Enter 发送 · Shift+Enter 换行")
         if error:
             self._log_msg(error, "error")
         elif result is not None:
@@ -1601,31 +1955,42 @@ class TkApp:
             self._log_msg(message, level)
 
     # ---------- API 指示 ----------
-    def _set_api_dot_color(self, color: str) -> None:
-        if hasattr(self, "api_dot"):
-            self.api_dot.itemconfig(self._api_dot_oval, fill=color)
+    def _paint_api_status(self, text: str, color: str) -> None:
+        self.api_status_text.set(text)
+        self.api_state_lbl.configure(text=text, fg=color)
 
     def _refresh_api_indicator(self) -> None:
         try:
             state, msg = self.server.runtime.api_indicator()
         except Exception:  # noqa: BLE001
             state, msg = None, "状态未知"
-        if state is True:
-            self.api_state_lbl.configure(text=f"● 已连接 · {msg}", fg=OK)
-            self._set_api_dot_color(OK)
-        elif state is False:
-            self.api_state_lbl.configure(text=f"● {msg}", fg=ERR)
-            self._set_api_dot_color(ERR)
-        else:
-            self.api_state_lbl.configure(text=f"● {msg}", fg=WARN)
-            self._set_api_dot_color(WARN)
         if not self.api_var.get():
-            self.api_state_lbl.configure(text="● API 未开启", fg="#5a5f66")
-            self._set_api_dot_color("#5a5f66")
+            self._paint_api_status(API_OFF_HINT, SUB)
+        elif state is True:
+            self._paint_api_status(f"● 已连接 · {msg}", OK)
+        elif state is False:
+            self._paint_api_status(f"● {msg}", ERR)
+        else:
+            self._paint_api_status(f"● {msg}", WARN)
         self.voice_state_lbl.configure(text=f"音色：{self.voice_var.get()}")
         provider = getattr(self.server.runtime.llm, "provider", "")
         model = getattr(self.server.runtime.llm, "model", "")
         self.mode_lbl.configure(text=f"{PROVIDER_LABELS.get(provider, provider)} / {model}")
+        selected = self._current_provider()
+        if self._settings_pending and selected and selected != provider:
+            settings = self.server.runtime.settings
+            available = selected in settings.keyless_providers or bool(settings.api_keys.get(selected))
+            self._paint_api_status("● 正在切换供应商…" if available else "● 未配置密钥",
+                                   WARN if available else ERR)
+        indicator = getattr(self, "_api_probe_indicator", None)
+        if indicator is not None:
+            context, ok, message = indicator
+            if context == self._api_probe_context():
+                # Initial reads and unrelated settings receipts can arrive
+                # after this probe. They do not revoke its observed state.
+                self._show_api_probe_indicator(ok, message)
+            else:
+                self._api_probe_indicator = None
 
     def _test_api(self) -> None:
         if self._closing:
@@ -1634,10 +1999,14 @@ class TkApp:
         if self._settings_future is not None and not self._settings_future.done():
             self._after(50, self._test_api)
             return
+        if not self.server.runtime.api_enabled:
+            self._api_probe_indicator = None
+            self._paint_api_status(API_OFF_HINT, SUB)
+            return
         self._api_probe_generation += 1
         context = self._api_probe_context()
-        self.api_state_lbl.configure(text="● 测试中…", fg=WARN)
-        self._set_api_dot_color(WARN)
+        self._api_probe_indicator = (context, None, "")
+        self._show_api_probe_indicator(None, "")
         future = self.server.api_check()
         future.add_done_callback(lambda done: self._on_api_check_done(done, context))
 
@@ -1664,16 +2033,20 @@ class TkApp:
             if context[0] == current[0]:
                 self._refresh_api_indicator()  # 当前探测已撤销，不无限停留在“测试中”。
             return
+        self._api_probe_indicator = (context, ok, msg)
         self._render_api_result(ok, msg)
 
     def _render_api_result(self, ok: bool, msg: str) -> None:
         self._log_msg(msg, "ok" if ok else "error")
-        if ok:
-            self.api_state_lbl.configure(text=f"● 已连接 · {msg}", fg=OK)
-            self._set_api_dot_color(OK)
+        self._show_api_probe_indicator(ok, msg)
+
+    def _show_api_probe_indicator(self, ok: bool | None, msg: str) -> None:
+        if ok is None:
+            self._paint_api_status("● 测试中…", WARN)
+        elif ok:
+            self._paint_api_status(f"● 已连接 · {msg}", OK)
         else:
-            self.api_state_lbl.configure(text=f"● 连接失败 · {msg}", fg=ERR)
-            self._set_api_dot_color(ERR)
+            self._paint_api_status(f"● 连接失败 · {msg}", ERR)
 
     # ---------- 总线事件拉取 ----------
     def _after(self, delay: int, callback) -> None:
@@ -1741,9 +2114,18 @@ class TkApp:
         self._cancel_chat(log=False)
         self._clear_desktop_view()
         self._clear_works_view()
-        self.chat_area.configure(state="normal")
-        self.chat_area.delete("1.0", tk.END)
-        self.chat_area.configure(state="disabled")
+        self._set_story_view()
+        self.chat_area.clear()
+        self._review_has_art = False
+        self._sync_review_art(self.root.winfo_width())
+        self._chat_sidebar_preview.set("还没有消息")
+        self._chat_sidebar_time.set("")
+        self.chat_find_query.set("")
+        self._chat_find_row.grid_remove()
+        self._has_new_chat = False
+        self.chat_jump.place_forget()
+        if hasattr(self, "chat_empty_frame"):
+            self.chat_empty_frame.place(relx=.5, rely=.43, anchor="center")
         self._memory_rows.clear()
         self.memory_tree.delete(*self.memory_tree.get_children())
         self.memory_detail.configure(state="normal")
@@ -1791,6 +2173,12 @@ class TkApp:
             self._sync_ui_context()
             epoch = self._ui_context_epoch
             data_dir = self.server.runtime.settings.data_dir
+        except Exception as exc:  # noqa: BLE001
+            self._clear_works_preview()
+            self._set_story_view(error=True)
+            self._log_msg(f"文件视图异常：{type(exc).__name__}", "warn")
+            return
+        try:
             works = sorted((data_dir / "作品集").glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
             names = [w.name for w in works[:40]]
             current = list(self.works_list.get(0, tk.END))
@@ -1798,6 +2186,7 @@ class TkApp:
             selected = self.works_list.get(selection[0]) if selection else None
             if not self.server.context_current(epoch):
                 self._sync_ui_context()
+                self._set_story_view()
                 return
             if names != current:
                 self.works_list.delete(0, tk.END)
@@ -1811,16 +2200,37 @@ class TkApp:
                 self._preview_works(works[index], expected_epoch=epoch)
             else:
                 self._clear_works_preview()
-            story = data_dir / "story.txt"
-            if story.exists():
-                lines = story.read_text(encoding="utf-8").splitlines()[-60:]
-                self.story_area.configure(state="normal")
-                self.story_area.delete("1.0", tk.END)
-                self.story_area.insert(tk.END, "\n".join(lines))
-                self.story_area.configure(state="disabled")
         except Exception as exc:  # noqa: BLE001
             self._clear_works_preview()
-            self._log_msg(f"文件视图异常：{type(exc).__name__} {str(exc)[:60]}", "warn")
+            self._log_msg(f"作品视图异常：{type(exc).__name__}", "warn")
+        # A story read must never clear an unrelated, valid work preview.
+        try:
+            try:
+                content = (data_dir / "story.txt").read_text(encoding="utf-8")
+            except FileNotFoundError:
+                content = ""
+            if not self.server.context_current(epoch):
+                self._sync_ui_context()
+                self._set_story_view()
+                return
+            self._set_story_view("\n".join(content.splitlines()[-60:]))
+        except Exception as exc:  # noqa: BLE001
+            self._set_story_view(error=True)
+            self._log_msg(f"故事视图异常：{type(exc).__name__}", "warn")
+
+    def _set_story_view(self, content: str = "", *, error: bool = False) -> None:
+        self.story_area.configure(state="normal")
+        self.story_area.delete("1.0", tk.END)
+        if content:
+            self.story_area.insert(tk.END, content)
+        self.story_area.configure(state="disabled")
+        if hasattr(self, "story_empty"):
+            self.story_empty.configure(text=("故事暂时无法读取。\n\n原文件已保留，请检查文件编码或访问权限。" if error else
+                                             "故事还在慢慢写。\n\n等有了新的篇章，再来这里读一读。"))
+            if content.strip():
+                self.story_empty.place_forget()
+            else:
+                self.story_empty.place(relx=.5, rely=.4, anchor="center")
 
     def _on_works_select(self, _event=None) -> None:
         self._sync_ui_context()
@@ -1837,6 +2247,8 @@ class TkApp:
         self.works_preview.configure(state="normal")
         self.works_preview.delete("1.0", tk.END)
         self.works_preview.configure(state="disabled")
+        if hasattr(self, "works_empty"):
+            self.works_empty.place(relx=.5, rely=.4, anchor="center")
 
     def _clear_works_view(self) -> None:
         self._clear_works_preview()
@@ -1873,6 +2285,8 @@ class TkApp:
         self.works_preview.delete("1.0", tk.END)
         self.works_preview.insert(tk.END, content)
         self.works_preview.configure(state="disabled")
+        if hasattr(self, "works_empty"):
+            self.works_empty.place_forget()
 
     # ---------- 关闭 ----------
     def on_close(self) -> None:
@@ -1896,7 +2310,7 @@ class TkApp:
 
     def _disable_inputs(self, parent) -> None:
         for widget in parent.winfo_children():
-            if isinstance(widget, (tk.Entry, ttk.Button, ttk.Combobox, ttk.Radiobutton, ttk.Checkbutton)):
+            if isinstance(widget, (tk.Entry, tk.Button, ttk.Button, ttk.Combobox, ttk.Radiobutton, ttk.Checkbutton)):
                 widget.configure(state="disabled")
             self._disable_inputs(widget)
 

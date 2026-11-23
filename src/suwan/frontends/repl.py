@@ -9,11 +9,36 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from suwan.services.doc import DocumentGenerationError
+import builtins
+import sys
 import json
 from pathlib import Path
 
 from suwan.app import SuwanRuntime
 from suwan.config import ENDPOINT_ENV, Settings
+
+
+def _print(*values, **kwargs) -> None:
+    """Keep one malformed string or a narrow console codec from ending a session."""
+    stream = kwargs.get("file") or sys.stdout
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    safe = []
+    for value in values:
+        text = str(value)
+        # Validate before printing, so a failed write cannot leave a partial
+        # turn followed by a duplicate retry. Preserve Chinese/emoji on UTF-8.
+        try:
+            text.encode(encoding, errors="strict")
+        except UnicodeEncodeError:
+            text = text.encode(encoding, errors="backslashreplace").decode(encoding)
+        safe.append(text)
+    builtins.print(*safe, **kwargs)
+
+
+def _read_line() -> str:
+    _print("你> ", end="", flush=True)
+    return input("")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -69,102 +94,114 @@ async def amain(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     settings = _build_settings(args.home)
     for warning in getattr(settings, "configuration_warnings", ()):
-        print(f"配置提示：{warning}")
+        _print(f"配置提示：{warning}")
     runtime = SuwanRuntime(settings)
     await runtime.start()
     for warning in getattr(runtime, "startup_warnings", ()):
-        print(f"启动提示：{warning}")
+        _print(f"启动提示：{warning}")
     try:
         if args.smoke:
             reply = await runtime.ask(args.smoke)
-            print(f"苏晚：{reply}")
+            _print(f"苏晚：{reply}")
             return 0
-        print("—— 苏晚 v7 候选版已苏醒。命令：/quit /status /desk today|find 词语|settings|set 键 JSON值|export /learn list|load <JSON路径>|step ID|run ID|cancel ID|revise ID 理由|find 查询 /activities /pause /resume /continue <ID> /discard <ID> /like <ID> /dislike <ID> /cfg /memory help /api on|off /net on|off /model <名> /voice <名> /tts <话> /doc <主题>")
+        _print("—— 苏晚 v7 候选版已苏醒。命令：/quit /status /desk today|find 词语|settings|set 键 JSON值|export /learn list|load <JSON路径>|step ID|run ID|cancel ID|revise ID 理由|find 查询 /activities /pause /resume /continue <ID> /discard <ID> /like <ID> /dislike <ID> /cfg /memory help /api on|off /net on|off /model <名> /voice <名> /tts <话> /doc <主题>")
         while True:
-            line = await asyncio.to_thread(input, "你> ")
+            try:
+                line = await asyncio.to_thread(_read_line)
+            except EOFError:
+                break
             line = line.strip()
             if not line:
+                continue
+            try:
+                line.encode("utf-8", errors="strict")
+            except UnicodeError:
+                _print("输入包含无效 Unicode 字符，请重新输入。")
                 continue
             if line in ("/quit", "/exit"):
                 break
             if line == "/status":
                 for name, state in runtime.status().items():
-                    print(f"{name}: {state}")
+                    _print(f"{name}: {state}")
                 continue
             if line == "/cfg":
                 flags = runtime.status()["flags"]
-                print(f"API={flags['api']} 联网={flags['network']} 模型={flags['llm_provider']}（可用：{', '.join(ENDPOINT_ENV)}）")
+                _print(f"API={flags['api']} 联网={flags['network']} 模型={flags['llm_provider']}（可用：{', '.join(ENDPOINT_ENV)}）")
                 continue
             if line == "/desk" or line.startswith("/desk "):
-                print(await desktop_command(runtime, line))
+                _print(await desktop_command(runtime, line))
                 continue
             if line == "/learn" or line.startswith("/learn "):
                 result = await runtime.learning_command(line)
-                print(result.get("text", "学习操作完成。" if result.get("ok") else "学习操作未完成。"))
+                _print(result.get("text", "学习操作完成。" if result.get("ok") else "学习操作未完成。"))
                 continue
             if line == "/activities":
                 view = await runtime.activity_view()
-                print(f"后台活动：{'暂停' if view.get('paused') else '可运行'}")
-                print(f"调用预算：{view.get('budget', {})}")
+                _print(f"后台活动：{'暂停' if view.get('paused') else '可运行'}")
+                _print(f"调用预算：{view.get('budget', {})}")
                 for item in view.get("activities", []):
-                    print(f"{item.get('id')} | {item.get('action', '')} | {item.get('status', '')} / {item.get('phase', '')} | {item.get('reason', '')}")
+                    _print(f"{item.get('id')} | {item.get('action', '')} | {item.get('status', '')} / {item.get('phase', '')} | {item.get('reason', '')}")
                     if item.get("error"):
-                        print(f"  说明：{item['error']}")
+                        _print(f"  说明：{item['error']}")
                     if item.get("status") == "unknown":
                         if item.get("action") in {"diary", "story"}:
-                            print("  请求可能已经发送，不自动重发。当日日历记录保留占位，此处仅查看。")
+                            _print("  请求可能已经发送，不自动重发。当日日历记录保留占位，此处仅查看。")
                         else:
-                            print("  请求可能已经发送，不自动重发。/discard ID 可解除活动等待；已占用调用额度不会返还。")
+                            _print("  请求可能已经发送，不自动重发。/discard ID 可解除活动等待；已占用调用额度不会返还。")
                 if view.get("last_error"):
-                    print(f"活动提示：{view['last_error']}")
+                    _print(f"活动提示：{view['last_error']}")
                 continue
             if line in {"/pause", "/resume"}:
                 result = await runtime.activity_command(line[1:])
-                print(result.get("text", "操作完成。" if result.get("ok") else "操作未完成。"))
+                _print(result.get("text", "操作完成。" if result.get("ok") else "操作未完成。"))
                 continue
             if any(line.startswith(prefix + " ") for prefix in ("/continue", "/discard", "/like", "/dislike")):
                 command, activity_id = line.split(maxsplit=1)
                 result = await runtime.activity_command(command[1:], activity_id.strip())
-                print(result.get("text", "操作完成。" if result.get("ok") else "操作未完成。"))
+                _print(result.get("text", "操作完成。" if result.get("ok") else "操作未完成。"))
                 continue
             if line.startswith("/model "):
                 name = line[7:].strip()
                 if name in ENDPOINT_ENV:
                     result = await runtime.update_desktop_settings({"provider": name})
-                    print(result.get("text", f"模型 -> {name}（{runtime.llm.model}）"))
+                    _print(result.get("text", f"模型 -> {name}（{runtime.llm.model}）"))
                 else:
-                    print(f"未知供应商，可用：{', '.join(ENDPOINT_ENV)}")
+                    _print(f"未知供应商，可用：{', '.join(ENDPOINT_ENV)}")
                 continue
             if line == "/api" or line.startswith("/api "):
                 value = line.partition(" ")[2].lower()
                 if value not in {"on", "off", "1", "0", "true", "false"}:
-                    print("用法：/api on|off")
+                    _print("用法：/api on|off")
                     continue
                 result = await runtime.update_desktop_settings({"api_enabled": value in ("on", "1", "true")})
-                print(result.get("text", f"API -> {runtime.api_enabled}"))
+                _print(result.get("text", f"API -> {runtime.api_enabled}"))
                 continue
             if line == "/net" or line.startswith("/net "):
                 value = line.partition(" ")[2].lower()
                 if value not in {"on", "off", "1", "0", "true", "false"}:
-                    print("用法：/net on|off")
+                    _print("用法：/net on|off")
                     continue
                 result = await runtime.update_desktop_settings({"network_enabled": value in ("on", "1", "true")})
-                print(result.get("text", f"联网 -> {runtime.network_enabled}"))
+                _print(result.get("text", f"联网 -> {runtime.network_enabled}"))
                 continue
             if line.startswith("/voice "):
                 result = await runtime.update_desktop_settings({"voice": line[7:].strip()})
-                print(result.get("text", f"音色 -> {runtime.tts_voice}"))
+                _print(result.get("text", f"音色 -> {runtime.tts_voice}"))
                 continue
             if line.startswith("/tts "):
                 path, error = await runtime.speak(line[5:].strip())
-                print(f"已生成语音：{path}" if path else f"语音失败：{error}")
+                _print(f"已生成语音：{path}" if path else f"语音失败：{error}")
                 continue
             if line.startswith("/doc "):
-                path = await runtime.doc_service.generate(line[5:].strip())
-                print(f"已生成文档：{path}" if path else "文档生成失败（需先 /api on）")
+                try:
+                    path = await runtime.doc_service.generate(line[5:].strip())
+                except DocumentGenerationError as exc:
+                    _print(f"文档生成失败：{exc}")
+                else:
+                    _print(f"已生成文档：{path}" if path else "文档未生成，请检查 API 开关、配置或稍后重试。")
                 continue
             reply = await runtime.ask(line)
-            print(f"苏晚：{reply}")
+            _print(f"苏晚：{reply}")
         return 0
     finally:
         await runtime.stop()

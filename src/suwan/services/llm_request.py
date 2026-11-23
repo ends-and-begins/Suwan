@@ -9,7 +9,7 @@ from suwan.calls import CallDenied
 from suwan.context import bound_messages
 
 
-def llm_chat(llm, system: str, prompt: str, max_tokens: int | None = None, *, timeout: float = LLM_TIMEOUT_SECONDS, priority: int = 0, source: str = "chat", call_key: str | None = None, raise_on_denied: bool = False, cancelled: threading.Event | None = None):
+def llm_chat(llm, system: str, prompt: str, max_tokens: int | None = None, *, timeout: float = LLM_TIMEOUT_SECONDS, priority: int = 0, source: str = "chat", call_key: str | None = None, raise_on_denied: bool = False, raise_on_error: bool = False, cancelled: threading.Event | None = None):
     """立即捕获来源代数，返回可 await 的有界请求。
 
     故意使用普通 def：创建请求和捕获代数不能延迟到 coroutine 真正执行时。
@@ -27,6 +27,8 @@ def llm_chat(llm, system: str, prompt: str, max_tokens: int | None = None, *, ti
         if generation is None:
             return llm.chat(system, prompt, max_tokens)
         kwargs = {"expected_generation": generation, "cancelled": cancelled}
+        if raise_on_error:
+            kwargs["raise_on_error"] = True
         if manager is not None:
             kwargs.update(priority=priority, source=source, call_key=call_key, raise_on_denied=raise_on_denied)
         return llm.chat(system, prompt, max_tokens, **kwargs)

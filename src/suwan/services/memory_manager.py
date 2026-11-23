@@ -10,10 +10,23 @@ PAGE_SIZE = 100
 
 
 class MemoryManager:
-    def __init__(self, memory, identity, sensory, *, persist_state=None, on_change=None):
+    def __init__(self, memory, identity, sensory, *, persist_state=None, on_change=None, on_blocked=None):
         self.memory, self.identity, self.sensory = memory, identity, sensory
         self.persist_state, self.on_change = persist_state, on_change
+        self.on_blocked = on_blocked
         self.epoch = 0
+        self.memory.bind_storage_change(self._storage_changed)
+
+    def _storage_changed(self, *, readable: bool) -> None:
+        if readable:
+            self.changed()
+            return
+        # A protected store cannot safely answer get_fact/project_identity.
+        # Clear projections directly, then revoke work without reading it again.
+        self.reset_context()
+        self.identity.register_name(None)
+        if self.on_blocked:
+            self.on_blocked()
 
     def initialise(self) -> None:
         self.memory.bootstrap_identity(self.identity.user_name)

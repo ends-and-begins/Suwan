@@ -20,6 +20,9 @@ from pathlib import Path
 from typing import Any
 
 _lock = threading.Lock()
+# Metadata logs never replace state files. A slow append must not prevent an
+# unrelated memory pause/settings transaction from acquiring the state lock.
+_append_lock = threading.Lock()
 
 
 class DataFileError(ValueError):
@@ -135,6 +138,6 @@ def append_line(path: str | Path, line: str) -> None:
     """线程安全地追加一行文本（日志类使用）。"""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with _lock:
+    with _append_lock:
         with open(p, "a", encoding="utf-8") as f:
             f.write(line + "\n")

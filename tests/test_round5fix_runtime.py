@@ -289,10 +289,10 @@ class LearningFixTkTest(unittest.TestCase):
         old_learning = {"ok": True, "text": NOTE, "_context_epoch": old_epoch}
         old_chat = {"text": NOTE, "epoch": old_epoch}
         self.app._render_learning(old_learning, self.app._learning_generation)
-        self.assertIn(NOTE, self.app.chat_area.get("1.0", "end"))
+        self.assertIn(NOTE, self.app.chat_area.text())
         result = self.app.server.learning_command("/learn cancel " + identifier).result(timeout=3)
         self.assertEqual(result["task"]["status"], "cancelled")
-        self.pump_until(lambda: NOTE not in self.app.chat_area.get("1.0", "end"))
+        self.pump_until(lambda: NOTE not in self.app.chat_area.text())
         self.runtime.set_api_enabled(True)
         self.app.read_var.set(True)
         self.app._render_learning(old_learning, self.app._learning_generation)
@@ -300,7 +300,7 @@ class LearningFixTkTest(unittest.TestCase):
         future.set_result(old_chat)
         self.app._on_reply_done(future)
         self.app._pump()
-        self.assertNotIn(NOTE, self.app.chat_area.get("1.0", "end"))
+        self.assertNotIn(NOTE, self.app.chat_area.text())
         self.assertEqual(self.app._last_reply, "")
         self.assertFalse(self.payloads)
         self.assertEqual(self.runtime.organs["memory"].get_item(source_id).content, SOURCE)
@@ -313,9 +313,9 @@ class LearningFixTkTest(unittest.TestCase):
         self.assertTrue(revised["ok"], revised)
         self.app._pump()
         self.app._render_learning(old, self.app._learning_generation)
-        self.assertNotIn(NOTE, self.app.chat_area.get("1.0", "end"))
+        self.assertNotIn(NOTE, self.app.chat_area.text())
         self.app._render_learning(revised, self.app._learning_generation)
-        self.assertIn(revised["text"], self.app.chat_area.get("1.0", "end"))
+        self.assertIn(revised["text"], self.app.chat_area.text())
 
 
 if __name__ == "__main__":

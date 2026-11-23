@@ -19,11 +19,12 @@ from pathlib import Path
 from suwan.adapters.browser import SafeBrowser
 from suwan.adapters.filestore import ensure_dir, read_json_checked
 from suwan.adapters.llm import LLM_TIMEOUT_SECONDS, LLMClient
+from suwan.adapters.http_chat import describe_api_error
 from suwan.adapters.migrator import commit as commit_legacy, prepare as prepare_legacy
 from suwan.adapters.tts import TTSClient
 from suwan.bus import EventBus
 from suwan.clock import Clock, RealClock
-from suwan.calls import CallManager
+from suwan.calls import CallDenied, CallManager
 from suwan.config import ENDPOINT_ENV, Settings
 from suwan.events import CLOCK_TICK, TTS_DONE, TTS_REQUEST
 from suwan.instance_lock import InstanceLock
@@ -74,7 +75,10 @@ class SuwanRuntime:
         self.clock = clock or RealClock()
         self._log = logging.getLogger(logger_name)
         self._running = False
+        self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._lifecycle_lock = asyncio.Lock()
+        self._shutdown_task: asyncio.Task | None = None
+        self._shutdown_waiters: set[asyncio.Task] = set()
         self._instance_lock = InstanceLock(self.settings.data_dir)
         self._ticker_task: asyncio.Task | None = None
         self._foreground_tasks: set[asyncio.Task] = set()
@@ -144,7 +148,7 @@ class SuwanRuntime:
 
         self.memory_manager = MemoryManager(
             self.organs["memory"], self.organs["identity"], self.organs["sensory"],
-            persist_state=store.save, on_change=self._memory_changed,
+            persist_state=store.save, on_change=self._memory_changed, on_blocked=self._memory_storage_blocked,
         )
 
         # 服务
@@ -218,6 +222,7 @@ class SuwanRuntime:
         async with self._lifecycle_lock:
             if self._running:
                 return
+            self._owner_loop = asyncio.get_running_loop()
             # 在迁移/恢复或器官写入前持有进程锁；锁失败不能清理其它实例。
             self._instance_lock.acquire()
             self.startup_warnings.clear()
@@ -295,23 +300,112 @@ class SuwanRuntime:
                         await self.bus.stop()
                     finally:
                         self.search_service.set_active(False)
-                        for client in self._llm_clients:
-                            client.set_active(False)
-                        self.tts.set_active(False)
-                        self.call_manager.close()
-                        self.notification_ledger.close()
-                        self._instance_lock.release()
+                        try:
+                            await self._close_llm_logs()
+                        finally:
+                            try:
+                                await self._close_adapter_writes()
+                            finally:
+                                self.notification_ledger.close()
+                                self._instance_lock.release()
                 raise
 
+    async def _close_llm_logs(self) -> None:
+        """Keep directory ownership until authorized metadata writes finish.
+
+        Revocation is immediate. Waiting happens off the owner loop and cannot
+        be abandoned by cancellation while an old writer still owns the file.
+        """
+        clients = tuple(self._llm_clients)
+        for client in clients:
+            client.set_active(False)
+
+        def join():
+            for client in clients:
+                client.wait_for_log_writes()
+
+        pending = asyncio.create_task(asyncio.to_thread(join))
+        cancelled = bool(asyncio.current_task().cancelling())
+        while True:
+            try:
+                await asyncio.shield(pending)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+
     async def stop(self) -> None:
+        """Join one owned cleanup; cancelling a caller never cancels that cleanup."""
+        caller = asyncio.current_task()
+        self._shutdown_waiters.add(caller)
+        try:
+            if self._shutdown_task is None or self._shutdown_task.done():
+                async def outcome():
+                    try:
+                        await self._stop_owned()
+                        return None
+                    except BaseException as exc:
+                        # Shielded tasks must not report late exceptions when
+                        # a cancelled waiter still needs to finish cleanup.
+                        return exc
+                self._shutdown_task = asyncio.create_task(outcome(), name="suwan.shutdown")
+            pending = self._shutdown_task
+            cancelled = bool(caller.cancelling())
+            while True:
+                try:
+                    error = await asyncio.shield(pending)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+            if error is not None:
+                raise error
+            if cancelled:
+                raise asyncio.CancelledError
+        finally:
+            self._shutdown_waiters.discard(caller)
+
+    async def _close_adapter_writes(self) -> None:
+        """Revoke immediately, then drain authorized adapter I/O off the loop."""
+        self.tts.set_active(False)
+        self.call_manager.close()
+
+        def join():
+            try:
+                for adapter in (self.tts, self.call_manager):
+                    drain = getattr(adapter, "wait_for_writes", None)
+                    if drain is not None:
+                        drain()
+                return None
+            except BaseException as exc:
+                return exc
+
+        pending = asyncio.create_task(asyncio.to_thread(join))
+        cancelled = False
+        while True:
+            try:
+                error = await asyncio.shield(pending)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+        if error is not None:
+            raise error
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _stop_owned(self) -> None:
         async with self._lifecycle_lock:
             if not self._running:
                 return
             self._running = False
             self.search_service.set_active(False)
+            self.tts.set_active(False)
+            for client in self._llm_clients:
+                client.set_active(False)
             errors = []
             try:
-                pending_requests = [task for task in self._foreground_tasks if task is not asyncio.current_task()]
+                pending_requests = [task for task in self._foreground_tasks
+                                    if task is not asyncio.current_task() and task not in self._shutdown_waiters]
                 for task in pending_requests:
                     task.cancel()
                 if pending_requests:
@@ -343,12 +437,14 @@ class SuwanRuntime:
                 try:
                     await self.bus.stop()
                 finally:
-                    for client in self._llm_clients:
-                        client.set_active(False)
-                    self.tts.set_active(False)
-                    self.call_manager.close()
-                    self.notification_ledger.close()
-                    self._instance_lock.release()
+                    try:
+                        await self._close_llm_logs()
+                    finally:
+                        try:
+                            await self._close_adapter_writes()
+                        finally:
+                            self.notification_ledger.close()
+                            self._instance_lock.release()
             if errors:
                 for error in errors:
                     self._log.error("停止时发生错误: %s", error)
@@ -420,25 +516,35 @@ class SuwanRuntime:
         if not self._running:
             return None, "运行时未启动"
         await self.wait_desktop_settings()
+        if not self._running:
+            return None, "运行时未启动"
         if expected_epoch is not None and not self.context_current(expected_epoch):
             return None, "记忆设置已变更，语音请求已取消。"
         if not self._api_enabled:
             return None, "API 未开启"
         voice = voice or getattr(self, "tts_voice", "mimo_default")
         task = asyncio.current_task()
+        delivery = self.tts_service.open_delivery()
         self._foreground_tasks.add(task)
         try:
             generation = self.tts.request_generation
             with self.call_manager.foreground():
                 data = await request(self.bus, TTS_REQUEST, TTS_DONE, {
-                    "text": text, "voice": voice, "generation": generation,
+                    "text": text, "voice": voice, "generation": generation, "delivery_id": delivery,
                 }, timeout=60.0)
+            if not bool(data.get("ok")):
+                return None, str(data.get("error") or "语音合成失败")
+            if not self._running or not self._api_enabled or generation != self.tts.request_generation:
+                return None, "语音请求已因 API 开关或运行时变化取消，请重新发起"
+            path = data.get("file")
+            if not self.tts_service.claim_delivery(delivery, path):
+                return None, "语音请求已取消，结果未交付"
+            return path, None
         except RpcTimeoutError:
             return None, "语音合成超时"
         finally:
+            self.tts_service.close_delivery(delivery)
             self._foreground_tasks.discard(task)
-        ok = bool(data.get("ok"))
-        return (data.get("file"), None) if ok else (None, str(data.get("error") or "语音合成失败"))
 
     @property
     def api_enabled(self) -> bool:
@@ -458,6 +564,22 @@ class SuwanRuntime:
         self.organs["affect"].modifiers[:] = [m for m in self.organs["affect"].modifiers
             if not m["source"].startswith("interaction:")
             or (m["source"][12:] in valid and m["value"] * valid[m["source"][12:]] > 0)]
+
+    def _memory_storage_blocked(self) -> None:
+        """Revoke projections after a storage conflict without rereading memory."""
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        loop = self._owner_loop
+        if loop is not None and loop.is_running() and current is not loop:
+            loop.call_soon_threadsafe(self._memory_storage_blocked)
+            return
+        self._cancel_context_work()
+        self.autonomous_service._privacy_blocked = True
+        self._learning_goal_projection = []
+        self._invalidate_activity_sources()
+        self._invalidate_learning_sources()
 
     def _memory_changed(self, *, clear_context=True) -> None:
         """管理操作执行于运行时循环内；撤销包含旧上下文的工作。"""
@@ -614,10 +736,22 @@ class SuwanRuntime:
         self._foreground_tasks.add(task)
         try:
             with self.call_manager.foreground():
-                reply = await llm_chat(llm, "你是一个连通性测试助手。", "请只回复：OK", 8,
-                                       timeout=LLM_TIMEOUT_SECONDS, source="api_probe")
+                reply = await llm_chat(llm, "你是一个连通性测试助手。", "请只回复：OK", 32,
+                                       timeout=LLM_TIMEOUT_SECONDS, source="api_probe",
+                                       raise_on_denied=True, raise_on_error=True)
+        except CallDenied as exc:
+            reasons = {"budget_exhausted": "本地调用预算已用完，请检查设置中的每日调用和输出额度",
+                       "ledger_readonly": "调用账本只读，请检查运行记录并修复数据后重启",
+                       "cancelled": "测试已取消，配置可能发生变化",
+                       "closed": "运行时已关闭", "already_sent": "该测试请求已经发送，不自动重试",
+                       "invalid_request": "测试参数无效"}
+            return False, reasons.get(exc.reason, "本地策略未允许发送此次测试")
         except Exception as exc:  # noqa: BLE001
-            return False, f"连接失败：{type(exc).__name__}: {str(exc)[:80]}"
+            error = describe_api_error(exc)
+            hint = ""
+            if error.kind == "model" and llm.provider == "deepseek":
+                hint = "；可在设置中选择 deepseek-flash，点击“应用模型”后重新测试"
+            return False, f"连接失败（{llm.provider}/{llm.model}）：{error}{hint}"
         finally:
             self._foreground_tasks.discard(task)
         if reply:
@@ -649,7 +783,7 @@ class SuwanRuntime:
             "relation": self.organs["relation"].state(),
             "goals": goals,
             "identity": self.organs["identity"].state(),
-            "memory": self.organs["memory"].state(),
+            "memory": self.organs["memory"].peek_state(),
             "flags": {"api": self._api_enabled, "network": self._network_enabled, "llm_provider": self.llm.provider},
         }
 

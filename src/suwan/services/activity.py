@@ -10,6 +10,7 @@ import re
 import uuid
 
 from suwan.adapters.filestore import DataFileError, atomic_write_json, read_json_checked
+from suwan.adapters.artifacts import check_pending_commit, file_fingerprint, file_revision, guarded_replace
 from suwan.context import TRACKED_GENERATION_REF
 
 ACTIONS = frozenset({"learning", "creation", "social", "reminisce", "idle"})
@@ -40,6 +41,7 @@ def activity_result_state(row: dict, memory) -> str:
     ``memory_saved`` false. A same-ID correction keeps its receipt, so the
     receipt alone cannot authorize replaying the previous draft or success.
     """
+    memory.revision  # Check the disk version before consulting cached receipts/items.
     if row["action"] not in {"learning", "creation"}:
         return "missing"
     receipt = "activity:" + row["id"] + ":memory"
@@ -65,6 +67,8 @@ class ActivityJournal:
         self.paused = False
         self._loaded = False
         self._read_error: DataFileError | None = None
+        self._disk_fingerprint: bytes | None = None
+        self._disk_revision: tuple | None = None
         self.revision = 0
 
     @staticmethod
@@ -142,42 +146,69 @@ class ActivityJournal:
         if self._read_error is not None:
             raise self._read_error
         if self._loaded:
+            self._check_disk()
             return
         try:
+            check_pending_commit(self.path)
+            revision = file_revision(self.path)
+            fingerprint = file_fingerprint(self.path)
             data = read_json_checked(self.path, default={"version": 1, "paused": False, "activities": []})
             self.validate(data)
             if any((datetime.fromisoformat(row["created"]).tzinfo is None) != (self.clock.now().tzinfo is None)
                    or (datetime.fromisoformat(row["updated"]).tzinfo is None) != (self.clock.now().tzinfo is None)
                    for row in data["activities"]):
                 raise ValueError("活动时间的时区格式不一致")
-        except (ValueError, TypeError, KeyError) as exc:
+            if file_revision(self.path) != revision or file_fingerprint(self.path) != fingerprint:
+                raise DataFileError(self.path, "加载期间活动文件发生变化，请重新加载")
+        except (ValueError, TypeError, KeyError, OverflowError, RecursionError) as exc:
             self._read_error = exc if isinstance(exc, DataFileError) else DataFileError(self.path, "活动记录字段非法")
+            self.records = []
+            self.revision += 1
             raise self._read_error from exc
         self.records = data["activities"]
         self.paused = data["paused"]
         self._loaded = True
+        self._disk_fingerprint = fingerprint
+        self._disk_revision = revision
+
+    def reload(self) -> None:
+        """Explicitly discard cached activity state and load the current file."""
+        self._loaded, self._read_error = False, None
+        self.records = []
+        self.load()
+        self.revision += 1
+
+    def _check_disk(self) -> None:
+        try:
+            revision = file_revision(self.path)
+            if file_fingerprint(self.path) != self._disk_fingerprint:
+                raise DataFileError(self.path, "活动文件已被外部替换或删除，已隐藏旧活动；请重新加载")
+            self._disk_revision = revision
+        except DataFileError as exc:
+            self._read_error = exc
+            self.records = []
+            self.revision += 1
+            raise
 
     def _commit(self, mutation):
         self.load()
         if self._read_error:
             raise self._read_error
-        try:
-            prior = read_json_checked(self.path)
-            if prior is not None:
-                self.validate(prior)
-        except (ValueError, TypeError, KeyError) as exc:
-            self._read_error = exc if isinstance(exc, DataFileError) else DataFileError(self.path, "活动记录字段非法")
-            raise self._read_error from exc
         previous = copy.deepcopy((self.records, self.paused))
         try:
             result = mutation()
             payload = {"version": 1, "paused": self.paused, "activities": self.records}
             self.validate(payload)
-            atomic_write_json(self.path, payload)
+            self._disk_fingerprint, self._disk_revision = guarded_replace(
+                self.path, self._disk_fingerprint, lambda target: atomic_write_json(target, payload))
             self.revision += 1
             return result
-        except BaseException:
+        except BaseException as exc:
             self.records, self.paused = previous
+            if isinstance(exc, DataFileError):
+                self._read_error = exc
+                self.records = []
+                self.revision += 1
             raise
 
     def get(self, identifier: str) -> dict | None:

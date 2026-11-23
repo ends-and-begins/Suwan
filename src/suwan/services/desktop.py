@@ -14,7 +14,8 @@ from pathlib import Path
 import tempfile
 import uuid
 
-from suwan.adapters.filestore import atomic_write_json, read_json_checked
+from suwan.adapters.artifacts import check_pending_commit, guarded_replace
+from suwan.adapters.filestore import DataFileError, atomic_write_json, read_json_checked
 from suwan.adapters.tts import VOICE_PRESETS
 from suwan.calls import CallPolicy
 from suwan.config import ENDPOINT_ENV
@@ -39,6 +40,10 @@ def validate_settings(values):
     model = values["model"]
     if type(model) is not str or not model.strip() or model != model.strip() or len(model) > 256 or any(ord(c) < 32 or ord(c) == 127 for c in model):
         raise ValueError("模型名须为1..256个不含控制字符的非空字符")
+    try:
+        model.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("模型名包含无效Unicode字符，请重新输入") from None
     if type(values["voice"]) is not str or values["voice"] not in VOICE_PRESETS:
         raise ValueError("请选择受支持的朗读音色")
     for key in ("auto_read", "api_enabled", "network_enabled"):
@@ -69,7 +74,8 @@ class DesktopService:
             return None
 
     def _block(self, exc):
-        self.error = f"桌面设置不可写（{type(exc).__name__}）；原文件已保留，请修复或从有效备份恢复后重新启动。本地聊天仍可使用。"
+        detail = exc.reason if isinstance(exc, DataFileError) else type(exc).__name__
+        self.error = f"桌面设置不可写（{detail}）。请检查保留的文件或从有效备份恢复后重启。本地聊天仍可使用。"
 
     def _check_disk(self):
         if self.error:
@@ -122,6 +128,7 @@ class DesktopService:
         self.error = ""
         self._loaded = True
         try:
+            check_pending_commit(self.path)
             fingerprint = self._digest()
             data = read_json_checked(self.path)
             if self._digest() != fingerprint:
@@ -148,22 +155,10 @@ class DesktopService:
             self._block(exc)
 
     def _persist_settings(self, data, previous_fingerprint):
-        # Stage away from the live path. A global filestore-lock wait must not
-        # let an external replacement be overwritten with our stale settings.
-        staging = self.path.with_name("." + self.path.name + "." + uuid.uuid4().hex + ".pending")
-        try:
-            if self._digest() != previous_fingerprint:
-                raise ValueError("设置文件在运行期间发生变化")
-            atomic_write_json(staging, data)
-            fingerprint = hashlib.sha256(staging.read_bytes()).digest()
-            if self._digest() != previous_fingerprint:
-                raise ValueError("保存期间设置文件已变化，未覆盖外部文件")
-            os.replace(staging, self.path)
-            if self._digest() != fingerprint:
-                raise ValueError("设置提交后内容已变化")
-            return fingerprint
-        finally:
-            staging.unlink(missing_ok=True)
+        check_pending_commit(self.path)
+        fingerprint, _ = guarded_replace(
+            self.path, previous_fingerprint, lambda target: atomic_write_json(target, data))
+        return fingerprint
 
     async def update(self, patch):
         if type(patch) is not dict or not patch or set(patch) - SETTINGS_KEYS:
@@ -188,6 +183,9 @@ class DesktopService:
             if not self._loaded or self.error:
                 return self._settings_result(False, self.error or "设置尚未加载。")
             data = {"version": 1, "settings": values}
+            # Validate serialization while this is still a recoverable input
+            # error, before the durable writer acquires ownership.
+            json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
             async def persist():
                 # Transport late I/O failures as data (Python 3.14 shield).
                 try:

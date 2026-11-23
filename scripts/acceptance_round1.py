@@ -162,10 +162,11 @@ def gui_flow(base: Path) -> dict:
         if not app._last_reply:
             app.root.after(30, poll_second)
             return
-        text = app.chat_area.get("1.0", "end")
-        assert text.count("你：我叫小明") == 1
-        assert text.count("你：昨晚我们一起看了星空") == 1
-        assert text.count("苏晚：") == 2
+        lines = app.chat_area.text().splitlines()
+        assert lines.count("我叫小明") == 1
+        assert lines.count("昨晚我们一起看了星空") == 1
+        assert sum(line.startswith("你  ·  ") for line in lines) == 2
+        assert sum(line.startswith("苏晚  ·  ") for line in lines) == 2
 
         async def inspect_and_create():
             lines = runtime.organs["sensory"].recent(20)

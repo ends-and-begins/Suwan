@@ -10,12 +10,17 @@ import os
 import random
 import re
 import tempfile
+import threading
 import uuid
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
 
+from suwan.adapters.artifacts import check_pending_commit, file_fingerprint, file_revision, guarded_replace
 from suwan.adapters.filestore import DataFileError, atomic_write_text, read_json_checked
 from suwan.bus import EventBus
 from suwan.clock import Clock
@@ -48,11 +53,36 @@ class MemoryItem:
     derived_from: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class MemoryReadSnapshot:
+    revision: int
+    items: tuple[MemoryItem, ...]
+    durable_receipts: frozenset[str]
+    content_versions: Mapping[str, int]
+
+
+def _locked_memory(operation):
+    """Publish metadata only after the outermost operation has committed/rolled back."""
+    @wraps(operation)
+    def locked(self, *args, **kwargs):
+        with self._state_lock:
+            self._state_depth += 1
+            try:
+                return operation(self, *args, **kwargs)
+            finally:
+                self._state_depth -= 1
+                if self._state_depth == 0:
+                    self._published_state = self._state_payload()
+    return locked
+
+
 class MemoryOrgan(Organ):
     name = "memory"
 
     def __init__(self, bus: EventBus, clock: Clock, *, file_path: str | Path, save_every: int = 10) -> None:
         super().__init__(bus, clock)
+        self._state_lock = threading.RLock()
+        self._state_depth = 0
         self._file = Path(file_path)
         self._save_every = max(1, save_every)
         self.items: list[MemoryItem] = []
@@ -66,18 +96,26 @@ class MemoryOrgan(Organ):
         self._read_error: DataFileError | None = None
         self._durable_receipts: set[str] = set()
         self._loaded = False
+        self._disk_fingerprint: bytes | None = None
+        self._disk_revision: tuple | None = None
+        self._storage_change_handler = None
+        self._storage_blocked_notified = False
+        self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._legacy_bytes: bytes | None = None
         # 只读投影的失效令牌；不是磁盘格式，也不把未落盘来源当作已确认来源。
         # 正文版本独立于元数据/收据提交，避免无关变更重复散列大分享正文。
         self._revision = 0
         self._content_versions: dict[str, int] = {}
+        self._published_state = self._state_payload()
 
     @property
+    @_locked_memory
     def revision(self) -> int:
         """当前公开写入口的单调修订；一次成功落盘也会改变它。"""
         self._ensure_writable()
         return self._revision
 
+    @_locked_memory
     def content_version(self, item_id: str) -> int:
         """正文内容的运行时版本，仅供只读派生缓存使用。"""
         self._ensure_writable()
@@ -89,6 +127,7 @@ class MemoryOrgan(Organ):
             self._content_versions[identifier] = self._revision
 
     async def _on_start(self) -> None:
+        self._owner_loop = asyncio.get_running_loop()
         await asyncio.to_thread(self._load)
         self._subscribe(MEMORY_ADD_REQUEST, self._on_add_request)
         self._subscribe(MEMORY_MAINTENANCE, self._on_maintenance)
@@ -145,13 +184,72 @@ class MemoryOrgan(Organ):
         if self._read_error is not None:
             self._log.error("原记忆文件未成功读取，已阻止退出覆盖: %s", self._file)
             return
-        self.force_save()
+        try:
+            self.force_save()
+        except DataFileError as exc:
+            self._log.error("退出时检测到记忆存储冲突，已阻止覆盖: %s", exc)
 
+    @_locked_memory
     def _ensure_writable(self) -> None:
         if self._read_error is not None:
             raise self._read_error
         if not self._loaded:
             self._load()
+        try:
+            revision = file_revision(self._file)
+            if file_fingerprint(self._file) != self._disk_fingerprint:
+                raise DataFileError(self._file, "记忆文件已被外部替换或删除，已隐藏旧记忆；请重新加载")
+            self._disk_revision = revision
+        except DataFileError as exc:
+            self._read_error = exc
+            self._hide_stale()
+            raise
+
+    @_locked_memory
+    def _hide_stale(self) -> None:
+        self.items = []
+        self._durable_receipts.clear()
+        self._content_versions.clear()
+        self.privacy_generation += 1
+        self._touch()
+        if not self._storage_blocked_notified:
+            self._storage_blocked_notified = True
+            if self._storage_change_handler is not None:
+                try:
+                    self._emit_storage_change(readable=False)
+                except (OSError, ValueError, TypeError) as exc:
+                    self._log.error("记忆冲突上下文清理失败，存储仍保持写保护: %s", exc)
+
+    def bind_storage_change(self, handler) -> None:
+        """Let the owning runtime revoke projections when disk authority changes."""
+        self._storage_change_handler = handler
+
+    def _emit_storage_change(self, *, readable: bool) -> None:
+        # Snapshot workers must lose stale identity/history before reading them.
+        # The runtime dispatches only its task/event work to the owner loop.
+        self._storage_change_handler(readable=readable)
+
+    def reload(self) -> None:
+        """Explicitly accept the current disk version, including its forget ledger."""
+        if self._owner_loop is not None and self._owner_loop.is_running():
+            try:
+                current = asyncio.get_running_loop()
+            except RuntimeError:
+                current = None
+            if current is not self._owner_loop:
+                raise RuntimeError("运行中的记忆重载必须在所属事件循环执行")
+        self._reload_current()
+        # Manager.changed can persist the state store. Release memory's lock
+        # first: snapshot workers acquire store -> memory in the opposite order.
+        if self._storage_change_handler is not None:
+            self._emit_storage_change(readable=True)
+
+    @_locked_memory
+    def _reload_current(self) -> None:
+        self._load()
+        # Explicit acceptance can revoke sources without first passing through
+        # _ensure_writable. Old in-flight contexts must never retain authority.
+        self.privacy_generation += 1
 
     @staticmethod
     def _number(value, label: str) -> float:
@@ -164,10 +262,22 @@ class MemoryOrgan(Organ):
         return float(value)
 
     @staticmethod
-    def _identifier(value, label: str) -> str:
+    def _text(value, label: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{label}必须为文本")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            # Escaped lone surrogates can arrive through JSON as Python str.
+            # Reject them before a batched item can poison later commits.
+            raise ValueError(f"{label}包含无效Unicode字符") from None
+        return value
+
+    @classmethod
+    def _identifier(cls, value, label: str) -> str:
         if not isinstance(value, str) or not value.strip() or len(value) > 1024:
             raise ValueError(f"无效{label}")
-        return value
+        return cls._text(value, label)
 
     @staticmethod
     def _date(value: datetime | None, now: datetime) -> datetime | None:
@@ -186,6 +296,12 @@ class MemoryOrgan(Organ):
         """所有入口共用验证；返回副本，批量入口先验证整批再改变集合。"""
         if not isinstance(item, MemoryItem) or not isinstance(item.content, str):
             raise ValueError("记忆内容必须为文本")
+        for field, label in (("content", "记忆内容"), ("topic", "记忆主题"),
+                             ("source_ref", "记忆来源引用"), ("fact_key", "事实键"),
+                             ("fact_value", "事实值")):
+            value = getattr(item, field)
+            if value is not None:
+                cls._text(value, label)
         if item.receipt is not None:
             cls._identifier(item.receipt, "记忆收据")
         identifier = item.id
@@ -220,7 +336,9 @@ class MemoryOrgan(Organ):
                        created=cls._date(item.created if item.created is not None else now, now),
                        occurred_at=cls._date(item.occurred_at, now), derived_from=parents)
 
+    @_locked_memory
     def has_receipt(self, receipt: str, *, durable: bool = False) -> bool:
+        self._ensure_writable()
         if durable:
             return receipt in self._durable_receipts
         return receipt in self.retired_receipts or any(m.receipt == receipt for m in self.items)
@@ -283,11 +401,14 @@ class MemoryOrgan(Organ):
         if any(parent not in active for parent in parents):
             raise ValueError("派生来源已删除、已替代或不存在，拒绝迟到结果")
 
+    @_locked_memory
     def sources_valid(self, identifiers) -> bool:
         """仅验证当前可用来源；与 privacy_generation 一同用于异步结果提交。"""
+        self._ensure_writable()
         active = {m.id for m in self.items if m.superseded_by is None}
         return all(identifier in active for identifier in identifiers)
 
+    @_locked_memory
     def add(self, content: str, importance: float = 5.0, emotion: float = 50.0, *, receipt: str | None = None,
             kind: str = "event", source: str = "system", source_ref: str | None = None,
             occurred_at: datetime | None = None, topic: str = "", derived_from: tuple[str, ...] = (),
@@ -320,6 +441,7 @@ class MemoryOrgan(Organ):
             self.force_save()
         return item
 
+    @_locked_memory
     def import_memory_items(self, items: list[MemoryItem]) -> int:
         """迁移批量写入；失败保留 pending 收据，重试不会重复追加。"""
         self._ensure_writable()
@@ -347,6 +469,7 @@ class MemoryOrgan(Organ):
             self.force_save()
         return count
 
+    @_locked_memory
     def _transaction(self, mutation, *, privacy_change: bool = True, content_ids=()):
         """管理动作只在原子写成功后确认；写失败恢复全部内存状态。"""
         self._ensure_writable()
@@ -365,12 +488,16 @@ class MemoryOrgan(Organ):
             (self.items, self.tombstones, self.retired_receipts, self.recording_enabled,
              self.identity_migrated, self._dirty, self._durable_receipts, self.privacy_generation,
              self._revision, self._content_versions) = previous
+            if self._read_error is not None:
+                self._hide_stale()
             raise
 
+    @_locked_memory
     def get_fact(self, key: str) -> MemoryItem | None:
         self._ensure_writable()
         return next((m for m in reversed(self.items) if m.kind == "fact" and m.fact_key == key and m.superseded_by is None), None)
 
+    @_locked_memory
     def update_fact(self, key: str, value: str, content: str | None = None, *, source: str = "user", topic: str = "",
                     derived_from: tuple[str, ...] = (), explicit: bool = False) -> MemoryItem | None:
         self._ensure_writable()
@@ -401,6 +528,7 @@ class MemoryOrgan(Organ):
             return item
         return self._transaction(mutation, privacy_change=previous is not None or explicit, content_ids=(item.id,))
 
+    @_locked_memory
     def correct(self, item_id: str, content: str, fact_value: str | None = None, *, explicit: bool = True) -> MemoryItem:
         self._ensure_writable()
         old = next((m for m in self.items if m.id == item_id), None)
@@ -418,7 +546,7 @@ class MemoryOrgan(Organ):
                                     source="manual", topic=old.topic, derived_from=old.derived_from, explicit=explicit)
         if fact_value is not None:
             raise ValueError("非事实记录不能设置事实值")
-        item = replace(old, content=content.strip(), source="manual")
+        item = self.normalize_item(replace(old, content=content.strip(), source="manual"), self.clock.now())
         def mutation():
             self._delete_ids(self._descendants({item_id}) - {item_id})
             self.items = [item if m.id == item_id else m for m in self.items]
@@ -442,6 +570,7 @@ class MemoryOrgan(Organ):
             self._content_versions.pop(item.id, None)
         return [m.id for m in removed]
 
+    @_locked_memory
     def delete(self, item_id: str, cascade: bool = True) -> list[str]:
         self._ensure_writable()
         item = next((m for m in self.items if m.id == item_id), None)
@@ -458,6 +587,7 @@ class MemoryOrgan(Organ):
             return self._delete_ids(descendants)
         return self._transaction(mutation)
 
+    @_locked_memory
     def forget_fact(self, key: str) -> list[str]:
         self._ensure_writable()
         item = next((m for m in self.items if m.kind == "fact" and m.fact_key == key), None)
@@ -472,6 +602,7 @@ class MemoryOrgan(Organ):
             return self._transaction(mutation)
         return []
 
+    @_locked_memory
     def set_recording_enabled(self, value: bool) -> None:
         if type(value) is not bool:
             raise ValueError("记忆新增开关必须为bool")
@@ -479,6 +610,7 @@ class MemoryOrgan(Organ):
             self.recording_enabled = value
         self._transaction(mutation)
 
+    @_locked_memory
     def bootstrap_identity(self, name: str | None) -> MemoryItem | None:
         """实际接管身份时才确认；空启动或失败迁移仍可稍后重试。"""
         self._ensure_writable()
@@ -501,6 +633,7 @@ class MemoryOrgan(Organ):
             return existing
         return self._transaction(mutation, privacy_change=False)
 
+    @_locked_memory
     def list_items(self, include_superseded: bool = False, limit: int = 100, *,
                    offset: int = 0, kind: str | None = None) -> list[MemoryItem]:
         self._ensure_writable()
@@ -511,12 +644,14 @@ class MemoryOrgan(Organ):
         start = max(0, offset)
         return records[start:start + max(0, limit)]
 
+    @_locked_memory
     def count_items(self, *, kind: str | None = None) -> int:
         self._ensure_writable()
         if kind is not None and kind not in KINDS:
             raise ValueError("未知记忆类型")
         return sum(m.superseded_by is None and (kind is None or m.kind == kind) for m in self.items)
 
+    @_locked_memory
     def get_item(self, item_id: str) -> MemoryItem | None:
         self._ensure_writable()
         return next((m for m in self.items if m.id == item_id), None)
@@ -549,11 +684,10 @@ class MemoryOrgan(Organ):
         finally:
             Path(temporary).unlink(missing_ok=True)
 
+    @_locked_memory
     def force_save(self) -> None:
         self._ensure_writable()
-        if self._file.exists():
-            self._load(validate_only=True)
-        if not self._dirty and self._file.exists() and self._legacy_bytes is None:
+        if not self._dirty and self._disk_fingerprint is not None and self._legacy_bytes is None:
             return
         self._validate_relations(self.items, self.tombstones)
         if any(m.receipt in self.retired_receipts for m in self.items if m.receipt is not None):
@@ -562,15 +696,26 @@ class MemoryOrgan(Organ):
                 "items": [self._record(m) for m in self.items], "tombstones": sorted(self.tombstones),
                 "retired_receipts": sorted(self.retired_receipts)}
         self._backup_legacy()
-        atomic_write_text(self._file, json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False))
+        text = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False)
+        try:
+            self._disk_fingerprint, self._disk_revision = guarded_replace(
+                self._file, self._disk_fingerprint, lambda target: atomic_write_text(target, text))
+        except DataFileError as exc:
+            self._read_error = exc
+            self._hide_stale()
+            raise
         self._dirty = False
         self._durable_receipts = {m.receipt for m in self.items if m.receipt is not None} | self.retired_receipts
         self._legacy_bytes = None
         self._touch()
 
+    @_locked_memory
     def _load(self, *, validate_only: bool = False) -> None:
         self._loaded = True
         try:
+            check_pending_commit(self._file)
+            revision = file_revision(self._file)
+            fingerprint = file_fingerprint(self._file)
             missing = object()
             data = read_json_checked(self._file, default=missing)
             recording, migrated, tombstones, retired, legacy_bytes = True, False, set(), set(), None
@@ -605,6 +750,8 @@ class MemoryOrgan(Organ):
                     values = data[label]
                     if not isinstance(values, list) or any(not isinstance(value, str) or not value.strip() for value in values) or len(set(values)) != len(values):
                         raise ValueError("无效遗忘账目")
+                    for value in values:
+                        self._identifier(value, "遗忘账目")
                 tombstones, retired = set(data["tombstones"]), set(data["retired_receipts"])
                 record_fields = set(MemoryItem.__dataclass_fields__)
                 for record in data["items"]:
@@ -620,9 +767,12 @@ class MemoryOrgan(Organ):
             receipts = {m.receipt for m in loaded if m.receipt is not None}
             if receipts & retired:
                 raise ValueError("已删除收据重新出现")
+            if file_revision(self._file) != revision or file_fingerprint(self._file) != fingerprint:
+                raise DataFileError(self._file, "加载期间记忆文件发生变化，请重新加载")
         except (OSError, ValueError, TypeError, OverflowError, RecursionError) as exc:
             error = exc if isinstance(exc, DataFileError) else DataFileError(self._file, str(exc))
             self._read_error = error
+            self._hide_stale()
             self._log.error("无法恢复记忆，原文件已保护: %s", error)
             if error is exc:
                 raise
@@ -634,6 +784,9 @@ class MemoryOrgan(Organ):
             self._durable_receipts = receipts | retired
             self._dirty = False
             self._read_error = None
+            self._storage_blocked_notified = False
+            self._disk_fingerprint = fingerprint
+            self._disk_revision = revision
             self._touch()
             self._content_versions = {item.id: self._revision for item in self.items}
 
@@ -642,6 +795,7 @@ class MemoryOrgan(Organ):
         hours = max(0.0, (self.clock.now() - base).total_seconds() / 3600.0)
         return 0.0 if item.importance <= 0 else max(0.1, math.exp(-0.05 * hours / item.importance))
 
+    @_locked_memory
     def search(self, query: str, limit: int = 3, kinds=None, include_generated: bool = False):
         self._ensure_writable()
         from suwan.retrieval import search_memories
@@ -651,7 +805,9 @@ class MemoryOrgan(Organ):
     def recall_by_keyword(self, keyword: str, limit: int = 3) -> list[MemoryItem]:
         return [hit.item for hit in self.search(keyword, limit=limit) if hit.item.importance > 0]
 
+    @_locked_memory
     def _active(self) -> list[MemoryItem]:
+        self._ensure_writable()
         return [m for m in self.items if m.superseded_by is None]
 
     @staticmethod
@@ -659,6 +815,7 @@ class MemoryOrgan(Organ):
         """后台传播资格标记；来源有效性仍须用 sources_valid/代数单独复核。"""
         return item.kind != "generated" or item.source_ref == TRACKED_GENERATION_REF
 
+    @_locked_memory
     def _context_active(self) -> list[MemoryItem]:
         """旧自动产物保留供显式管理；缺少可靠来源标记时不自动再传播。"""
         self._ensure_writable()
@@ -690,6 +847,7 @@ class MemoryOrgan(Organ):
                 return item
         return random.choice(candidates)
 
+    @_locked_memory
     def cleanup_old(self, min_importance: float = 3.0, max_age_days: int = 90) -> int:
         self._ensure_writable()
         identifiers = {m.id for m in self.items if m.kind != "fact" and m.importance < min_importance
@@ -702,8 +860,30 @@ class MemoryOrgan(Organ):
         """不做破坏性压缩；带来源的生成总结由反思服务另建记录。"""
         return 0
 
+    def peek_state(self) -> dict:
+        """GUI metadata: no disk reads, locks, or mutations on a foreign thread."""
+        return dict(self._published_state)
+
+    @_locked_memory
+    def read_snapshot(self) -> MemoryReadSnapshot:
+        """One validated, detached view for an entire projection calculation."""
+        self._ensure_writable()
+        return MemoryReadSnapshot(
+            self._revision, tuple(replace(item) for item in self.items),
+            frozenset(self._durable_receipts),
+            MappingProxyType(dict(self._content_versions)),
+        )
+
+    @_locked_memory
     def state(self) -> dict:
-        return {"count": len(self._active()), "total_count": len(self.items), "dirty": self._dirty,
+        try:
+            self._ensure_writable()
+        except DataFileError:
+            pass  # Health views remain available, without the stale source bodies.
+        return self._state_payload()
+
+    def _state_payload(self) -> dict:
+        return {"count": sum(m.superseded_by is None for m in self.items), "total_count": len(self.items), "dirty": self._dirty,
                 "file": str(self._file), "write_blocked": self._read_error is not None,
                 "recording_enabled": self.recording_enabled, "version": 2,
                 "forgotten_count": len(self.tombstones)}

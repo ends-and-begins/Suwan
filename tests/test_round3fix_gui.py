@@ -99,7 +99,7 @@ class ApiProbeTkTest(unittest.TestCase):
 
         self.app.server._submit(enqueue()).result(timeout=3)
         self.app._pump()
-        visible = self.app.chat_area.get("1.0", "end")
+        visible = self.app.chat_area.text()
         self.assertNotIn("低频积压消息0", visible)
         self.assertNotIn("低频积压消息1", visible)
         self.assertIn("低频积压消息2", visible)

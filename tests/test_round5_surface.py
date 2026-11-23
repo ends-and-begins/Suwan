@@ -31,7 +31,7 @@ class LearningTkTest(unittest.TestCase):
                     "_context_epoch": self.runtime.context_epoch()}
         with patch.object(self.runtime, "learning_command", side_effect=command):
             self.app.learning_view_button.invoke()
-            self.pump_until(lambda: "学习任务：暂无。" in self.app.chat_area.get("1.0", "end"))
+            self.pump_until(lambda: "学习任务：暂无。" in self.app.chat_area.text())
             self.app.entry_var.set("/learn find 合成规约")
             self.app.send()
             self.pump_until(lambda: len(observed) == 2)
@@ -61,13 +61,13 @@ class LearningTkTest(unittest.TestCase):
         self.app._render_learning(old, current_generation)
         pending.set_result(old)
         self.app._pump()
-        self.assertNotIn("不应再显示", self.app.chat_area.get("1.0", "end"))
+        self.assertNotIn("不应再显示", self.app.chat_area.text())
         current = {"ok": True, "text": "当前有效学习正文", "_context_epoch": self.runtime.context_epoch()}
         self.app._render_learning(current, self.app._learning_generation)
-        self.assertIn("当前有效学习正文", self.app.chat_area.get("1.0", "end"))
+        self.assertIn("当前有效学习正文", self.app.chat_area.text())
         self.app.server.memory_command("/memory forget user.name").result(timeout=3)
         self.app._pump()
-        self.assertNotIn("当前有效学习正文", self.app.chat_area.get("1.0", "end"))
+        self.assertNotIn("当前有效学习正文", self.app.chat_area.text())
 
     def test_newer_command_supersedes_older_result_and_missing_epoch_is_rejected(self):
         first, second = Future(), Future()
@@ -77,10 +77,10 @@ class LearningTkTest(unittest.TestCase):
         second.set_result({"ok": True, "text": "新查询结果", "_context_epoch": self.runtime.context_epoch()})
         first.set_result({"ok": True, "text": "过期查询结果", "_context_epoch": self.runtime.context_epoch()})
         self.app._pump()
-        self.assertIn("新查询结果", self.app.chat_area.get("1.0", "end"))
-        self.assertNotIn("过期查询结果", self.app.chat_area.get("1.0", "end"))
+        self.assertIn("新查询结果", self.app.chat_area.text())
+        self.assertNotIn("过期查询结果", self.app.chat_area.text())
         self.app._render_learning({"ok": True, "text": "无来源版本结果"}, self.app._learning_generation)
-        self.assertNotIn("无来源版本结果", self.app.chat_area.get("1.0", "end"))
+        self.assertNotIn("无来源版本结果", self.app.chat_area.text())
 
 
 class LearningReplTest(unittest.IsolatedAsyncioTestCase):

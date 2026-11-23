@@ -113,7 +113,7 @@ class TkMemoryPrivacyTest(unittest.TestCase):
         forgotten = self.app.server.memory_command("/memory forget-key user.name").result(timeout=3)
         self.assertTrue(forgotten["ok"])
         self.app._pump()
-        self.assertNotIn("合成私密名字", self.app.chat_area.get("1.0", "end"))
+        self.assertNotIn("合成私密名字", self.app.chat_area.text())
         self.assertEqual(self.app._last_reply, "")
         self.assertEqual(self.payloads, [])
 
@@ -127,7 +127,7 @@ class TkMemoryPrivacyTest(unittest.TestCase):
         future.set_result(old_reply)
         self.app._on_reply_done(future)
         self.app._pump()
-        self.assertNotIn("合成私密名字", self.app.chat_area.get("1.0", "end"))
+        self.assertNotIn("合成私密名字", self.app.chat_area.text())
         self.assertEqual(self.payloads, [])
 
     def test_forget_between_render_and_speak_still_cannot_start_tts(self):
@@ -147,7 +147,7 @@ class TkMemoryPrivacyTest(unittest.TestCase):
         self.app._pump()
         self.assertEqual(self.payloads, [])
         self.assertEqual(self.app._last_reply, "")
-        self.assertNotIn("合成私密名字", self.app.chat_area.get("1.0", "end"))
+        self.assertNotIn("合成私密名字", self.app.chat_area.text())
 
     def test_backend_rejects_old_epoch_even_if_gui_check_and_submission_race(self):
         reply = self.named_reply()
@@ -169,7 +169,7 @@ class TkMemoryPrivacyTest(unittest.TestCase):
             self.app._render_audio("never-play.wav", None, self.app._speech_generation, reply["epoch"])
             self.app._pump()
         play.assert_not_called()
-        self.assertNotIn("旧叙事", self.app.chat_area.get("1.0", "end"))
+        self.assertNotIn("旧叙事", self.app.chat_area.text())
 
     def test_current_confirmation_after_natural_correction_remains_visible(self):
         first = self.app.server.ask_with_context("我叫小明").result(timeout=3)
@@ -177,7 +177,7 @@ class TkMemoryPrivacyTest(unittest.TestCase):
         corrected = self.app.server.ask_with_context("我叫小王").result(timeout=3)
         self.assertTrue(self.runtime.context_current(corrected["epoch"]))
         self.app._render_reply(corrected["text"], corrected["epoch"])
-        self.assertIn("小王", self.app.chat_area.get("1.0", "end"))
+        self.assertIn("小王", self.app.chat_area.text())
 
     def test_older_generated_record_can_be_paged_searched_selected_and_forgotten(self):
         async def populate():

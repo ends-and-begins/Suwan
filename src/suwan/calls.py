@@ -132,8 +132,8 @@ class CallManager:
         # Policy installation must not wait behind ledger fsync. Admission
         # captures one immutable policy before starting its durable reserve.
         self._policy_lock = threading.Lock()
-        # Queue/UI operations must never wait for full-ledger fsync. The
-        # original condition remains the lifecycle fence for durable writes.
+        # Ledger I/O is serialized by _condition. Queue and immediate
+        # lifecycle revocation use only this short, independent condition.
         self._queue_condition = threading.Condition(threading.RLock())
         self._records = []
         self._queue = []
@@ -156,9 +156,11 @@ class CallManager:
     def start(self) -> bool:
         """调用方必须已持有数据目录实例锁；损坏时只禁外部调用。"""
         with self._condition:
-            if self._active:
-                return not bool(self._error)
-            self._epoch += 1
+            with self._queue_condition:
+                if self._active:
+                    return not bool(self._error)
+                self._epoch += 1
+                epoch = self._epoch
             self._error = ""
             try:
                 fingerprint = self._fingerprint()
@@ -177,21 +179,33 @@ class CallManager:
                     self._write(records)
             except (OSError, ValueError, TypeError, OverflowError) as exc:
                 self._error = "ledger_unreadable" if not isinstance(exc, OSError) else "ledger_write_failed"
-            self._active = True
             with self._queue_condition:
+                if epoch != self._epoch:
+                    return False
+                self._active = True
                 self._queue_condition.notify_all()
             return not bool(self._error)
 
     def close(self):
-        with self._condition:
+        with self._queue_condition:
             self._active = False
             self._epoch += 1
-            with self._queue_condition:
-                for _, _, future, _, _ in self._queue:
-                    if not future.done():
-                        future.set_exception(CallDenied("closed"))
-                self._queue.clear()
-                self._queue_condition.notify_all()
+            for _, _, future, _, _ in self._queue:
+                if not future.done():
+                    future.set_exception(CallDenied("closed"))
+            self._queue.clear()
+            self._queue_condition.notify_all()
+
+    def wait_for_writes(self) -> None:
+        """Drain authorized ledger commits off-loop after close().
+
+        Reservations and settlements retain their serial durable boundary.
+        The directory instance lock must stay owned until this returns; a
+        successor can then load conservatively without any old-epoch writer.
+        This never waits for a network response, which runs outside the lock.
+        """
+        with self._condition:
+            pass
 
     def wait_closed(self, timeout: float | None = None) -> bool:
         """Wait for the physical worker, separately from revoking its writes.
@@ -199,7 +213,7 @@ class CallManager:
         A GUI shutdown awaits this off its Tk thread after data was saved.
         close() itself stays nonblocking for async runtime cancellation.
         """
-        with self._condition:
+        with self._queue_condition:
             worker = self._worker
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout)
@@ -318,8 +332,13 @@ class CallManager:
         return self.schedule(lambda: self._execute(send, **arguments), priority=priority, cancelled=cancelled).result()
 
     def _execute(self, send, *, kind, provider, model, max_output_tokens, priority, source, call_key, cancelled, allowed):
+        with self._queue_condition:
+            epoch = self._epoch
+
         def permitted():
-            return (cancelled is None or not cancelled.is_set()) and (allowed is None or bool(allowed()))
+            with self._queue_condition:
+                live = self._active and epoch == self._epoch
+            return live and (cancelled is None or not cancelled.is_set()) and (allowed is None or bool(allowed()))
 
         with self._condition:
             if not self._active:
@@ -351,12 +370,16 @@ class CallManager:
             output_limit = policy.daily_output_tokens - (policy.foreground_reserved_output_tokens if priority == 10 else 0)
             if len(today) + 1 > call_limit or (max_output_tokens is not None and allocated + max_output_tokens > output_limit):
                 raise CallDenied("budget_exhausted")
-            epoch = self._epoch
             records = list(self._records)
             records.append(row)
             try:
                 self._commit(records)
                 # 文件落盘期间也可能撤销；明确未发送才释放额度。
+                # close() may revoke without waiting for this disk boundary.
+                # Leave its durable reservation for conservative recovery;
+                # no further old-epoch write or send may begin.
+                if not self._active or epoch != self._epoch:
+                    raise CallDenied("closed")
                 records = list(self._records)
                 records[-1] = dict(records[-1])
                 if not permitted():
@@ -369,6 +392,8 @@ class CallManager:
                 raise CallDenied("ledger_readonly") from None
             # 最后一次取消检查紧邻发送授权边界。此后取消不能假定外部零消耗。
             if not permitted():
+                if not self._active or epoch != self._epoch:
+                    raise CallDenied("closed")
                 records = list(self._records)
                 records[-1] = dict(records[-1])
                 records[-1].update(state="cancelled_unsent", finished_at=self.clock.now().isoformat(timespec="microseconds"), result_discarded=True)

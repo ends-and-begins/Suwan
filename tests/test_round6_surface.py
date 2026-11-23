@@ -166,7 +166,7 @@ class DesktopTkBoundaryTest(unittest.TestCase):
         second.set_result({"text": "新的有效回复", "epoch": self.runtime.context_epoch()})
         first.set_result({"text": "旧的迟到回复", "epoch": self.runtime.context_epoch()})
         self.app._pump()
-        content = self.app.chat_area.get("1.0", "end")
+        content = self.app.chat_area.text()
         self.assertIn("新的有效回复", content)
         self.assertNotIn("旧的迟到回复", content)
         self.assertEqual(str(self.app.send_button.cget("state")), "normal")
@@ -245,7 +245,7 @@ class DesktopTkBoundaryTest(unittest.TestCase):
         after = self.app.server.activity_view().result(timeout=3)["budget"]["used_calls"]
         self.assertEqual(after, before)
         self.assertEqual(len(requests), 1)
-        self.assertNotIn("30秒之后的迟到回复", self.app.chat_area.get("1.0", "end"))
+        self.assertNotIn("30秒之后的迟到回复", self.app.chat_area.text())
 
 
 class DesktopCloseOrderTest(unittest.TestCase):

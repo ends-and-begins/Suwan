@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 import random
 
-from suwan.adapters.artifacts import artifact_digest, publish_artifact
+from suwan.adapters.artifacts import artifact_digest, publish_artifact, remove_registered_artifact
 from suwan.assets import generation as gen
 from suwan.bus import EventBus
 from suwan.clock import Clock
@@ -214,12 +214,14 @@ class AutonomousService(Organ):
     def _remove_artifact(self, row: dict) -> None:
         try:
             path = self._artifact_path(row)
-            if path.exists() and artifact_digest(path.read_bytes()) != row["artifact_sha256"]:
-                raise ValueError("活动路径已有不同内容，保留用户文件")
-            path.unlink(missing_ok=True)
+            remove_registered_artifact(path, row["artifact_sha256"])
             self.journal.update(row["id"], artifact_path="", artifact_sha256="")
         except (OSError, ValueError) as exc:
-            self.last_error = f"活动产物清理失败（{type(exc).__name__}），已阻止继续传播"
+            self.last_error = f"活动产物清理失败（{type(exc).__name__}）：{exc}；登记已保留，已阻止继续传播"
+            try:
+                self.journal.update(row["id"], error=self.last_error)
+            except (OSError, ValueError):
+                pass  # A protected journal must not hide the actionable recovery path.
 
     def _cancel(self, identifier: str, reason: str) -> None:
         row = self.journal.update(identifier, status="cancelled", topic="", draft="", feedback=0,

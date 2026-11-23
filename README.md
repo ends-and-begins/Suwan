@@ -1,5 +1,11 @@
 # 苏晚 v7 候选版 —— 恢复验收与本地交付
 
+> 审查补修（2026-11-22）：954 项测试及六项离线检查通过，修复状态轮询误锁记忆、设置覆盖外部更新、关系计算重复整库校验、文档任务失败退出会话四项问题。修改前的完整备份已校验。详见 [本轮补修记录](docs/review-fixes-20261107.md)。
+
+> 本地补修（2026-10-21）：878 项测试及六项离线门禁通过，修复边界审查确认的 8 类可靠性问题，包括 API 异常回复、取消卡顿、非法 Unicode、环境回滚、队列关闭与故事预览。修复内容和 API 操作见 [本轮补修记录](docs/reliability-fixes-20261021.md)。
+
+> 本地更新（2026-10-20）：暖色 UI 与 API 免新增安装后备。双击 `start_gui.bat`；DeepSeek 当前使用 `deepseek-flash`。启动步骤、真实连通测试和验证边界见 [API 免安装说明](docs/api-no-install.md)。无需为这一步运行 `pip install -e .`。
+
 > 状态：2026-10-20，第七版最终测试前的5项审查问题已补修。803项测试、六项离线门禁及10项冻结交付任务全部通过，无跳过；新增9项回归，原测试方法保留。观测现在检查核心与真实时钟推进，通知/设置故障会失败；启动、解包和实际实例锁恢复验收已补强。原24小时观测已中断，尚未完成，7天人工使用为PENDING。详见 [第七版补修报告](docs/round7-fix-report.md)、[第七版执行记录](docs/round7-report.md)、[候选包使用说明](docs/release-user-guide.md)及 [第七版设计](docs/round7-design.md)。第七版对应原计划阶段6，仍是候选版，包内项目版本为0.1.0；当前依赖环境验证不代表全新Windows安装通过。真实接口、声卡、人工易用性，以及第五版真实模型8/10正确、至少5组有效改善仍待实测。固定记忆检索仍为 Top-3 20/20、Top-1 14/20。
 > 本项目承接旧版模块拆分代码，采用 **asyncio 事件总线 + 器官(organ) 架构**。
 > 桌面操作与设计见 [第六版桌面说明](docs/desktop-v6.md)、[第六版补修报告](docs/round6-fix-report.md)及 [第六版设计](docs/round6-design.md)。学习基础见 [第五版补修报告](docs/round5-fix-report.md)、[第五版验收报告](docs/round5-report.md)、[学习使用说明](docs/learning-v5.md)和 [第五版设计](docs/round5-design.md)。第四版基础见 [严格审查补修报告](docs/round4-fix-report.md)、[第四版验收报告](docs/round4-report.md)及 [活动、预算与恢复说明](docs/activities-v4.md)。人格与记忆沿用 [人格与交流说明](docs/personality-v3.md)、[记忆使用与升级说明](docs/memory-v2.md)。历史验证见 [第三版补修报告](docs/round3-fix-report.md)、[第三版报告](docs/round3-report.md)、[第二版补修报告](docs/round2-fix-report.md)、[第二版验收报告](docs/round2-report.md)、[第一版严格审查修复报告](docs/review-fix-report.md)和 [第一轮验收报告](docs/round1-report.md)，后续目标见 [阶段性迭代计划](docs/iteration-plan.md)。
@@ -16,10 +22,10 @@
 ## 运行
 ```powershell
 # 离线门禁：临时源码副本；禁用 dotenv/真实网络；编译、测试、静态守卫、冒烟、对照、自检
-python scripts/run_tests.py
+python scripts/run_tests.py --timeout-seconds 600
 
 # 机器较慢或完整套件需要更长时限时（不改变单项断言与超时）
-python scripts/run_tests.py --timeout-seconds 600
+python scripts/run_tests.py --timeout-seconds 1200
 
 # 行为对照（本地兜底类别断言 6/6）
 python scripts/parity.py
@@ -86,7 +92,7 @@ pip install -e ".[dev]"
 
 | 供应商 | env 变量 | 默认模型 | base_url（默认） |
 |---|---|---|---|
-| deepseek | `DEEPSEEK_API_KEY` | deepseek-chat | https://api.deepseek.com |
+| deepseek | `DEEPSEEK_API_KEY` | deepseek-flash | https://api.deepseek.com |
 | openai (ChatGPT) | `OPENAI_API_KEY` | gpt-4o-mini | https://api.openai.com/v1 |
 | gemini | `GEMINI_API_KEY` | gemini-2.0-flash | https://generativelanguage.googleapis.com/v1beta/openai/ |
 | qwen | `DASHSRCOPE_API_KEY` | qwen-turbo | https://dashscope.aliyuncs.com/compatible-mode/v1 |

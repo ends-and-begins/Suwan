@@ -68,15 +68,11 @@ class Organ(ABC):
         return sub
 
     async def _close_sub(self, sub: Subscription) -> None:
-        sub.cancelled = True
+        # The bus owns the admission boundary as well as the consumer. Closing
+        # only the worker strands publishers already waiting on its full queue.
+        await sub.close()
         if sub in self._subs:
             self._subs.remove(sub)
-        if sub.task is not None and not sub.task.done():
-            sub.task.cancel()
-            try:
-                await sub.task
-            except asyncio.CancelledError:
-                pass
 
     def _spawn(self, coro: Any) -> asyncio.Task:
         """启动器官内部长驻协程（stop 时会取消）。"""

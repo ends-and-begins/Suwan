@@ -110,12 +110,16 @@ class RelationOrgan(Organ):
         revision = self._memory.revision
         if self._projected_revision == revision:
             return
+        snapshot = self._memory.read_snapshot()
+        revision = snapshot.revision
         candidates = []
         live_fingerprints = {}
-        for item in self._memory.list_items(limit=max(1, len(self._memory.items))):
+        for item in reversed(snapshot.items):
+            if item.superseded_by is not None:
+                continue
             # 文件分享的旧 RPC 失败时可保留 pending 收据供重试；它还不是
             # 已确认的共同经历，不能提前进入关系与解释。
-            if item.receipt is None or not self._memory.has_receipt(item.receipt, durable=True):
+            if item.receipt is None or item.receipt not in snapshot.durable_receipts:
                 continue
             if item.kind == "event" and item.source in {"user", "manual"} and item.topic == "interaction.feedback":
                 kind = classify_feedback(item.content)
@@ -128,7 +132,7 @@ class RelationOrgan(Organ):
                 continue
             fingerprint = ""
             if kind == "share":
-                version = self._memory.content_version(item.id)
+                version = snapshot.content_versions.get(item.id, 0)
                 cached = self._fingerprints.get(item.id)
                 if cached is None or cached[0] != version:
                     normalized = "".join(unicodedata.normalize("NFKC", item.content).casefold().split()).rstrip("。.!！")
@@ -185,10 +189,12 @@ class RelationOrgan(Organ):
         migrated.bind_memory(self._memory)
         migrated._baseline = {field: _bounded(float(data[field])) for field in ("closeness", "trust")}
         migrated._legacy_imported = True
+        snapshot = self._memory.read_snapshot()
         migrated._baseline_sources = {
-            item.id for item in self._memory.list_items(limit=max(1, len(self._memory.items)))
+            item.id for item in snapshot.items
             if item.kind == "knowledge" and item.source == "share" and item.topic == "share"
-            and item.receipt is not None and self._memory.has_receipt(item.receipt, durable=True)
+            and item.superseded_by is None
+            and item.receipt is not None and item.receipt in snapshot.durable_receipts
         }
         migrated.reconcile()
         return migrated.state()

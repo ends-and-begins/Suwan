@@ -3,7 +3,7 @@
 - available：key 已配置才算可用（修复旧版 .env 未加载导致全空的问题：配置由 Settings.from_env 保证）；
 - chat()：同步调用，任何失败返回 None（上层走本地兜底）；网络 IO 由调用方放线程；
 - 每次调用（含失败）写 api_call_log.jsonl（用量/时长/成败），线程安全追加；
-- 无 openai 包或网络问题时自动降级，绝不抛出到上层。
+- 无 openai 包时使用标准库 HTTP；正常聊天失败仍回到本地兜底。
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from suwan.adapters.filestore import append_line
 from suwan.clock import Clock, RealClock
 from suwan.calls import CallDenied
 from suwan.config import KEYLESS_PROVIDERS, Settings
+from suwan.adapters.http_chat import HTTPChatClient, HTTPChatError, describe_api_error, validate_response_text
 
 LLM_TIMEOUT_SECONDS = 30.0
 
@@ -33,6 +34,8 @@ class LLMClient:
         self._log = logging.getLogger("suwan.llm")
         self._client = None
         self._lifecycle_guard = threading.RLock()
+        self._log_condition = threading.Condition(self._lifecycle_guard)
+        self._pending_log_writes = 0
         self._active = True
         self._generation = 0
         self.call_manager = None  # runtime 注入；独立离线替身仍可使用旧接口
@@ -54,6 +57,15 @@ class LLMClient:
         with self._lifecycle_guard:
             self._generation += 1
 
+    def wait_for_log_writes(self) -> None:
+        """Join already authorized metadata writes from a worker, never the owner loop.
+
+        The runtime first deactivates this client, then awaits this boundary
+        before transferring its data-directory lock to another instance.
+        """
+        with self._log_condition:
+            self._log_condition.wait_for(lambda: self._pending_log_writes == 0)
+
     @property
     def request_generation(self) -> int:
         """构造提示词时捕获，在线程池排队后仍能识别旧上下文。"""
@@ -62,10 +74,13 @@ class LLMClient:
 
     def _get_client(self):
         if self._client is None and self.available:
-            from openai import OpenAI  # 延迟导入：不可用/未安装时不拉包
-
             api_key = self.api_key or ("EMPTY" if self._keyless else "")
-            self._client = OpenAI(api_key=api_key, base_url=self.base_url, max_retries=0, timeout=LLM_TIMEOUT_SECONDS)
+            try:
+                from openai import OpenAI  # 可选；未安装时不要求用户另装依赖
+            except ImportError:
+                self._client = HTTPChatClient(api_key=api_key, base_url=self.base_url, timeout=LLM_TIMEOUT_SECONDS)
+            else:
+                self._client = OpenAI(api_key=api_key, base_url=self.base_url, max_retries=0, timeout=LLM_TIMEOUT_SECONDS)
         return self._client
 
     def _log_call(
@@ -82,7 +97,7 @@ class LLMClient:
         model: str | None = None,
         call_id: str | None = None,
     ) -> None:
-        """写用量日志（线程安全追加 JSONL）。"""
+        """Authorize a metadata-only write under a short lock; disk I/O is outside it."""
         with self._lifecycle_guard:
             if not self._active or (generation is not None and generation != self._generation) or self.api_log_file is None:
                 return
@@ -97,12 +112,21 @@ class LLMClient:
                 "max_tokens": max_tokens,
                 "success": success,
             }
-            try:
-                append_line(self.api_log_file, json.dumps(record, ensure_ascii=False))
-            except OSError:  # noqa: BLE001
-                self._log.warning("API 用量日志写入失败: %s", self.api_log_file)
+            path = self.api_log_file
+            # ASCII serialization also keeps malformed model metadata from
+            # turning an otherwise usable reply into an encoding failure.
+            payload = json.dumps(record, ensure_ascii=True, allow_nan=False)
+            self._pending_log_writes += 1
+        try:
+            append_line(path, payload)
+        except (OSError, ValueError, UnicodeError):
+            self._log.warning("API 用量日志写入失败")
+        finally:
+            with self._log_condition:
+                self._pending_log_writes -= 1
+                self._log_condition.notify_all()
 
-    def chat(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None, *, expected_generation: int | None = None, cancelled: threading.Event | None = None, priority: int = 0, source: str = "chat", call_key: str | None = None, raise_on_denied: bool = False) -> str | None:
+    def chat(self, system_prompt: str, user_prompt: str, max_tokens: int | None = None, *, expected_generation: int | None = None, cancelled: threading.Event | None = None, priority: int = 0, source: str = "chat", call_key: str | None = None, raise_on_denied: bool = False, raise_on_error: bool = False) -> str | None:
         with self._lifecycle_guard:
             if not self._active or (cancelled is not None and cancelled.is_set()):
                 return None
@@ -131,13 +155,24 @@ class LLMClient:
                 if not self._active or generation != self._generation or (cancelled is not None and cancelled.is_set()):
                     return None
             def send():
-                return client.chat.completions.create(
+                options = {}
+                # These DeepSeek models think by default. Interactive replies
+                # use the configured short output budget for visible text.
+                if provider == "deepseek" and model.startswith(("deepseek-flash", "deepseek-v4")):
+                    options["extra_body"] = {"thinking": {"type": "disabled"}}
+                result = client.chat.completions.create(
                     model=model,
                     messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
                     temperature=0.85,
                     max_tokens=tokens,
                     timeout=LLM_TIMEOUT_SECONDS,
+                    **options,
                 )
+                # SDK objects need the same text boundary as the native HTTP
+                # transport. JSON permits escaped lone surrogates; UTF-8 does
+                # not. Reject them before reporting a successful reply.
+                self._response_text(result)
+                return result
 
             if self.call_manager is None:
                 resp = send()
@@ -145,11 +180,13 @@ class LLMClient:
                 resp = self.call_manager.run(send, kind="llm", provider=provider, model=model,
                     max_output_tokens=tokens, priority=priority, source=source, call_key=call_key,
                     cancelled=cancelled, allowed=allowed)
-            text = (resp.choices[0].message.content or "").strip() or None
+            text = self._response_text(resp)
             with self._lifecycle_guard:
                 if not self._active or self._generation != generation or (cancelled is not None and cancelled.is_set()):
                     return None
-                self._log_call(success=True, system_prompt=system_prompt, user_prompt=user_prompt, response=text or "", max_tokens=tokens, generation=generation, provider=provider, model=model, call_id=call_id)
+            self._log_call(success=True, system_prompt=system_prompt, user_prompt=user_prompt, response=text, max_tokens=tokens, generation=generation, provider=provider, model=model, call_id=call_id)
+            if not allowed():
+                return None
             return text
         except CallDenied:
             if raise_on_denied:
@@ -159,4 +196,20 @@ class LLMClient:
             self._log.warning("LLM 调用失败(%s/%s): %s", provider, model, type(exc).__name__)
             if cancelled is None or not cancelled.is_set():
                 self._log_call(success=False, system_prompt=system_prompt, user_prompt=user_prompt, error=str(exc), max_tokens=tokens, generation=generation, provider=provider, model=model, call_id=call_id)
+            if raise_on_error:
+                raise describe_api_error(exc) from None
             return None
+
+    @staticmethod
+    def _response_text(response) -> str:
+        try:
+            content = response.choices[0].message.content
+        except (AttributeError, IndexError, KeyError, TypeError):
+            raise HTTPChatError("invalid_response") from None
+        if content is None:
+            raise HTTPChatError("empty_response")
+        validate_response_text(content)
+        text = content.strip()
+        if not text:
+            raise HTTPChatError("empty_response")
+        return text
