@@ -26,6 +26,7 @@ CANDIDATE = "round7-source-candidate"
 _GENERATED = frozenset({"start_suwan.py", "start_gui.bat", "start_repl.bat"})
 _FIXED = frozenset({"pyproject.toml", "README.md", "seven-day-log.json",
                     "scripts/observe_round7.py", "scripts/_offline.py", "scripts/release_round7.py"})
+_ASSETS = frozenset({"src/suwan/assets/evening-window.png"})
 _REQUIRED = _FIXED | _GENERATED | frozenset({"src/suwan/__init__.py", "src/suwan/app.py",
     "src/suwan/config.py", "src/suwan/frontends/tkapp.py", "src/suwan/frontends/repl.py"})
 _IGNORED = frozenset({".git", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
@@ -132,7 +133,7 @@ def _safe_name(name: str) -> str:
 
 
 def _allowed(name: str) -> bool:
-    if name in _FIXED or name in _GENERATED:
+    if name in _FIXED or name in _GENERATED or name in _ASSETS:
         return True
     parts = name.split("/")
     return (len(parts) >= 3 and parts[:2] == ["src", "suwan"] and name.endswith(".py")
@@ -167,7 +168,7 @@ def _read_source(root: Path, name: str) -> bytes:
     return payload
 
 
-def _python_members(root: Path) -> dict[str, bytes]:
+def _source_members(root: Path) -> dict[str, bytes]:
     package = root / "src" / "suwan"
     _reject_links(package, stop=root)
     if not package.is_dir():
@@ -182,9 +183,10 @@ def _python_members(root: Path) -> dict[str, bytes]:
                 raise ReleaseError("symbolic links/junctions are not allowed in src/suwan")
             if path.is_dir():
                 walk(path)
-            elif path.suffix == ".py":
+            else:
                 name = path.relative_to(root).as_posix()
-                result[_safe_name(name)] = _read_source(root, name)
+                if path.suffix == ".py" or name in _ASSETS:
+                    result[_safe_name(name)] = _read_source(root, name)
     walk(package)
     return result
 
@@ -227,7 +229,7 @@ def build_release(source_root: str | Path, output_zip: str | Path) -> dict:
         raise FileExistsError("candidate archive already exists")
     if not output.parent.is_dir():
         raise ReleaseError("output parent directory must already exist")
-    members = _python_members(root)
+    members = _source_members(root)
     mapping = {"pyproject.toml": "pyproject.toml", "README.md": "docs/release-user-guide.md",
                "seven-day-log.json": "docs/seven-day-log-template.json",
                "scripts/observe_round7.py": "scripts/observe_round7.py",

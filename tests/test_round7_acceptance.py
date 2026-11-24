@@ -304,6 +304,8 @@ asyncio.run(main())
         with zipfile.ZipFile(self.archive) as archive:
             names=archive.namelist()
             self.assertEqual(len(names),len(set(names)))
+            artwork='src/suwan/assets/evening-window.png'
+            self.assertEqual(archive.read(artwork),(ROOT/artwork).read_bytes())
             for row in manifest['files']:
                 data=archive.read(row['path'])
                 self.assertEqual(len(data),row['bytes'])
@@ -317,11 +319,13 @@ asyncio.run(main())
         (synthetic/'.env').mkdir()
         (synthetic/'private-memory.json').write_text('SYNTHETIC_PRIVATE_DATA',encoding='utf-8')
         (synthetic/'unknown-root.txt').write_text('SYNTHETIC_UNKNOWN_ROOT',encoding='utf-8')
+        (synthetic/'src/suwan/assets/unlisted.png').write_bytes(b'SYNTHETIC_UNLISTED_ASSET')
         (synthetic/'data').mkdir(exist_ok=True)
         (synthetic/'data'/'personal.json').write_text('SYNTHETIC_PRIVATE_DATA',encoding='utf-8')
         second=self.area/'filtered.zip'
         release.build_release(synthetic,second)
         with zipfile.ZipFile(second) as archive:
+            self.assertNotIn('src/suwan/assets/unlisted.png',archive.namelist())
             self.assertFalse(any('private-memory' in name or 'unknown-root' in name or name.startswith('data/')
                                  or name.startswith('.env') for name in archive.namelist()))
         original=Path.is_symlink
