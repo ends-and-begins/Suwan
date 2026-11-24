@@ -288,6 +288,20 @@ class RuntimeThread:
     def export_data(self) -> Future:
         return self._submit(self.runtime.export_data())
 
+    def report_view(self) -> Future:
+        return self._submit(self.runtime.report_runtime.view())
+
+    def report_submit(self, paths, instruction: str, request_key: str) -> Future:
+        return self._submit(self.runtime.report_runtime.submit(tuple(paths), instruction, request_key))
+
+    def report_control(self, task_id: str, action: str, destination: dict | None = None) -> Future:
+        approved = dict(destination) if destination is not None else None
+        if action in {"start", "retry"}:
+            return self._submit(self._after_settings(
+                lambda: self.runtime.report_runtime.control(task_id, action, approved)
+            ))
+        return self._submit(self.runtime.report_runtime.control(task_id, action, approved))
+
     def notification_current(self, data: dict) -> bool:
         interaction = getattr(self.runtime, "interaction", None)
         if interaction is None:

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import queue
 import time
 import tkinter as tk
@@ -25,6 +26,7 @@ from suwan.config import ENDPOINT_ENV, MODEL_CANDIDATES, PROVIDER_LABELS, Settin
 from suwan.frontends.bridge import RuntimeThread, TkBridge
 from suwan.frontends.chat_composer import ChatComposer
 from suwan.frontends.chat_transcript import ChatTranscript
+from suwan.frontends.report_window import ReportWindow
 from suwan.frontends.warm_theme import (
     ACCENT, ACCENT_SOFT, BG, CHAT_BG, ERR, FG, FIELD,
     FONT, LINE, LOG_COLORS, OK, PANEL, RAIL, RAIL_TEXT, SIDEBAR, SUB, WARN,
@@ -38,6 +40,7 @@ except ImportError:  # pragma: no cover
 
 LOG_LEVELS = ("ALL", "INFO", "OK", "WARN", "ERROR")
 API_OFF_HINT = "● API 未开启，请勾选「启用模型 API」"
+_LOG = logging.getLogger(__name__)
 
 
 class TkApp:
@@ -104,6 +107,7 @@ class TkApp:
         self._playback_auto_read = bool(getattr(runtime, "tts_enabled", False))
         self._review_rows: dict[str, dict] = {}
         self.review_window = None
+        self.report_window: ReportWindow | None = None
         self._log_entries: list[tuple[str, str]] = []  # (level, text)
         self._toggles: list = []  # (canvas, oval, var, on_color, on_toggle)
 
@@ -366,6 +370,9 @@ class TkApp:
         self._chat_header_actions.grid(row=0, column=2, padx=(0, 16), sticky="e")
         ttk.Button(self._chat_header_actions, text="搜索", style="Quiet.TButton", width=5,
                    command=self._open_chat_find).pack(side=tk.LEFT)
+        self.report_button = ttk.Button(self._chat_header_actions, text="整理资料", style="Quiet.TButton",
+                                        width=7, command=self._open_reports)
+        self.report_button.pack(side=tk.LEFT)
         self.today_works_button = ttk.Button(self._chat_header_actions, text="作品", style="Quiet.TButton",
                                              width=5, command=self._show_works)
         self.today_works_button.pack(side=tk.LEFT)
@@ -373,6 +380,16 @@ class TkApp:
         ttk.Button(self._chat_header_actions, text="连接设置", width=7,
                    command=lambda: self._navigate("settings")).pack(side=tk.LEFT)
         tk.Frame(bar, height=1, bg=LINE).grid(row=1, column=0, columnspan=3, sticky="ew")
+
+    def _open_reports(self) -> None:
+        if self._closing:
+            return
+        if self.report_window is None:
+            self.report_window = ReportWindow(self)
+        else:
+            self.report_window.deiconify()
+            self.report_window.lift()
+            self.report_window.focus_set()
 
     # ---------- row1 主区 ----------
     def _build_notebook(self, row: int) -> None:
@@ -2069,37 +2086,45 @@ class TkApp:
     def _pump(self) -> None:
         if self._closing:
             return
-        items = self.server.bridge.drain()
-        allows_notification = getattr(self.server.bridge, "allows_notification", None)
-        commit_notification = getattr(self.server.bridge, "commit_notification", None)
-        # Check the runtime directly as well: a reset notification may arrive late.
-        self._sync_ui_context()
-        while True:
-            try:
-                callback, args = self._ui_callbacks.get_nowait()
-            except queue.Empty:
-                break
-            callback(*args)
-        for item in items:
-            kind, data = item["kind"], item["data"]
-            text = data.get("text", data.get("name", ""))
-            if kind == "memory_reset":
-                self._sync_ui_context()
-            elif not self.server.context_current(item.get("epoch")):
-                continue
-            elif callable(allows_notification) and not allows_notification(kind, data):
-                continue
-            elif callable(commit_notification) and not commit_notification(kind, data):
-                continue
-            elif kind == "doc":
-                self._log_msg(f"文档已生成：{text}", "ok")
-            elif kind == "toast":
-                self._log_msg(text, "info")
-            elif kind == "inner":
-                self._show_chat("独白", f"（{text}）")
-            elif kind == "narrative":
-                self._show_chat("苏晚·主动", text)
-        self._after(100, self._pump)
+        try:
+            bridge = self.server.bridge
+            items = bridge.drain()
+            allows_notification = getattr(bridge, "allows_notification", None)
+            commit_notification = getattr(bridge, "commit_notification", None)
+            # A reset notification may arrive late, so check the runtime before rendering.
+            self._sync_ui_context()
+            while not self._closing:
+                try:
+                    callback, args = self._ui_callbacks.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    callback(*args)
+                except Exception as exc:
+                    _LOG.warning("桌面回调处理失败（%s）", type(exc).__name__)
+            if self._closing:
+                return
+            for item in items:
+                kind, data = item["kind"], item["data"]
+                text = data.get("text", data.get("name", ""))
+                if kind == "memory_reset":
+                    self._sync_ui_context()
+                elif not self.server.context_current(item.get("epoch")):
+                    continue
+                elif callable(allows_notification) and not allows_notification(kind, data):
+                    continue
+                elif callable(commit_notification) and not commit_notification(kind, data):
+                    continue
+                elif kind == "doc":
+                    self._log_msg(f"文档已生成：{text}", "ok")
+                elif kind == "toast":
+                    self._log_msg(text, "info")
+                elif kind == "inner":
+                    self._show_chat("独白", f"（{text}）")
+                elif kind == "narrative":
+                    self._show_chat("苏晚·主动", text)
+        finally:
+            self._after(100, self._pump)
 
     def _sync_ui_context(self) -> None:
         epoch = self.server.context_epoch()

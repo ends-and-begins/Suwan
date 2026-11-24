@@ -49,6 +49,7 @@ from suwan.services.memory_manager import MemoryManager
 from suwan.services.llm_request import llm_chat
 from suwan.services.learning import LearningService
 from suwan.services.reflection import ReflectionService
+from suwan.services.report_runtime import ReportRuntime
 from suwan.services.search import SearchService
 from suwan.services.share import ShareWatcherService
 from suwan.services.tts import TtsService
@@ -82,6 +83,7 @@ class SuwanRuntime:
         self._instance_lock = InstanceLock(self.settings.data_dir)
         self._ticker_task: asyncio.Task | None = None
         self._foreground_tasks: set[asyncio.Task] = set()
+        self.report_runtime: ReportRuntime | None = None
         self._reply_context: ContextVar[tuple[int, int] | None] = ContextVar("suwan_reply_context", default=None)
         self._learning_goal_projection: list[dict] = []
         self._learning_change_active = False
@@ -281,6 +283,7 @@ class SuwanRuntime:
                     await service.start()
                 self._sync_flags()
                 self._refresh_learning_goals()
+                self.report_runtime = ReportRuntime(self)
                 self._running = True
                 self._ticker_task = asyncio.create_task(self._tick_loop(), name="suwan.ticker")
             except BaseException:
@@ -404,6 +407,11 @@ class SuwanRuntime:
                 client.set_active(False)
             errors = []
             try:
+                if self.report_runtime is not None:
+                    try:
+                        await self.report_runtime.stop()
+                    except Exception as exc:
+                        errors.append(exc)
                 pending_requests = [task for task in self._foreground_tasks
                                     if task is not asyncio.current_task() and task not in self._shutdown_waiters]
                 for task in pending_requests:
