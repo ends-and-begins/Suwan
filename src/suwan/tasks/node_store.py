@@ -295,10 +295,12 @@ class NodeTaskStore:
         )
         self._event(db, task, "failed", now, "task_integrity")
 
-    def claim(self, node_id: str, instance_id: str, ttl: float) -> dict | None:
-        """Reuse a live grant for this owner or grant the next valid eligible task."""
+    def claim(self, node_id: str, instance_id: str, ttl: float, *, task_id: str | None = None) -> dict | None:
+        """Reuse a live grant or grant an eligible task, optionally by its exact ID."""
         _id(node_id)
         _id(instance_id)
+        if task_id is not None:
+            _id(task_id)
         duration = _duration_ticks(ttl)
         with self._database(write=True) as db:
             now, tick = self._now(), self._tick()
@@ -306,16 +308,17 @@ class NodeTaskStore:
                 row = db.execute(
                     """
                     SELECT * FROM node_task
-                    WHERE (state = 'ready' AND (next_claim_tick IS NULL OR next_claim_tick <= :tick))
-                        OR (state = 'leased' AND (
-                            deadline_tick IS NULL OR deadline_tick <= :tick
-                            OR (node_id = :node_id AND instance_id = :instance_id)
+                    WHERE (state = 'leased' AND deadline_tick > :tick
+                        AND node_id = :node_id AND instance_id = :instance_id)
+                        OR ((:task_id IS NULL OR task_id = :task_id) AND (
+                            (state = 'ready' AND (next_claim_tick IS NULL OR next_claim_tick <= :tick))
+                            OR (state = 'leased' AND (deadline_tick IS NULL OR deadline_tick <= :tick))
                         ))
                     ORDER BY CASE WHEN state = 'leased' AND deadline_tick > :tick THEN 0 ELSE 1 END,
                         CASE WHEN failure_count > 0 THEN 1 ELSE 0 END, rowid
                     LIMIT 1
                     """,
-                    {"tick": tick, "node_id": node_id, "instance_id": instance_id},
+                    {"tick": tick, "node_id": node_id, "instance_id": instance_id, "task_id": task_id},
                 ).fetchone()
                 if row is None:
                     return None
@@ -325,7 +328,7 @@ class NodeTaskStore:
                 self._quarantine(db, row, now)
 
             if view["lease_active"]:
-                return view
+                return view if task_id is None or view["task_id"] == task_id else None
             deadline = tick + duration
             _integer(deadline, 1)
             granted = db.execute(

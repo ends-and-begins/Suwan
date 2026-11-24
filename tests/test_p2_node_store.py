@@ -67,6 +67,27 @@ class NodeTaskStoreTest(unittest.TestCase):
         )
         self.assertEqual(self.store.claim("other", "instance", 10)["task_id"], "next")
 
+    def test_targeted_claim_does_not_return_another_waiting_or_held_task(self):
+        self.store.enqueue("other-job", 1, {})
+        self.assertIsNone(self.store.claim("node-a", "first", 10, task_id="wanted"))
+        with self.assertRaises(ValueError):
+            self.store.claim("node-a", "first", 10, task_id="not/a/task")
+        self.assertEqual(self.store.get("other-job")["state"], "ready")
+
+        self.store.enqueue("wanted", 1, {})
+        lease = self.store.claim("node-a", "first", 10, task_id="wanted")
+        self.assertEqual(lease["task_id"], "wanted")
+        self.assertEqual(self.store.claim("node-a", "first", 20, task_id="wanted"), lease)
+        self.assertIsNone(self.store.claim("node-a", "first", 10, task_id="other-job"))
+        self.assertIsNone(self.store.claim("node-b", "second", 10, task_id="wanted"))
+        self.assertEqual(self.store.get("other-job")["state"], "ready")
+
+        second = self.store.claim("node-b", "second", 10, task_id="other-job")
+        self.assertEqual(second["task_id"], "other-job")
+        self.assertEqual(
+            [row["task_id"] for row in self.store.events() if row["event"] == "claimed"], ["wanted", "other-job"],
+        )
+
     def test_all_fence_fields_and_exact_deadline_are_checked(self):
         self.store.enqueue("report", 2, {})
         self.store.claim("node-a", "first", 10)

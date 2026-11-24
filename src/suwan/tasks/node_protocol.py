@@ -1,7 +1,9 @@
-"""Paired loopback transport for the coordinator's P2 fixture tasks."""
+"""Paired loopback transport for task coordination and optional replica reads."""
 
 from __future__ import annotations
 
+from base64 import b64decode, b64encode
+from binascii import Error as Base64Error
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -21,6 +23,7 @@ from suwan.tasks.node_store import (
     NodeTaskStore,
     serialize_node_object,
 )
+from suwan.tasks.replica_store import MAX_BLOB_BYTES, MAX_EVENT_PAGE, ReplicaIntegrityError, ReplicaStore
 
 
 _HOST = "127.0.0.1"
@@ -29,14 +32,22 @@ _CAPABILITY = "report-fixture-v1"
 _LIMIT = 256 * 1024
 _MAX_EVENT_COUNT = 500
 _MAX_SEQUENCE = 2**63 - 1
+REPLICA_CHUNK_BYTES = 48 * 1024
+_REPLICA_EVENT_BATCH = 32
 _PREFIX = "/p2/"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_REPORT_ID = re.compile(r"[0-9a-f]{32}")
+_REPORT_SOURCE_ID = re.compile(r"S(?:0[1-9]|1[0-2])")
 _IDENTITY_FIELDS = frozenset({"agent_id", "node_id", "instance_id", "protocol_version", "capability"})
 _LEASE_FIELDS = frozenset({"task_id", "version", "generation"})
+_REPORT_STEP_FIELDS = frozenset({"task_id", "id", "kind", "attempt", "version"})
 _EVENT_FIELDS = (
     "seq", "event", "task_id", "version", "node_id", "instance_id", "generation", "expires_at", "at",
 )
 _PAGE_FIELDS = (*_EVENT_FIELDS, "reason")
+_REPLICA_EVENT_FIELDS = ("seq", "event_key", "task_id", "kind", "payload", "objects")
+_REPLICA_CHUNK_FIELDS = frozenset({"sha256", "offset", "total", "data"})
 _FAILURE_REASON = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _BODY_FIELDS = {
     "handshake": frozenset(),
@@ -46,6 +57,9 @@ _BODY_FIELDS = {
     "fail": _LEASE_FIELDS | {"reason", "retryable"},
     "events": frozenset({"after", "limit"}),
     "events_page": frozenset({"after", "limit"}),
+    "replica-events": frozenset({"after", "limit"}),
+    "replica-object": frozenset({"sha256", "offset"}),
+    "replica-claim": frozenset({"checkpoint_seq"}),
 }
 _ERROR_STATUS = {
     "invalid_request": 400,
@@ -53,6 +67,9 @@ _ERROR_STATUS = {
     "not_paired": 403,
     "unknown_operation": 404,
     "protocol_mismatch": 409,
+    "checkpoint_required": 409,
+    "replica_integrity": 409,
+    "replica_object_unavailable": 404,
     "request_too_large": 413,
     "result_too_large": 413,
     "response_too_large": 413,
@@ -79,6 +96,10 @@ def _token(value: object) -> bool:
 
 def _integer(value: object, lower: int, upper: int = _MAX_SEQUENCE) -> bool:
     return type(value) is int and lower <= value <= upper
+
+
+def _digest(value: object) -> bool:
+    return isinstance(value, str) and _SHA256.fullmatch(value) is not None
 
 
 def _identity(agent_id: str, node_id: str, instance_id: str) -> dict:
@@ -181,8 +202,72 @@ def _event_cursor(rows: object, after: int, limit: int, fields: tuple[str, ...])
     return cursor
 
 
+def _replica_page(replica: ReplicaStore, after: int, limit: int) -> list[dict]:
+    rows = replica.events(after, min(limit, _REPLICA_EVENT_BATCH))
+    page = []
+    byte_count = len(_json_bytes({"result": []}))
+    for row in rows:
+        size = len(_json_bytes(row)) + int(bool(page))
+        if byte_count + size > _LIMIT:
+            if not page:
+                raise NodeProtocolError("response_too_large")
+            break
+        page.append(row)
+        byte_count += size
+    return page
+
+
+def _replica_chunk(replica: ReplicaStore, sha: str, offset: int) -> dict:
+    if not replica.is_referenced(sha) or (blob := replica.get_blob(sha)) is None:
+        raise NodeProtocolError("replica_object_unavailable")
+    if offset >= len(blob) and (blob or offset != 0):
+        raise NodeProtocolError("invalid_request")
+    chunk = blob[offset:offset + REPLICA_CHUNK_BYTES]
+    return {"sha256": sha, "offset": offset, "total": len(blob), "data": b64encode(chunk).decode("ascii")}
+
+
+def _check_replica_chunk(chunk: object, sha: str, offset: int) -> dict:
+    """Check the decoded chunk before the caller assembles it."""
+    if type(chunk) is not dict or chunk.keys() != _REPLICA_CHUNK_FIELDS:
+        raise NodeProtocolError("invalid_response")
+    total, data = chunk["total"], chunk["data"]
+    if (
+        chunk["sha256"] != sha or not _integer(chunk["offset"], offset, offset)
+        or not _integer(total, offset, MAX_BLOB_BYTES)
+        or (offset == total and total != 0) or type(data) is not bytes
+        or len(data) != min(REPLICA_CHUNK_BYTES, total - offset)
+    ):
+        raise NodeProtocolError("invalid_response")
+    return chunk
+
+
+def _report_delegation_id(task_id: object, step: object) -> str:
+    if (
+        not isinstance(task_id, str) or _REPORT_ID.fullmatch(task_id) is None
+        or type(step) is not dict or step.get("task_id") != task_id
+        or not _integer(step.get("version"), 1) or not _integer(step.get("attempt"), 1)
+    ):
+        raise NodeProtocolError("invalid_request")
+    if step.get("kind") == "extract":
+        source = step.get("source_id")
+        first, last = step.get("first_line"), step.get("last_line")
+        if (
+            step.keys() != _REPORT_STEP_FIELDS | {"source_id", "first_line", "last_line"}
+            or not isinstance(source, str) or _REPORT_SOURCE_ID.fullmatch(source) is None
+            or not _integer(first, 1, 999999) or not _integer(last, first, 999999)
+            or step.get("id") != f"{source}-{first}"
+        ):
+            raise NodeProtocolError("invalid_request")
+    elif step.keys() != _REPORT_STEP_FIELDS or (step.get("kind"), step.get("id")) != ("synthesize", "summary"):
+        raise NodeProtocolError("invalid_request")
+    return f"report:{task_id}:{step['id']}:{step['attempt']}"
+
+
 class _Coordinator:
-    def __init__(self, store: NodeTaskStore, agent_id: str, node_tokens: dict[str, str], lease_seconds: float) -> None:
+    def __init__(
+        self, store: NodeTaskStore, agent_id: str, node_tokens: dict[str, str], lease_seconds: float,
+        replica: ReplicaStore | None = None,
+    ) -> None:
         tokens = dict(node_tokens)
         if (
             not _identifier(agent_id) or not tokens
@@ -195,6 +280,7 @@ class _Coordinator:
         self.agent_id = agent_id
         self.node_tokens = tokens
         self.lease_seconds = lease_seconds
+        self.replica = replica
 
     def execute(self, operation: str, request: dict, token: str) -> Any:
         fields = _BODY_FIELDS.get(operation)
@@ -216,8 +302,12 @@ class _Coordinator:
         if operation == "handshake":
             return _identity(self.agent_id, node_id, instance_id)
         if operation == "claim":
+            if self.replica is not None:
+                raise NodeProtocolError("checkpoint_required")
             lease = self.store.claim(node_id, instance_id, self.lease_seconds)
             return {**lease, "lease_seconds": self.lease_seconds} if lease is not None else None
+        if operation == "replica-claim":
+            return self._claim_replica(node_id, instance_id, request["checkpoint_seq"])
         if operation in {"events", "events_page"}:
             after, limit = request["after"], request["limit"]
             if not _integer(after, 0) or not _integer(limit, 1, _MAX_EVENT_COUNT):
@@ -226,6 +316,18 @@ class _Coordinator:
                 return _event_page(self.store, after, limit)
             # Retain the original list response for older, small-page callers.
             return [_event_metadata(row, include_reason=False) for row in self.store.events(after, limit)]
+        if operation in {"replica-events", "replica-object"}:
+            if self.replica is None:
+                raise NodeProtocolError("unknown_operation")
+            if operation == "replica-events":
+                after, limit = request["after"], request["limit"]
+                if not _integer(after, 0) or not _integer(limit, 1, MAX_EVENT_PAGE):
+                    raise NodeProtocolError("invalid_request")
+                return _replica_page(self.replica, after, limit)
+            sha, offset = request["sha256"], request["offset"]
+            if not _digest(sha) or not _integer(offset, 0, MAX_BLOB_BYTES - 1):
+                raise NodeProtocolError("invalid_request")
+            return _replica_chunk(self.replica, sha, offset)
         task_id, version, generation = _lease(request)
         lease = (task_id, version, node_id, instance_id, generation)
         if operation == "renew":
@@ -244,6 +346,28 @@ class _Coordinator:
             raise NodeProtocolError("result_too_large") from exc
         except InvalidNodeResult as exc:
             raise NodeProtocolError("invalid_result") from exc
+
+    def _claim_replica(self, node_id: str, instance_id: str, seq: int) -> dict | None:
+        if self.replica is None:
+            raise NodeProtocolError("unknown_operation")
+        if not _integer(seq, 1):
+            raise NodeProtocolError("invalid_request")
+        checkpoint = self.replica.event(seq)
+        if checkpoint is None or checkpoint["kind"] != "checkpoint":
+            raise NodeProtocolError("invalid_request")
+        checkpoint_data = checkpoint["payload"]
+        if not _integer(checkpoint_data.get("format"), 1, 1):
+            raise NodeProtocolError("invalid_request")
+        step = checkpoint_data.get("step")
+        task_id = _report_delegation_id(checkpoint["task_id"], step)
+        work = self.store.get(task_id)
+        if work is None:
+            return None
+        expected = {"operation": "replicated_report", "checkpoint_seq": seq, "step": step}
+        if work["version"] != step["version"] or work["payload"] != expected:
+            raise NodeProtocolError("invalid_request")
+        lease = self.store.claim(node_id, instance_id, self.lease_seconds, task_id=task_id)
+        return {**lease, "lease_seconds": self.lease_seconds} if lease is not None else None
 
 
 class _NodeHandler(BaseHTTPRequestHandler):
@@ -268,6 +392,8 @@ class _NodeHandler(BaseHTTPRequestHandler):
                 raise NodeProtocolError("response_too_large")
         except NodeProtocolError as exc:
             self._send(_ERROR_STATUS[exc.code], _json_bytes({"error": exc.code}))
+        except ReplicaIntegrityError:
+            self._send(_ERROR_STATUS["replica_integrity"], b'{"error":"replica_integrity"}')
         except (TypeError, ValueError, RecursionError):
             self._send(_ERROR_STATUS["invalid_request"], b'{"error":"invalid_request"}')
         except sqlite3.Error as exc:
@@ -324,11 +450,12 @@ class _NodeServer(ThreadingHTTPServer):
 
 def create_node_server(
     store: NodeTaskStore, *, agent_id: str, node_tokens: dict[str, str], port: int = 0, lease_seconds: float = 10.0,
+    replica: ReplicaStore | None = None,
 ) -> ThreadingHTTPServer:
     """Bind only the IPv4 loopback address. The caller owns the server lifetime."""
     if not _integer(port, 0, 65535):
         raise ValueError("invalid P2 coordinator port")
-    return _NodeServer(_Coordinator(store, agent_id, node_tokens, lease_seconds), port)
+    return _NodeServer(_Coordinator(store, agent_id, node_tokens, lease_seconds, replica), port)
 
 
 class NodeClient:
@@ -392,8 +519,13 @@ class NodeClient:
             raise NodeProtocolError("invalid_response")
         return result
 
-    def claim(self) -> dict | None:
-        result = self._request("claim")
+    def claim(self, *, checkpoint_seq: int | None = None) -> dict | None:
+        if checkpoint_seq is None:
+            result = self._request("claim")
+        else:
+            if not _integer(checkpoint_seq, 1):
+                raise NodeProtocolError("invalid_request")
+            result = self._request("replica-claim", checkpoint_seq=checkpoint_seq)
         if result is None:
             return None
         if (
@@ -410,6 +542,18 @@ class NodeClient:
             raise NodeProtocolError("invalid_response")
         try:
             _lease(result)
+            if checkpoint_seq is not None:
+                payload = result["payload"]
+                step = payload.get("step")
+                if (
+                    payload.keys() != {"operation", "checkpoint_seq", "step"}
+                    or payload["operation"] != "replicated_report"
+                    or not _integer(payload["checkpoint_seq"], checkpoint_seq, checkpoint_seq)
+                    or type(step) is not dict
+                    or result["task_id"] != _report_delegation_id(step.get("task_id"), step)
+                    or result["version"] != step["version"]
+                ):
+                    raise NodeProtocolError("invalid_response")
         except NodeProtocolError as exc:
             raise NodeProtocolError("invalid_response") from exc
         return result
@@ -469,3 +613,29 @@ class NodeClient:
                 break
             after = page["next_after"]
         return events
+
+    def replica_events(self, after: int = 0, limit: int = 32) -> list[dict]:
+        """Return one size-capped P3 page following the receiver's cursor."""
+        if not _integer(after, 0) or not _integer(limit, 1, MAX_EVENT_PAGE):
+            raise NodeProtocolError("invalid_request")
+        rows = self._request("replica-events", after=after, limit=limit)
+        cursor = _event_cursor(rows, after, limit, _REPLICA_EVENT_FIELDS)
+        if cursor != after + len(rows):
+            raise NodeProtocolError("invalid_response")
+        return rows
+
+    def replica_chunk(self, sha: str, offset: int = 0) -> dict:
+        """Return an authorized chunk of a published object by digest."""
+        if not _digest(sha) or not _integer(offset, 0, MAX_BLOB_BYTES - 1):
+            raise NodeProtocolError("invalid_request")
+        chunk = self._request("replica-object", sha256=sha, offset=offset)
+        if type(chunk) is not dict or chunk.keys() != _REPLICA_CHUNK_FIELDS:
+            raise NodeProtocolError("invalid_response")
+        encoded = chunk["data"]
+        if type(encoded) is not str or len(encoded) > ((REPLICA_CHUNK_BYTES + 2) // 3) * 4:
+            raise NodeProtocolError("invalid_response")
+        try:
+            data = b64decode(encoded, validate=True)
+        except (Base64Error, ValueError) as exc:
+            raise NodeProtocolError("invalid_response") from exc
+        return _check_replica_chunk({**chunk, "data": data}, sha, offset)

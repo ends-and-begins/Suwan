@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from asyncio import CancelledError
 from contextlib import ExitStack
+from functools import partial
 import hashlib
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -134,8 +135,10 @@ def _delegation_key(task_id: str, step: dict) -> str:
 
 
 class _DelegatedFixtureModel:
-    def __init__(self, store: NodeTaskStore, task_id: str, version: int, stop: threading.Event):
+    def __init__(self, store: NodeTaskStore, task_id: str, version: int, stop: threading.Event,
+                 validate_result=_validate_result):
         self.store, self.task_id, self.version, self.stop = store, task_id, version, stop
+        self.validate_result = validate_result
 
     def _delegate(self, payload: dict):
         if self.stop.is_set():
@@ -145,7 +148,7 @@ class _DelegatedFixtureModel:
             row = self.store.get(self.task_id)
             if row is not None and row["state"] == "succeeded":
                 try:
-                    _validate_result(payload, row["result"])
+                    self.validate_result(payload, row["result"])
                 except (KeyError, TypeError, ValueError) as exc:
                     raise ReportStepBlocked("p2_invalid_delegated_result", state="failed") from exc
                 return row["result"]["value"]
@@ -179,6 +182,8 @@ class _ReportRun:
 
     def recover(self) -> None:
         if saved := self._saved_task():
+            if saved["state"] == "succeeded":
+                self._report_published(saved)
             self._launch(saved["id"])
 
     def start(self) -> str:
@@ -199,6 +204,12 @@ class _ReportRun:
     def _active_step(self, task_id: str) -> dict | None:
         return next((step for step in self.reports.steps(task_id) if step["state"] == "running"), None)
 
+    def _report_published(self, task: dict) -> None:
+        """A replica-enabled runner can register the artifact after publication."""
+
+    def _model(self, task: dict, step: dict, version: int) -> _DelegatedFixtureModel:
+        return _DelegatedFixtureModel(self.store, _delegation_key(task["id"], step), version, self.stop)
+
     def _launch(self, task_id: str) -> None:
         if self.thread is not None and self.thread.is_alive():
             return
@@ -210,12 +221,12 @@ class _ReportRun:
         self.thread.start()
 
     def _execute(self, task_id: str) -> None:
-        def delegate(_task, step):
+        def delegate(task, step):
             # The claimed event is the original immutable delegation version.
             version = next(event["revision"] for event in reversed(self.reports.events(task_id))
                            if event["event"] == "claimed" and event["step_id"] == step["id"]
                            and event["attempt"] == step["attempt"])
-            return _DelegatedFixtureModel(self.store, _delegation_key(task_id, step), version, self.stop)
+            return self._model(task, step, version)
 
         try:
             while not self.stop.is_set():
@@ -232,6 +243,8 @@ class _ReportRun:
                 if step is None:
                     return
                 outcome = self.service.advance(task_id, model_for_step=delegate, claimed_step=step)
+                if outcome["state"] == "succeeded":
+                    self._report_published(outcome)
                 if step["kind"] != "publish" and outcome["state"] not in {"running", "ready"}:
                     # A local source/validation failure must also stop its uncommitted delegate.
                     self.store.cancel(_delegation_key(task_id, step))
@@ -253,17 +266,21 @@ class _ReportRun:
         return report
 
 
-def _coordinator(root: Path, port: int, guard) -> None:
+def _coordinator(root: Path, port: int, guard, *, replica_factory=None, report_runner=_ReportRun,
+                 validate_result=_validate_result) -> None:
     folder = root / "coordinator"
     tokens = {node: (root / node / "pairing.txt").read_text(encoding="ascii") for node in _WORKERS}
     with InstanceLock(folder):
-        store = NodeTaskStore(folder / "node_tasks.sqlite3", result_validator=_validate_result)
+        replica = replica_factory(folder / "replica.sqlite3") if replica_factory is not None else None
+        validator = validate_result if replica is None else partial(validate_result, replica)
+        store = NodeTaskStore(folder / "node_tasks.sqlite3", result_validator=validator)
         store.begin_coordinator_session()
-        server = create_node_server(store, agent_id=_AGENT, node_tokens=tokens, port=port, lease_seconds=_LEASE)
+        kwargs = {"replica": replica} if replica is not None else {}
+        server = create_node_server(store, agent_id=_AGENT, node_tokens=tokens, port=port, lease_seconds=_LEASE, **kwargs)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         thread.start()
         stop = threading.Event()
-        reports = _ReportRun(folder, store, stop)
+        reports = report_runner(folder, store, stop) if replica is None else report_runner(folder, store, stop, replica)
         reports.recover()
         meta = {"agent_id": _AGENT, "node_id": "coordinator", "instance_id": uuid4().hex,
                 "pid": os.getpid(), "port": server.server_address[1]}
@@ -307,7 +324,7 @@ class _StatusServer(HTTPServer):
         self.server_name, self.server_port = self.server_address
 
 
-def _worker(root: Path, node: str, coordinator_port: int, guard) -> None:
+def _worker(root: Path, node: str, coordinator_port: int, guard, *, replica_factory=None) -> None:
     folder = root / node
     token = (folder / "pairing.txt").read_text(encoding="ascii")
     instance = uuid4().hex
@@ -315,7 +332,8 @@ def _worker(root: Path, node: str, coordinator_port: int, guard) -> None:
         client = NodeClient(coordinator_port, agent_id=_AGENT, node_id=node, instance_id=instance,
                             token=token)
         client.handshake()
-        worker = ReportNodeWorker(client, _processor)
+        replica = replica_factory(folder, client) if replica_factory is not None else None
+        worker = ReportNodeWorker(client, _processor if replica is None else replica.process)
 
         class StatusHandler(BaseHTTPRequestHandler):
             def do_GET(self):
@@ -340,6 +358,10 @@ def _worker(root: Path, node: str, coordinator_port: int, guard) -> None:
         log = _logger(folder, meta)
 
         def handle(action, _request):
+            if replica is not None:
+                replica_handler = replica.handle(action, _request, worker)
+                if replica_handler is not None:
+                    return replica_handler
             if action == "claim":
                 result = worker.claim()
             elif action == "renew":
@@ -363,12 +385,12 @@ def _worker(root: Path, node: str, coordinator_port: int, guard) -> None:
 
 
 class _Process:
-    def __init__(self, role: str, root: Path, port: int, node: str | None = None):
+    def __init__(self, role: str, root: Path, port: int, node: str | None = None, *, entrypoint: Path | None = None):
         self.messages: Queue = Queue()
         self.root = root
         folder = root / (node or "coordinator")
         self.stderr = (folder / "stderr.log").open("ab")
-        args = [sys.executable, "-B", "-X", "utf8", str(Path(__file__).resolve()),
+        args = [sys.executable, "-B", "-X", "utf8", str(entrypoint or Path(__file__).resolve()),
                 "--role", role, "--output", str(root), "--port", str(port)]
         if node is not None:
             args += ["--node", node]

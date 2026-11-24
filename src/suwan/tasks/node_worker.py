@@ -88,12 +88,16 @@ class ReportNodeWorker:
         self._failure = None
         self._set_status(status, error_code)
 
-    def claim(self) -> dict[str, Any] | None:
+    def claim(self, *, checkpoint_seq: int | None = None) -> dict[str, Any] | None:
         """Ask for work or return a held lease only after renewing it."""
         if self._lease is not None:
+            if checkpoint_seq is not None and self._lease["payload"].get("checkpoint_seq") != checkpoint_seq:
+                return None
             return self.lease if self.renew() else None
         try:
-            self._lease = self._client.claim()
+            self._lease = self._client.claim() if checkpoint_seq is None else self._client.claim(
+                checkpoint_seq=checkpoint_seq
+            )
         except (OSError, NodeProtocolError) as exc:
             self._request_failed(exc, "claim")
             return None
