@@ -443,6 +443,26 @@ class ReportTaskStore:
             self._transition(db, task_id, "ready", "resumed")
             return True
 
+    def reattach_waiting_delegation(self, task_id: str) -> bool:
+        """Restore the same attempt when an older P2 coordinator paused its wait."""
+        with self._database(write=True) as db:
+            task = self._task(db, task_id)
+            if (task["state"], task["reason"]) != ("paused", "p2_waiting_for_executor"):
+                return False
+            step = db.execute(
+                """SELECT * FROM report_step WHERE task_id = ? AND state != 'completed'
+                ORDER BY position LIMIT 1""",
+                (task_id,),
+            ).fetchone()
+            if step is None or step["state"] != "pending" or step["attempt"] < 1:
+                return False
+            if json.loads(step["spec_json"])["kind"] not in {"extract", "synthesize"}:
+                return False
+            db.execute("UPDATE report_step SET state = 'running' WHERE task_id = ? AND id = ?",
+                       (task_id, step["id"]))
+            self._transition(db, task_id, "running", "delegation_reattached", step=step)
+            return True
+
     def fail_step(
         self,
         task_id: str,
