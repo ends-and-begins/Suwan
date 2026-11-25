@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from base64 import b64decode, b64encode
 from binascii import Error as Base64Error
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -23,7 +25,16 @@ from suwan.tasks.node_store import (
     NodeTaskStore,
     serialize_node_object,
 )
-from suwan.tasks.replica_store import MAX_BLOB_BYTES, MAX_EVENT_PAGE, ReplicaIntegrityError, ReplicaStore
+from suwan.tasks.replica_store import (
+    EMPTY_HISTORY_DIGEST,
+    MAX_BLOB_BYTES,
+    MAX_EVENT_PAGE,
+    ReplicaConflictError,
+    ReplicaIntegrityError,
+    ReplicaStore,
+    _chain_digest,
+    _encode_event,
+)
 
 
 _HOST = "127.0.0.1"
@@ -47,6 +58,7 @@ _EVENT_FIELDS = (
 )
 _PAGE_FIELDS = (*_EVENT_FIELDS, "reason")
 _REPLICA_EVENT_FIELDS = ("seq", "event_key", "task_id", "kind", "payload", "objects")
+_REPLICA_PAGE_FIELDS = frozenset({"after", "prefix_digest", "end_digest", "tail", "events", "blocked_at"})
 _REPLICA_CHUNK_FIELDS = frozenset({"sha256", "offset", "total", "data"})
 _FAILURE_REASON = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _BODY_FIELDS = {
@@ -58,6 +70,7 @@ _BODY_FIELDS = {
     "events": frozenset({"after", "limit"}),
     "events_page": frozenset({"after", "limit"}),
     "replica-events": frozenset({"after", "limit"}),
+    "replica-page": frozenset({"after", "limit", "prefix_digest"}),
     "replica-object": frozenset({"sha256", "offset"}),
     "replica-claim": frozenset({"checkpoint_seq"}),
 }
@@ -69,6 +82,9 @@ _ERROR_STATUS = {
     "protocol_mismatch": 409,
     "checkpoint_required": 409,
     "replica_integrity": 409,
+    "replica_history_mismatch": 409,
+    "replica_history_damaged": 409,
+    "replica_history_unsupported": 409,
     "replica_object_unavailable": 404,
     "request_too_large": 413,
     "result_too_large": 413,
@@ -81,9 +97,10 @@ _ERROR_STATUS = {
 class NodeProtocolError(Exception):
     """A bounded error code shared by the coordinator and its clients."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, sequence: int | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.sequence = sequence
 
 
 def _identifier(value: object) -> bool:
@@ -202,28 +219,40 @@ def _event_cursor(rows: object, after: int, limit: int, fields: tuple[str, ...])
     return cursor
 
 
-def _replica_page(replica: ReplicaStore, after: int, limit: int) -> list[dict]:
-    rows = replica.events(after, min(limit, _REPLICA_EVENT_BATCH))
-    page = []
-    byte_count = len(_json_bytes({"result": []}))
+def _replica_page(replica: ReplicaStore, after: int, limit: int, prefix_digest: str) -> dict:
+    try:
+        rows, blocked_at, tail = replica.history_page(after, min(limit, _REPLICA_EVENT_BATCH), prefix_digest)
+    except ReplicaConflictError as exc:
+        raise NodeProtocolError("replica_history_mismatch") from exc
+    except ReplicaIntegrityError as exc:
+        raise NodeProtocolError("replica_history_damaged", sequence=exc.sequence) from exc
+    page = {"after": after, "prefix_digest": prefix_digest, "end_digest": prefix_digest,
+            "tail": tail, "events": [], "blocked_at": blocked_at}
+    byte_count = len(_json_bytes({"result": page}))
     for row in rows:
-        size = len(_json_bytes(row)) + int(bool(page))
+        size = len(_json_bytes(row)) + int(bool(page["events"]))
         if byte_count + size > _LIMIT:
-            if not page:
+            if not page["events"]:
                 raise NodeProtocolError("response_too_large")
+            page["blocked_at"] = None
             break
-        page.append(row)
+        page["events"].append(row)
+        page["end_digest"] = _chain_digest(page["end_digest"], _encode_event(row))
         byte_count += size
     return page
 
 
 def _replica_chunk(replica: ReplicaStore, sha: str, offset: int) -> dict:
-    if not replica.is_referenced(sha) or (blob := replica.get_blob(sha)) is None:
+    try:
+        found = replica.blob_chunk(sha, offset, REPLICA_CHUNK_BYTES) if replica.is_referenced(sha) else None
+    except ReplicaIntegrityError:
+        raise
+    except ValueError as exc:
+        raise NodeProtocolError("invalid_request") from exc
+    if found is None:
         raise NodeProtocolError("replica_object_unavailable")
-    if offset >= len(blob) and (blob or offset != 0):
-        raise NodeProtocolError("invalid_request")
-    chunk = blob[offset:offset + REPLICA_CHUNK_BYTES]
-    return {"sha256": sha, "offset": offset, "total": len(blob), "data": b64encode(chunk).decode("ascii")}
+    total, chunk = found
+    return {"sha256": sha, "offset": offset, "total": total, "data": b64encode(chunk).decode("ascii")}
 
 
 def _check_replica_chunk(chunk: object, sha: str, offset: int) -> dict:
@@ -267,6 +296,7 @@ class _Coordinator:
     def __init__(
         self, store: NodeTaskStore, agent_id: str, node_tokens: dict[str, str], lease_seconds: float,
         replica: ReplicaStore | None = None,
+        replica_claim_guard: Callable[[dict], AbstractContextManager[bool]] | None = None,
     ) -> None:
         tokens = dict(node_tokens)
         if (
@@ -281,6 +311,7 @@ class _Coordinator:
         self.node_tokens = tokens
         self.lease_seconds = lease_seconds
         self.replica = replica
+        self.replica_claim_guard = replica_claim_guard
 
     def execute(self, operation: str, request: dict, token: str) -> Any:
         fields = _BODY_FIELDS.get(operation)
@@ -316,14 +347,16 @@ class _Coordinator:
                 return _event_page(self.store, after, limit)
             # Retain the original list response for older, small-page callers.
             return [_event_metadata(row, include_reason=False) for row in self.store.events(after, limit)]
-        if operation in {"replica-events", "replica-object"}:
+        if operation in {"replica-events", "replica-page", "replica-object"}:
             if self.replica is None:
                 raise NodeProtocolError("unknown_operation")
             if operation == "replica-events":
-                after, limit = request["after"], request["limit"]
-                if not _integer(after, 0) or not _integer(limit, 1, MAX_EVENT_PAGE):
+                raise NodeProtocolError("replica_history_unsupported")
+            if operation == "replica-page":
+                after, limit, prefix_digest = request["after"], request["limit"], request["prefix_digest"]
+                if not _integer(after, 0) or not _integer(limit, 1, MAX_EVENT_PAGE) or not _digest(prefix_digest):
                     raise NodeProtocolError("invalid_request")
-                return _replica_page(self.replica, after, limit)
+                return _replica_page(self.replica, after, limit, prefix_digest)
             sha, offset = request["sha256"], request["offset"]
             if not _digest(sha) or not _integer(offset, 0, MAX_BLOB_BYTES - 1):
                 raise NodeProtocolError("invalid_request")
@@ -331,23 +364,24 @@ class _Coordinator:
         task_id, version, generation = _lease(request)
         lease = (task_id, version, node_id, instance_id, generation)
         if operation == "renew":
-            return self.store.renew(*lease, self.lease_seconds)
+            return self._lease_action(lease, lambda: self.store.renew(*lease, self.lease_seconds))
         if operation == "fail":
             reason, retryable = request["reason"], request["retryable"]
             if not isinstance(reason, str) or _FAILURE_REASON.fullmatch(reason) is None or type(retryable) is not bool:
                 raise NodeProtocolError("invalid_request")
-            return self.store.fail(*lease, reason, retryable=retryable)
+            return self._lease_action(lease, lambda: self.store.fail(*lease, reason, retryable=retryable),
+                                      receipt_states=("ready", "failed"))
         result = request["result"]
         if type(result) is not dict:
             raise NodeProtocolError("invalid_result")
         try:
-            return self.store.submit(*lease, result)
+            return self._lease_action(lease, lambda: self.store.submit(*lease, result), receipt_states=("succeeded",))
         except NodeObjectTooLarge as exc:
             raise NodeProtocolError("result_too_large") from exc
         except InvalidNodeResult as exc:
             raise NodeProtocolError("invalid_result") from exc
 
-    def _claim_replica(self, node_id: str, instance_id: str, seq: int) -> dict | None:
+    def _checkpoint(self, seq: int) -> tuple[dict, str, dict]:
         if self.replica is None:
             raise NodeProtocolError("unknown_operation")
         if not _integer(seq, 1):
@@ -360,14 +394,46 @@ class _Coordinator:
             raise NodeProtocolError("invalid_request")
         step = checkpoint_data.get("step")
         task_id = _report_delegation_id(checkpoint["task_id"], step)
+        expected = {"operation": "replicated_report", "checkpoint_seq": seq, "step": step}
+        return checkpoint, task_id, expected
+
+    def _claim_replica(self, node_id: str, instance_id: str, seq: int) -> dict | None:
+        checkpoint, task_id, expected = self._checkpoint(seq)
         work = self.store.get(task_id)
         if work is None:
             return None
-        expected = {"operation": "replicated_report", "checkpoint_seq": seq, "step": step}
-        if work["version"] != step["version"] or work["payload"] != expected:
+        if work["version"] != expected["step"]["version"] or work["payload"] != expected:
             raise NodeProtocolError("invalid_request")
-        lease = self.store.claim(node_id, instance_id, self.lease_seconds, task_id=task_id)
+        with self._guard(checkpoint) as active:
+            lease = self.store.claim(node_id, instance_id, self.lease_seconds, task_id=task_id) if active else None
         return {**lease, "lease_seconds": self.lease_seconds} if lease is not None else None
+
+    def _guard(self, checkpoint: dict) -> AbstractContextManager[bool]:
+        return self.replica_claim_guard(checkpoint) if self.replica_claim_guard is not None else nullcontext(True)
+
+    def _lease_action(self, lease: tuple, action: Callable[[], bool], *, receipt_states: tuple[str, ...] = ()) -> bool:
+        if self.replica_claim_guard is None:
+            return action()
+        task_id, *owner = lease
+        work = self.store.get(task_id)
+        fields = ("version", "node_id", "instance_id", "generation")
+        if work is None or [work[field] for field in fields] != owner:
+            return False
+        if work["state"] in receipt_states:
+            # The store matches the exact receipt and lease without writing a new result.
+            return action()
+        if not work["lease_active"]:
+            return False
+        payload = work["payload"]
+        checkpoint, expected_task, expected = self._checkpoint(payload.get("checkpoint_seq"))
+        if expected_task != task_id or work["version"] != expected["step"]["version"] or payload != expected:
+            raise NodeProtocolError("replica_history_mismatch")
+        with self._guard(checkpoint) as active:
+            if active:
+                return action()
+            # A concurrent submit can have committed before this guard acquired the P1 lock.
+            latest = self.store.get(task_id) if receipt_states else None
+            return latest is not None and latest["state"] in receipt_states and action()
 
 
 class _NodeHandler(BaseHTTPRequestHandler):
@@ -391,7 +457,10 @@ class _NodeHandler(BaseHTTPRequestHandler):
             if len(payload) > _LIMIT:
                 raise NodeProtocolError("response_too_large")
         except NodeProtocolError as exc:
-            self._send(_ERROR_STATUS[exc.code], _json_bytes({"error": exc.code}))
+            error = {"error": exc.code}
+            if exc.sequence is not None:
+                error["sequence"] = exc.sequence
+            self._send(_ERROR_STATUS[exc.code], _json_bytes(error))
         except ReplicaIntegrityError:
             self._send(_ERROR_STATUS["replica_integrity"], b'{"error":"replica_integrity"}')
         except (TypeError, ValueError, RecursionError):
@@ -451,11 +520,12 @@ class _NodeServer(ThreadingHTTPServer):
 def create_node_server(
     store: NodeTaskStore, *, agent_id: str, node_tokens: dict[str, str], port: int = 0, lease_seconds: float = 10.0,
     replica: ReplicaStore | None = None,
+    replica_claim_guard: Callable[[dict], AbstractContextManager[bool]] | None = None,
 ) -> ThreadingHTTPServer:
     """Bind only the IPv4 loopback address. The caller owns the server lifetime."""
     if not _integer(port, 0, 65535):
         raise ValueError("invalid P2 coordinator port")
-    return _NodeServer(_Coordinator(store, agent_id, node_tokens, lease_seconds, replica), port)
+    return _NodeServer(_Coordinator(store, agent_id, node_tokens, lease_seconds, replica, replica_claim_guard), port)
 
 
 class NodeClient:
@@ -509,8 +579,12 @@ class NodeClient:
         if status == 200 and envelope.keys() == {"result"}:
             return envelope["result"]
         error = envelope.get("error")
-        if envelope.keys() == {"error"} and isinstance(error, str) and _ERROR_STATUS.get(error) == status:
-            raise NodeProtocolError(error)
+        if isinstance(error, str) and _ERROR_STATUS.get(error) == status:
+            if envelope.keys() == {"error"}:
+                raise NodeProtocolError(error)
+            sequence = envelope.get("sequence")
+            if error == "replica_history_damaged" and envelope.keys() == {"error", "sequence"} and _integer(sequence, 1):
+                raise NodeProtocolError(error, sequence=sequence)
         raise NodeProtocolError("invalid_response")
 
     def handshake(self) -> dict:
@@ -614,15 +688,45 @@ class NodeClient:
             after = page["next_after"]
         return events
 
-    def replica_events(self, after: int = 0, limit: int = 32) -> list[dict]:
-        """Return one size-capped P3 page following the receiver's cursor."""
-        if not _integer(after, 0) or not _integer(limit, 1, MAX_EVENT_PAGE):
+    def replica_page(self, after: int, prefix_digest: str, limit: int = 32) -> dict:
+        """Get a bounded, contiguous page bound to the verified local history."""
+        if not _integer(after, 0) or not _integer(limit, 1, MAX_EVENT_PAGE) or not _digest(prefix_digest):
             raise NodeProtocolError("invalid_request")
-        rows = self._request("replica-events", after=after, limit=limit)
-        cursor = _event_cursor(rows, after, limit, _REPLICA_EVENT_FIELDS)
-        if cursor != after + len(rows):
+        try:
+            page = self._request("replica-page", after=after, limit=limit, prefix_digest=prefix_digest)
+        except NodeProtocolError as exc:
+            if exc.code in {"unknown_operation", "protocol_mismatch"}:
+                raise NodeProtocolError("replica_history_unsupported") from exc
+            raise
+        if type(page) is not dict or page.keys() != _REPLICA_PAGE_FIELDS:
             raise NodeProtocolError("invalid_response")
-        return rows
+        rows, tail, blocked = page["events"], page["tail"], page["blocked_at"]
+        cursor = _event_cursor(rows, after, limit, _REPLICA_EVENT_FIELDS)
+        if (
+            not _integer(page["after"], after, after) or page["prefix_digest"] != prefix_digest
+            or cursor != after + len(rows) or not _integer(tail, cursor)
+            or (blocked is not None and (not _integer(blocked, cursor + 1, cursor + 1) or blocked > tail))
+            or (not rows and blocked is None and tail != after)
+        ):
+            raise NodeProtocolError("invalid_response")
+        end_digest = prefix_digest
+        try:
+            for row in rows:
+                end_digest = _chain_digest(end_digest, _encode_event(row))
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise NodeProtocolError("invalid_response") from exc
+        if page["end_digest"] != end_digest:
+            raise NodeProtocolError("invalid_response")
+        return page
+
+    def replica_events(
+        self, after: int = 0, limit: int = 32, *, prefix_digest: str = EMPTY_HISTORY_DIGEST,
+    ) -> list[dict]:
+        """Get an anchored page as a list for callers that need only its records."""
+        page = self.replica_page(after, prefix_digest, limit)
+        if page["blocked_at"] is not None:
+            raise NodeProtocolError("replica_history_damaged", sequence=page["blocked_at"])
+        return page["events"]
 
     def replica_chunk(self, sha: str, offset: int = 0) -> dict:
         """Return an authorized chunk of a published object by digest."""

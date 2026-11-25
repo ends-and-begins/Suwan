@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from asyncio import CancelledError
+from collections import deque
 from contextlib import ExitStack
 from functools import partial
 import hashlib
@@ -13,6 +14,7 @@ import os
 from pathlib import Path
 from queue import Empty, Queue
 import secrets
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -73,17 +75,27 @@ def _write_message(message: dict) -> None:
 
 def _commands(handler, log, guard) -> None:
     for line in sys.stdin:
+        response = {}
         try:
             request = json.loads(line)
+            if not isinstance(request, dict):
+                raise TypeError("invalid control request")
+            response["id"] = request.get("id")
             action = request["action"]
             if action == "exit":
-                _write_message({"data": {"guard": guard["blocked_attempts"]}})
+                _write_message({**response, "data": {"guard": guard["blocked_attempts"]}})
                 return
             result = handler(action, request)
             log(action)
-            _write_message({"data": result})
+            response["data"] = result
+        except NodeProtocolError as exc:
+            response["error"] = exc.code
+        except sqlite3.Error as exc:
+            code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+            response["error"] = "storage_busy" if code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED} else "storage_unavailable"
         except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
-            _write_message({"error": type(exc).__name__})
+            response["error"] = type(exc).__name__
+        _write_message(response)
 
 
 def _logger(folder: Path, metadata: dict):
@@ -144,7 +156,16 @@ class _DelegatedFixtureModel:
         if self.stop.is_set():
             raise CancelledError
         self.store.enqueue(self.task_id, self.version, payload)
+        return self._wait_for_result(payload)
+
+    def _delegation_active(self) -> bool:
+        return True
+
+    def _wait_for_result(self, payload: dict):
         while not self.stop.is_set():
+            if not self._delegation_active():
+                self.store.cancel(self.task_id)
+                raise CancelledError
             row = self.store.get(self.task_id)
             if row is not None and row["state"] == "succeeded":
                 try:
@@ -265,6 +286,13 @@ class _ReportRun:
                 report["execution_status"] = "waiting_for_executor"
         return report
 
+    def cancel(self, task_id: str) -> bool:
+        return self.reports.cancel(task_id)
+
+    def close(self) -> None:
+        if self.thread is not None:
+            self.thread.join(3)
+
 
 def _coordinator(root: Path, port: int, guard, *, replica_factory=None, report_runner=_ReportRun,
                  validate_result=_validate_result) -> None:
@@ -275,13 +303,12 @@ def _coordinator(root: Path, port: int, guard, *, replica_factory=None, report_r
         validator = validate_result if replica is None else partial(validate_result, replica)
         store = NodeTaskStore(folder / "node_tasks.sqlite3", result_validator=validator)
         store.begin_coordinator_session()
-        kwargs = {"replica": replica} if replica is not None else {}
+        stop = threading.Event()
+        reports = report_runner(folder, store, stop) if replica is None else report_runner(folder, store, stop, replica)
+        kwargs = {"replica": replica, "replica_claim_guard": reports.claim_guard} if replica is not None else {}
         server = create_node_server(store, agent_id=_AGENT, node_tokens=tokens, port=port, lease_seconds=_LEASE, **kwargs)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         thread.start()
-        stop = threading.Event()
-        reports = report_runner(folder, store, stop) if replica is None else report_runner(folder, store, stop, replica)
-        reports.recover()
         meta = {"agent_id": _AGENT, "node_id": "coordinator", "instance_id": uuid4().hex,
                 "pid": os.getpid(), "port": server.server_address[1]}
         log = _logger(folder, meta)
@@ -301,9 +328,12 @@ def _coordinator(root: Path, port: int, guard, *, replica_factory=None, report_r
                 return reports.start()
             if action == "report-status":
                 return reports.status(request["task_id"])
+            if action == "report-cancel":
+                return reports.cancel(request["task_id"])
             raise ValueError("unsupported coordinator action")
 
         try:
+            reports.recover()
             log("listening")
             _write_message({"data": meta})
             _commands(handle, log, guard)
@@ -312,8 +342,7 @@ def _coordinator(root: Path, port: int, guard, *, replica_factory=None, report_r
             server.shutdown()
             server.server_close()
             thread.join(3)
-            if reports.thread is not None:
-                reports.thread.join(3)
+            reports.close()
 
 
 class _StatusServer(HTTPServer):
@@ -384,9 +413,17 @@ def _worker(root: Path, node: str, coordinator_port: int, guard, *, replica_fact
             thread.join(3)
 
 
+class _ChildCommandError(RuntimeError):
+    def __init__(self, code: str):
+        super().__init__(f"P2 child returned {code}")
+        self.code = code
+
+
 class _Process:
     def __init__(self, role: str, root: Path, port: int, node: str | None = None, *, entrypoint: Path | None = None):
         self.messages: Queue = Queue()
+        self._pending = deque()
+        self._sequence = 0
         self.root = root
         folder = root / (node or "coordinator")
         self.stderr = (folder / "stderr.log").open("ab")
@@ -417,24 +454,34 @@ class _Process:
         self.messages.put(None)
 
     def send(self, action, **kwargs):
-        self.proc.stdin.write(json.dumps({"action": action, **kwargs}) + "\n")
+        self._sequence += 1
+        self.proc.stdin.write(json.dumps({"action": action, **kwargs, "id": self._sequence}) + "\n")
         self.proc.stdin.flush()
+        self._pending.append(self._sequence)
 
-    def receive(self):
-        try:
-            line = self.messages.get(timeout=12)
-        except Empty as exc:
-            raise RuntimeError("P2 child response timed out") from exc
-        if line is None:
-            raise RuntimeError("P2 child closed its control pipe; see stderr.log")
-        response = json.loads(line)
-        if "error" in response:
-            raise RuntimeError(f"P2 child returned {response['error']}")
-        return response["data"]
+    def receive(self, *, timeout=12):
+        expected = self._pending.popleft() if self._pending else None
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                line = self.messages.get(timeout=max(0, deadline - time.monotonic()))
+            except Empty as exc:
+                raise RuntimeError("P2 child response timed out") from exc
+            if line is None:
+                raise RuntimeError("P2 child closed its control pipe; see stderr.log")
+            response = json.loads(line)
+            actual = response.get("id")
+            if actual == expected:
+                if "error" in response:
+                    raise _ChildCommandError(response["error"])
+                return response["data"]
+            if type(actual) is not int or expected is None or actual >= expected:
+                raise RuntimeError("P2 child reply ID is out of order")
+            # An earlier command timed out. Its reply is never the current result.
 
-    def request(self, action, **kwargs):
+    def request(self, action, *, timeout=12, **kwargs):
         self.send(action, **kwargs)
-        return self.receive()
+        return self.receive(timeout=timeout)
 
     def kill(self):
         self.proc.kill()

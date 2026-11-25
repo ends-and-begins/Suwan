@@ -398,6 +398,16 @@ class ReportTaskStore:
             (task_id, step_id, attempt),
         ).fetchone()
 
+    @contextmanager
+    def delegation_guard(self, task_id: str, step_id: str, attempt: int) -> Iterator[bool]:
+        """Serialize a P3 delegation decision with transitions of its P1 task.
+
+        Acquire this guard before the replica or node-store writer. Protected
+        work must not write back to the report store using another connection.
+        """
+        with self._database(write=True) as db:
+            yield self._active_step(db, task_id, step_id, attempt) is not None
+
     @staticmethod
     def _finish_step(db: sqlite3.Connection, step: sqlite3.Row, state: str, result: str | None = None) -> None:
         db.execute(

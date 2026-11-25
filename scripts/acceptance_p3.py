@@ -2,27 +2,38 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack
+from asyncio import CancelledError
+from contextlib import ExitStack, closing, contextmanager
 from functools import partial
 import hashlib
 import json
 from pathlib import Path
 import secrets
+import sqlite3
 import sys
+from threading import Lock, Thread
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "src")]
 
 from scripts.acceptance_p2 import (
-    _WORKERS, _DelegatedFixtureModel, _Process, _ReportRun, _coordinator, _delegation_key, _expect,
+    _WORKERS, _ChildCommandError, _DelegatedFixtureModel, _Process, _ReportRun, _coordinator, _delegation_key, _expect,
     _guard_local_testing, _processor, _validate_result, _worker,
 )
 from suwan.services.report_replication import (
     publish_checkpoint, publish_report_artifact, replicated_input, restore_report_artifact,
 )
-from suwan.tasks.replica_store import ReplicaStore
+from suwan.tasks.replica_store import ReplicaConflictError, ReplicaIntegrityError, ReplicaStore
 from suwan.tasks.replica_sync import fetch_objects, sync_events
+
+
+class ReplicaRecoveryRequired(RuntimeError):
+    """The report and the existing delegation require matching replica data."""
+
+
+def _work_payload(event: dict) -> dict:
+    return {"operation": "replicated_report", "checkpoint_seq": event["seq"], "step": event["payload"]["step"]}
 
 
 def _work_input(local: ReplicaStore, payload: dict) -> dict:
@@ -39,43 +50,138 @@ def _validate_replicated_result(local: ReplicaStore, payload: dict, result: dict
 
 
 class _ReplicatedModel(_DelegatedFixtureModel):
-    def __init__(self, store, task_id, version, stop, replica, event):
+    def __init__(self, store, task_id, version, stop, replica, event, reports):
         super().__init__(store, task_id, version, stop, partial(_validate_replicated_result, replica))
-        self.payload = {"operation": "replicated_report", "checkpoint_seq": event["seq"],
-                        "step": event["payload"]["step"]}
+        self.payload = _work_payload(event)
+        self.reports = reports
+
+    def _delegation_active(self):
+        return self.reports.get(self.payload["step"]["task_id"])["state"] == "running"
 
     def extract(self, _instruction, _chunk):
-        return self._delegate(self.payload)
+        return self._wait_for_result(self.payload)
 
     def synthesize(self, _instruction, _findings):
-        return self._delegate(self.payload)
+        return self._wait_for_result(self.payload)
 
 
 class _P3ReportRun(_ReportRun):
     def __init__(self, folder, store, stop, replica):
         super().__init__(folder, store, stop)
         self.replica = replica
+        self._artifact_thread = None
+        self._artifact_lock = Lock()
+        self._artifact_reason = None
+
+    def _attached_event(self, key, version, row):
+        if row is None:
+            return None
+        try:
+            event = self.replica.event(row["payload"]["checkpoint_seq"])
+            if (event is None or event["kind"] != "checkpoint" or event["event_key"] != key
+                    or row["version"] != version or _work_payload(event) != row["payload"]):
+                raise ValueError("delegation and replica do not match")
+            # Validate immutable content too, before attaching a previously queued job.
+            replicated_input(self.replica, event, event["payload"]["step"])
+            return event
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReplicaRecoveryRequired("restore the replica that matches the queued report") from exc
 
     def _model(self, task, step, version):
-        event = publish_checkpoint(self.replica, self.reports, task, step)
-        return _ReplicatedModel(self.store, _delegation_key(task["id"], step), version, self.stop, self.replica, event)
+        key = _delegation_key(task["id"], step)
+        existing = self._attached_event(key, version, self.store.get(key))
+
+        def enqueue(event):
+            if existing is not None and existing != event:
+                raise ReplicaRecoveryRequired("restored event changed")
+            self.store.enqueue(key, version, _work_payload(event))
+
+        try:
+            event = publish_checkpoint(self.replica, self.reports, task, step, after_publish=enqueue)
+        except (ReplicaConflictError, ReplicaIntegrityError) as exc:
+            raise ReplicaRecoveryRequired("restore the replica that matches the report checkpoint") from exc
+        return _ReplicatedModel(self.store, key, version, self.stop, self.replica, event, self.reports)
+
+    @contextmanager
+    def claim_guard(self, checkpoint):
+        step = checkpoint["payload"]["step"]
+        task_id = checkpoint["task_id"]
+        with self.reports.delegation_guard(task_id, step["id"], step["attempt"]) as active:
+            if not active:
+                self.store.cancel(_delegation_key(task_id, step))
+            yield active
+
+    def cancel(self, task_id):
+        step = self._active_step(task_id)
+        cancelled = super().cancel(task_id)
+        if cancelled and step is not None and step["kind"] != "publish":
+            self.store.cancel(_delegation_key(task_id, step))
+        return cancelled
 
     def _report_published(self, task):
-        publish_report_artifact(self.replica, task, self.service.output_dir)
+        with self._artifact_lock:
+            if self._artifact_thread is None or not self._artifact_thread.is_alive():
+                self._artifact_thread = Thread(target=self._announce, args=(task,), daemon=True)
+                self._artifact_thread.start()
+
+    def _announce(self, task):
+        backoff = 0.1
+        while not self.stop.is_set():
+            try:
+                publish_report_artifact(self.replica, task, self.service.output_dir)
+            except FileNotFoundError:
+                self._artifact_reason = "artifact_missing"
+                return
+            except ValueError:
+                self._artifact_reason = "artifact_invalid"
+                return
+            except (sqlite3.Error, OSError):
+                self._artifact_reason = "artifact_publication_retrying"
+                self.stop.wait(backoff)
+                backoff = min(backoff * 2, 2.0)
+            else:
+                self._artifact_reason = None
+                return
+
+    def _resume_previous_failure(self, task):
+        """Offer explicit recovery of a report cancelled by the old split-restore bug."""
+        if (task["state"], task["reason"]) != ("paused", "model_failed"):
+            return
+        step = next((row for row in self.reports.steps(task["id"]) if row["state"] != "completed"), None)
+        if step is None or step["state"] != "pending" or step["attempt"] < 1:
+            return
+        key = _delegation_key(task["id"], step)
+        row = self.store.get(key)
+        if row is not None and row["state"] == "cancelled":
+            self._attached_event(key, row["version"], row)
+            self.reports.resume(task["id"])
 
     def start(self):
+        if task := self._saved_task():
+            self._resume_previous_failure(task)
         task_id = super().start()
         task = self.reports.get(task_id)
-        if task["state"] == "succeeded" and self.replica.latest(task_id, "artifact") is None:
+        if task["state"] == "succeeded":
             self._report_published(task)
         return task_id
 
     def status(self, task_id):
         report = super().status(task_id)
+        if self.error == ReplicaRecoveryRequired.__name__ and report["state"] == "interrupted":
+            return {**report, "reason": "p3_replica_recovery_required"}
         if report["state"] == "succeeded":
-            published = self.replica.latest(task_id, "artifact") is not None
+            artifact = self.replica.latest(task_id, "artifact")
+            published = artifact is not None and not self.replica.missing(artifact)
             report["replica_status"] = "announced" if published else "awaiting_artifact_registration"
+            report["local_artifact_status"] = "available" if Path(report["artifact"]["path"]).is_file() else "missing"
+            if not published and self._artifact_reason is not None:
+                report["replica_reason"] = self._artifact_reason
         return report
+
+    def close(self):
+        super().close()
+        if self._artifact_thread is not None:
+            self._artifact_thread.join(3)
 
 
 class _ReplicaNode:
@@ -91,8 +197,14 @@ class _ReplicaNode:
         if event is None:
             return {"status": "waiting_for_metadata", "missing": []}
         missing = self.local.missing(event)
-        return {"status": "waiting_for_objects" if missing else "objects_verified",
-                "missing": missing}
+        if missing:
+            return {"status": "waiting_for_objects", "missing": missing}
+        if event["kind"] == "checkpoint":
+            try:
+                replicated_input(self.local, event, event["payload"]["step"])
+            except (KeyError, TypeError, ValueError) as exc:
+                return {"status": "incompatible_checkpoint", "missing": [], "reason": str(exc)}
+        return {"status": "objects_verified", "missing": []}
 
     def handle(self, action, request, worker):
         local = self.local
@@ -103,20 +215,24 @@ class _ReplicaNode:
         if action == "latest":
             return {"event": local.latest(request["task_id"], request["kind"]), "cursor": local.cursor}
         if action == "replica-status":
+            sync_events(self.client, local, limit=1)
             return self._status(request["seq"])
         if action == "fetch":
+            sync_events(self.client, local, limit=1)
             event = local.event(request["seq"])
             if event is None:
                 raise ValueError("event must be saved first")
             return {"fetched": fetch_objects(self.client, local, event, only=request.get("only")),
                     **self._status(request["seq"])}
         if action == "restore":
+            sync_events(self.client, local, limit=1)
             status = self._status(request["seq"])
             if status["status"] != "objects_verified":
                 return {"path": None, **status}
             path = restore_report_artifact(local, local.event(request["seq"]), self.folder / "restored")
             return {"path": str(path), "status": "restored"}
         if action == "claim":
+            sync_events(self.client, local, limit=1)
             status = self._status(request["checkpoint_seq"])
             if status["status"] != "objects_verified":
                 return {"result": None, **status}
@@ -125,6 +241,7 @@ class _ReplicaNode:
         if action == "complete":
             lease = worker.lease
             if lease is not None:
+                sync_events(self.client, local, limit=1)
                 status = self._status(lease["payload"]["checkpoint_seq"])
                 if status["status"] != "objects_verified":
                     return {"result": False, **status}
@@ -221,6 +338,20 @@ def _read_artifact(node, event, report):
     return {"path": str(path), "sha256": digest, "missing_artifact_blocked": True, "repeat_restore_same_path": True}
 
 
+def _probe_replica_write_lock(root, node):
+    with closing(sqlite3.connect(root / "coordinator" / "replica.sqlite3", isolation_level=None)) as db:
+        db.execute("BEGIN EXCLUSIVE")
+        try:
+            node.request("sync")
+        except _ChildCommandError as exc:
+            _expect(exc.code == "storage_busy", "SQLite lock did not surface a recoverable state")
+        else:
+            raise AssertionError("the locked replica unexpectedly replied without a busy state")
+    _expect(node.proc.poll() is None and node.request("sync")["cursor"] == 0,
+            "the same process could not sync when the lock cleared")
+    return True
+
+
 def _experiment(root, guard):
     root.mkdir(parents=True)
     with ExitStack() as stack:
@@ -238,10 +369,12 @@ def _experiment(root, guard):
             return process
 
         authority = start("coordinator", 0)
+        initial_authority = authority.meta
         port = authority.meta["port"]
         first, second = [start("worker", port, name) for name in _WORKERS]
         _expect(len({authority.meta["pid"], first.meta["pid"], second.meta["pid"]}) == 3,
                 "P3 did not launch three distinct processes")
+        write_lock_recovered = _probe_replica_write_lock(root, first)
         report_id = authority.request("report-start")
         initial = _wait_event(first, report_id, "checkpoint")
         first.request("fetch", seq=initial["seq"])
@@ -281,15 +414,36 @@ def _experiment(root, guard):
         _expect([item["task_id"] for item in submitted] == [first_job] + jobs, "handoff repeated a completed step")
         _expect([item["node_id"] for item in submitted] == [first.meta["node_id"]] + [second.meta["node_id"]] * 3,
                 "executor handoff did not take effect")
-        stopped = [authority.shutdown(), second.shutdown()]
+        original = Path(report["artifact"]["path"])
+        original.rename(original.with_suffix(".moved.md"))
+        stopped = [authority.shutdown()]
+        authority = start("coordinator", port)
+        reopened = authority.request("report-status", task_id=report_id)
+        _expect(reopened["replica_status"] == "announced" and reopened["local_artifact_status"] == "missing",
+                "removing the original report disrupted the coordinator or the verified replica")
+        with closing(sqlite3.connect(root / prior_receiver["node_id"] / "replica.sqlite3")) as db, db:
+            db.execute("DELETE FROM replica_blob WHERE sha256 = ?", (artifact["sha256"],))
+        _expect(second.request("replica-status", seq=artifact_event["seq"])["status"] == "waiting_for_objects",
+                "receiver cache still contains the artifact")
+        recovered_artifact = second.request("fetch", seq=artifact_event["seq"])
+        _expect(recovered_artifact["fetched"] == [artifact["sha256"]]
+                and recovered_artifact["status"] == "objects_verified",
+                "a receiver could not re-download the artifact with the original missing")
+        _expect(second.request("restore", seq=artifact_event["seq"])["path"] == artifact["path"],
+                "restored artifact was lost after the coordinator restart")
+        stopped.extend([authority.shutdown(), second.shutdown()])
         blocked = sum(stopped) + guard["blocked_attempts"]
         _expect(blocked == 0, "unexpected out-of-scope network attempt")
         return {
-            "report_id": report_id, "processes": [authority.meta, first.meta, prior_receiver],
+            "report_id": report_id, "processes": [initial_authority, first.meta, prior_receiver],
+            "coordinator_after_restart": authority.meta,
             "receiver_after_restart": second.meta, "receiver_restart_preserved_checkpoint": True,
             "first_executor_exit_code": first.proc.returncode, "first_checkpoint_seq": initial["seq"],
             "handoff_cursor": cursor, "duplicate_cursor": replay, "gap_detected": True, "stale_claim_rejected": True,
             "dependencies": missing, "submitted": submitted, "artifact": artifact,
+            "write_lock_recovered_in_same_process": write_lock_recovered,
+            "coordinator_restart_without_original": True,
+            "artifact_download_without_original": True,
             "external_network_blocks": blocked,
         }
 

@@ -7,8 +7,10 @@ import sqlite3
 import tempfile
 from threading import Barrier
 import unittest
+from unittest.mock import patch
 
 from suwan.tasks.replica_store import (
+    EMPTY_HISTORY_DIGEST,
     MAX_BLOB_BYTES,
     MAX_EVENT_BYTES,
     MAX_EVENT_PAGE,
@@ -89,6 +91,114 @@ class ReplicaStoreTest(unittest.TestCase):
         self.assertEqual(replica.cursor, 1)
         self.assertEqual(replica.event(1), first)
         self.assertIsNone(replica.event(2))
+
+    def test_anchor_refuses_rollback_and_fork_even_when_tail_catches_up(self):
+        first = self.authority.append("original-1", "report", "checkpoint", {}, [])
+        original = self.authority.append("original-2", "report", "artifact", {"count": 19}, [])
+        self.replica.apply([first, original])
+        _, anchor = self.replica.history_anchor(2)
+        restored = ReplicaStore(self.root / "restored.sqlite3")
+        restored.apply([first])
+        self.assertEqual(restored.history_anchor(0), (1, EMPTY_HISTORY_DIGEST))
+        self.assertEqual(restored.history_anchor(2), (1, None))
+        with self.assertRaises(ReplicaConflictError):
+            restored.history_page(2, 10, anchor)
+        alternate = restored.append("new-2", "report", "artifact", {"count": 31}, [])
+        restored.append("new-3", "report", "checkpoint", {}, [])
+        self.assertEqual(restored.history_anchor(2)[0], 3)
+        self.assertNotEqual(restored.history_anchor(2)[1], anchor)
+        with self.assertRaises(ReplicaConflictError):
+            restored.history_page(2, 10, anchor)
+        self.assertEqual(self.replica.latest("report", "artifact"), original)
+        self.assertNotEqual(alternate, original)
+
+    def test_page_retains_intact_prefix_and_repairs_only_matching_event(self):
+        first, second, third = [
+            self.authority.append(f"event:{seq}", "report", "checkpoint", {"seq": seq}, [])
+            for seq in range(1, 4)
+        ]
+        with closing(sqlite3.connect(self.authority.path)) as db, db:
+            db.execute("UPDATE replica_event SET event_json = '[' WHERE seq = 2")
+            self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        rows, bad_seq, tail = self.authority.history_page(0, 10, EMPTY_HISTORY_DIGEST)
+        self.assertEqual((rows, bad_seq, tail), ([first], 2, 3))
+        reopened = ReplicaStore(self.authority.path)
+        with self.assertRaises(ReplicaIntegrityError) as caught:
+            reopened.history_anchor(3)
+        self.assertEqual(caught.exception.sequence, 2)
+        with self.assertRaises(ReplicaConflictError):
+            reopened.repair_event({**second, "payload": {"seq": 20}})
+        with self.assertRaises(ReplicaIntegrityError):
+            reopened.append("new", "report", "checkpoint", {}, [])
+        reopened.repair_event(second)
+        self.assertEqual(reopened.history_page(0, 10, EMPTY_HISTORY_DIGEST), ([first, second, third], None, 3))
+
+    def test_page_apply_rejects_anchor_changed_by_another_writer(self):
+        first = self.authority.append("event:1", "report", "checkpoint", {}, [])
+        second = self.authority.append("event:2", "report", "checkpoint", {}, [])
+        _, previous = self.replica.history_anchor(0)
+        ReplicaStore(self.replica.path).apply([first])
+        with self.assertRaises(ReplicaConflictError):
+            self.replica.apply([first, second], expected_anchor=(0, previous))
+        self.assertEqual(self.replica.cursor, 1)
+        self.assertIsNone(self.replica.event(2))
+        cursor = self.replica.apply([second], expected_anchor=self.replica.history_anchor(1))
+        self.assertEqual(cursor, 2)
+
+    def test_reopen_and_exact_replay_rebuild_missing_references(self):
+        body = b"selected fixture source"
+        sha = self.authority.put_blob(body)
+        other = self.authority.put_blob(b"unreferenced fixture")
+        event = self.authority.append("event", "report", "checkpoint", {}, [sha])
+
+        def partial_restore():
+            with closing(sqlite3.connect(self.authority.path)) as db, db:
+                db.execute("DELETE FROM replica_reference")
+                db.execute("INSERT INTO replica_reference VALUES (1, ?)", (other,))
+                self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+        partial_restore()
+        self.assertFalse(self.authority.is_referenced(other))
+        reopened = ReplicaStore(self.authority.path)
+        self.assertTrue(reopened.is_referenced(sha))
+        self.assertFalse(reopened.is_referenced(other))
+        partial_restore()
+        self.assertEqual(reopened.append("event", "report", "checkpoint", {}, [sha]), event)
+        self.assertTrue(reopened.is_referenced(sha))
+        self.assertFalse(reopened.is_referenced(other))
+
+    def test_v1_migration_preserves_events_blobs_and_prefix_proofs(self):
+        body = b"legacy report fixture"
+        sha = self.authority.put_blob(body)
+        event = self.authority.append("artifact", "report", "artifact", {}, [sha])
+        before = self.authority.history_anchor(1)
+        with closing(sqlite3.connect(self.authority.path)) as db, db:
+            db.execute("DROP TABLE replica_history")
+            db.execute("ALTER TABLE replica_state DROP COLUMN blocked_sequence")
+            db.execute("PRAGMA user_version = 1")
+        reopened = ReplicaStore(self.authority.path)
+        self.assertEqual(reopened.history_anchor(1), before)
+        self.assertEqual(reopened.events(0, 10), [event])
+        self.assertEqual(reopened.get_blob(sha), body)
+        self.assertTrue(reopened.is_referenced(sha))
+
+    def test_max_object_range_never_calls_full_blob_reader(self):
+        body = bytes(range(256)) * (MAX_BLOB_BYTES // 256)
+        empty = self.authority.put_blob(b"")
+        sha = self.authority.put_blob(body)
+        size = 48 * 1024
+        with patch.object(self.authority, "_get_blob", side_effect=AssertionError("full blob read")):
+            downloaded = bytearray()
+            for offset in range(0, len(body), size):
+                total, chunk = self.authority.blob_chunk(sha, offset, size)
+                self.assertEqual(total, MAX_BLOB_BYTES)
+                self.assertLessEqual(len(chunk), size)
+                downloaded.extend(chunk)
+            self.assertEqual(downloaded, body)
+            self.assertEqual(self.authority.blob_chunk(empty, 0, size), (0, b""))
+            self.assertIsNone(self.authority.blob_chunk("c" * 64, 0, size))
+            with self.assertRaises(ValueError):
+                self.authority.blob_chunk(sha, len(body), size)
 
     def test_corrupt_bytes_are_missing_until_verified_refetch(self):
         body = b"report fixture"

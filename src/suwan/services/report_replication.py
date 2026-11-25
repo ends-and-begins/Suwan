@@ -1,6 +1,7 @@
 """Transfer the evidence for a delegated report step without transferring filesystem authority."""
 from __future__ import annotations
 
+from collections.abc import Callable
 import hashlib
 import json
 import os
@@ -20,7 +21,7 @@ from suwan.services.report_task import (
     _read_source,
     _strict_report_json,
 )
-from suwan.tasks.replica_store import ReplicaStore
+from suwan.tasks.replica_store import ReplicaIntegrityError, ReplicaStore
 from suwan.tasks.report_store import ReportTaskStore
 
 _FORMAT = 1
@@ -96,6 +97,25 @@ def _range(spec: dict) -> tuple[str, int, int]:
     return spec["source_id"], spec["first_line"], spec["last_line"]
 
 
+def _validate_extraction_plan(plan: list[dict], documents: dict[str, tuple[str, ...]]) -> None:
+    """Require every selected source to be covered once, in source and line order."""
+    sources = list(documents)
+    source_index, next_line = 0, 1
+    for row in plan[:-2]:
+        source_id, first, last = _range(row)
+        if source_index >= len(sources) or source_id != sources[source_index] or first != next_line:
+            raise ValueError("replica extraction plan has missing or reordered lines")
+        line_count = len(documents[source_id])
+        if last > line_count:
+            raise ValueError("replica extraction lies outside its source")
+        if last == line_count:
+            source_index, next_line = source_index + 1, 1
+        else:
+            next_line = last + 1
+    if source_index != len(sources):
+        raise ValueError("replica extraction plan does not cover all selected sources")
+
+
 def _checkpoint_findings(result: object, spec: dict) -> list[dict]:
     if not isinstance(result, dict) or set(result) != {"findings"}:
         raise ValueError("invalid replicated extraction result")
@@ -160,8 +180,11 @@ def _validate_snapshot(task_id: str, payload: dict) -> int:
     return position
 
 
-def publish_checkpoint(replica: ReplicaStore, report_store: ReportTaskStore, task: dict, step: dict) -> dict:
-    """Snapshot the durable, active P1 step and its completed prefix."""
+def publish_checkpoint(
+    replica: ReplicaStore, report_store: ReportTaskStore, task: dict, step: dict, *,
+    after_publish: Callable[[dict], None] | None = None,
+) -> dict:
+    """Snapshot an active P1 step, optionally registering its P3 work under the same guard."""
     task_id = _task_id(task.get("id"))
     saved = report_store.get(task_id)
     steps = report_store.steps(task_id)
@@ -174,20 +197,23 @@ def publish_checkpoint(replica: ReplicaStore, report_store: ReportTaskStore, tas
                     and event["attempt"] == step["attempt"]), None)
     scope = {**_spec(step), "task_id": task_id, "version": _positive(version), "attempt": _positive(step["attempt"])}
     sources, checkpoints, blobs, total = [], [], {}, 0
+    documents = {}
     for source in saved["sources"]:
         if source.get("scope") != "local":
             raise ValueError("report source is outside the supported P3 scope")
         mode = source.get("line_numbering", "legacy")
         if mode not in ("physical", "legacy"):
             raise ValueError("unsupported source line numbering")
-        raw, _ = _read_source(Path(source["path"]), physical_lines=mode == "physical")
+        raw, lines = _read_source(Path(source["path"]), physical_lines=mode == "physical")
         digest = _sha(source["sha256"])
         if hashlib.sha256(raw).hexdigest() != digest:
             raise ValueError("authoritative report source has changed")
         total += len(raw)
         if total > _MAX_INPUT_BYTES:
             raise ValueError("replica report input is too large")
-        sources.append({"source_id": _source_id(source["id"]), "sha256": digest, "line_numbering": mode})
+        source_id = _source_id(source["id"])
+        sources.append({"source_id": source_id, "sha256": digest, "line_numbering": mode})
+        documents[source_id] = lines
         blobs[digest] = raw
 
     for row in steps:
@@ -203,12 +229,17 @@ def publish_checkpoint(replica: ReplicaStore, report_store: ReportTaskStore, tas
     payload = {"format": _FORMAT, "step": scope, "instruction": _instruction(saved["instruction"]),
                "sources": sources, "plan": [_spec(row) for row in steps], "checkpoints": checkpoints}
     _validate_snapshot(task_id, payload)
+    _validate_extraction_plan(payload["plan"], documents)
     for digest, data in blobs.items():
         replica.put_blob(data, digest)
-    if report_store.get(task_id) != saved:
-        raise ValueError("authoritative report changed during checkpoint capture")
     key = f"report:{task_id}:{step['id']}:{step['attempt']}"
-    return replica.append(key, task_id, "checkpoint", payload, _references(sources, checkpoints))
+    with report_store.delegation_guard(task_id, step["id"], step["attempt"]) as active:
+        if not active or report_store.get(task_id) != saved or report_store.steps(task_id) != steps:
+            raise ValueError("authoritative report changed during checkpoint capture")
+        event = replica.append(key, task_id, "checkpoint", payload, _references(sources, checkpoints))
+        if after_publish is not None:
+            after_publish(event)
+    return event
 
 
 def _event(replica: ReplicaStore, event: dict, kind: str) -> tuple[str, dict]:
@@ -251,10 +282,9 @@ def replicated_input(replica: ReplicaStore, event: dict, spec: dict) -> dict:
         raise ValueError("replica report input is too large")
     documents = {source["source_id"]: _lines(objects[source["sha256"]], source["line_numbering"])
                  for source in payload["sources"]}
+    _validate_extraction_plan(payload["plan"], documents)
     findings = []
     for item, step in zip(payload["checkpoints"], payload["plan"][:position], strict=True):
-        if step["last_line"] > len(documents[step["source_id"]]):
-            raise ValueError("replica checkpoint lies outside its source")
         result = _strict_report_json(objects[item["sha256"]].decode("utf-8"))
         findings.extend(_checkpoint_findings(result, step))
     instruction = payload["instruction"]
@@ -263,8 +293,6 @@ def replicated_input(replica: ReplicaStore, event: dict, spec: dict) -> dict:
         return {"operation": "synthesize", "instruction": instruction, "findings": findings}
     source_id, first, last = _range(step)
     lines = documents[source_id]
-    if last > len(lines):
-        raise ValueError("replica extraction lies outside its source")
     return {"operation": "extract", "instruction": instruction, "source_id": source_id,
             "first_line": first, "lines": list(lines[first - 1:last])}
 
@@ -296,6 +324,21 @@ def publish_report_artifact(replica: ReplicaStore, task: dict, expected_output_d
     expected = _report_folder(Path(expected_output_dir)) / _report_name(task_id)
     if receipt.get("path") != str(expected):
         raise ValueError("registered report path is outside its expected output slot")
+    key = f"report:{task_id}:artifact:{version}"
+    payload = {"format": _FORMAT, "version": version, "sha256": digest}
+    previous = replica.latest(task_id, "artifact")
+    same_event = previous is not None and previous["event_key"] == key
+    if same_event and (previous["payload"] != payload or previous["objects"] != [digest]
+                       or type(previous["payload"]["format"]) is not int
+                       or type(previous["payload"]["version"]) is not int):
+        raise ValueError("registered report conflicts with its replica receipt")
+    try:
+        saved = replica.get_blob(digest)
+    except ReplicaIntegrityError:
+        saved = None
+    if saved is not None:
+        _report_bytes(saved)
+        return previous if same_event else replica.append(key, task_id, "artifact", payload, [digest])
     info = expected.stat(follow_symlinks=False)
     if not stat.S_ISREG(info.st_mode) or expected.is_junction():
         raise ValueError("registered report must be a regular file")
@@ -306,8 +349,7 @@ def publish_report_artifact(replica: ReplicaStore, task: dict, expected_output_d
     if hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError("registered report does not match its receipt")
     replica.put_blob(raw, digest)
-    return replica.append(f"report:{task_id}:artifact:{version}", task_id, "artifact",
-                          {"format": _FORMAT, "version": version, "sha256": digest}, [digest])
+    return replica.append(key, task_id, "artifact", payload, [digest])
 
 
 def restore_report_artifact(replica: ReplicaStore, event: dict, output_dir: Path) -> Path:

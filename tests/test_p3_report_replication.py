@@ -1,12 +1,15 @@
 """Verify that P3 steps and reports consume committed, complete local objects."""
 from __future__ import annotations
 
+from contextlib import closing
 from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from suwan.services.report_replication import (
     MissingReplicaObjects,
@@ -112,6 +115,81 @@ class P3ReportReplicationTest(unittest.TestCase):
             publish_checkpoint(self.authority, self.store, self.store.get(self.task_id), step)
         self.assertEqual(self.authority.events(0, 100), [])
 
+    def test_bad_future_step_is_rejected_before_publishing_active_checkpoint(self):
+        step = self.store.claim(self.task_id)
+        following = self.store.steps(self.task_id)[1]
+        with closing(sqlite3.connect(self.store.path)) as db, db:
+            raw = db.execute("SELECT spec_json FROM report_step WHERE task_id = ? AND id = ?",
+                             (self.task_id, following["id"])).fetchone()[0]
+            invalid = {**json.loads(raw), "last_line": 99}
+            db.execute("UPDATE report_step SET spec_json = ? WHERE task_id = ? AND id = ?",
+                       (json.dumps(invalid), self.task_id, following["id"]))
+            self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        queue_work = Mock()
+        with self.assertRaisesRegex(ValueError, "outside its source"):
+            publish_checkpoint(self.authority, self.store, self.store.get(self.task_id), step,
+                               after_publish=queue_work)
+        queue_work.assert_not_called()
+        self.assertEqual(self.authority.events(0, 100), [])
+
+    def test_receiver_rejects_preexisting_checkpoint_with_bad_future_geometry(self):
+        event = deepcopy(self._publish_next())
+        event["payload"]["plan"][1]["last_line"] = 99
+        self.worker.apply([event])
+        self._copy(event["objects"])
+        self.assertEqual(self.worker.missing(event), [])
+        with self.assertRaisesRegex(ValueError, "outside its source"):
+            replicated_input(self.worker, event, event["payload"]["step"])
+
+    def test_cancel_after_object_copy_leaves_no_claimable_checkpoint(self):
+        step = self.store.claim(self.task_id)
+        expected = self.store.get(self.task_id)
+        original_put = self.authority.put_blob
+        queue_work = Mock()
+        cancelled = []
+
+        def copy_then_cancel(data, digest):
+            copied = original_put(data, digest)
+            if not cancelled:
+                cancelled.append(self.store.cancel(self.task_id))
+            return copied
+
+        with patch.object(self.authority, "put_blob", side_effect=copy_then_cancel):
+            with self.assertRaisesRegex(ValueError, "changed during checkpoint capture"):
+                publish_checkpoint(self.authority, self.store, expected, step, after_publish=queue_work)
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(self.store.get(self.task_id)["state"], "cancelled")
+        self.assertEqual(self.authority.cursor, 0)
+        queue_work.assert_not_called()
+
+    def test_replica_append_and_delegation_share_the_report_writer_guard(self):
+        step = self.store.claim(self.task_id)
+        original_append = self.authority.append
+        locked = []
+
+        def require_writer_is_blocked():
+            with closing(sqlite3.connect(self.store.path, timeout=0, isolation_level=None)) as other_writer:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    other_writer.execute("BEGIN IMMEDIATE")
+
+        def append_while_guarded(*args):
+            require_writer_is_blocked()
+            locked.append("append")
+            return original_append(*args)
+
+        def queue_while_guarded(event):
+            require_writer_is_blocked()
+            self.assertEqual(self.authority.event(event["seq"]), event)
+            locked.append("queue")
+
+        with patch.object(self.authority, "append", side_effect=append_while_guarded):
+            publish_checkpoint(self.authority, self.store, self.store.get(self.task_id), step,
+                               after_publish=queue_while_guarded)
+        self.assertEqual(locked, ["append", "queue"])
+        self.assertTrue(self.store.cancel(self.task_id))
+        with self.store.delegation_guard(self.task_id, step["id"], step["attempt"]) as active:
+            self.assertFalse(active)
+
     def test_artifact_copy_is_digest_verified_and_never_replaces_another_file(self):
         done = self.service.run(self.task_id)
         self.assertEqual(done["state"], "succeeded")
@@ -144,3 +222,32 @@ class P3ReportReplicationTest(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             restore_report_artifact(self.worker, local, conflict_folder)
         self.assertEqual(existing.read_bytes(), b"existing report")
+
+    def test_verified_announced_artifact_reused_after_original_is_moved(self):
+        done = self.service.run(self.task_id)
+        event = publish_report_artifact(self.authority, done, self.output)
+        original = Path(done["artifact"]["path"])
+        copy = original.read_bytes()
+        archive = self.coordinator / "archived-report.md"
+        original.rename(archive)
+
+        self.assertEqual(publish_report_artifact(self.authority, done, self.output), event)
+        self.assertEqual(self.authority.events(0, 100), [event])
+        self.assertFalse(original.exists())
+        self.assertEqual(self.authority.get_blob(done["artifact"]["sha256"]), copy)
+        self.assertEqual(archive.read_bytes(), copy)
+
+    def test_announcement_retry_uses_verified_blob_after_original_is_moved(self):
+        done = self.service.run(self.task_id)
+        original = Path(done["artifact"]["path"])
+        original_bytes = original.read_bytes()
+        with patch.object(self.authority, "append", side_effect=sqlite3.OperationalError("storage busy")):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "storage busy"):
+                publish_report_artifact(self.authority, done, self.output)
+        self.assertEqual(self.authority.cursor, 0)
+        original.rename(self.coordinator / "archived-report.md")
+
+        event = publish_report_artifact(self.authority, done, self.output)
+        self.assertEqual(event["objects"], [done["artifact"]["sha256"]])
+        self.assertEqual(self.authority.get_blob(event["objects"][0]), original_bytes)
+        self.assertFalse(original.exists())
